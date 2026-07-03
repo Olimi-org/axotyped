@@ -25,14 +25,18 @@
 //!     .build();
 //! ```
 
+use std::marker::PhantomData;
+
 use axum::Router;
 use axum::handler::Handler;
 use axum::routing::{self, MethodRouter};
 
-use crate::types::{HttpMethod, RouteCollection, RouteDefinition};
+use crate::types::{
+    Collector, HttpMethod, NoCollect, RouteCollection, RouteDefinition, TypeRegistry,
+};
 
 // ---------------------------------------------------------------------------
-// Type collection helper
+// Type-collection trait bound
 // ---------------------------------------------------------------------------
 
 /// Trait bound for types that can be collected into the TypeRegistry.
@@ -50,43 +54,74 @@ pub trait MaybeTs: 'static {}
 #[cfg(not(feature = "ts-rs"))]
 impl<T: 'static> MaybeTs for T {}
 
-/// Register a type for TypeScript export. Deduplicates by TypeId.
-/// When the `ts-rs` feature is disabled, this is a no-op.
-pub fn collect_type<T: MaybeTs + 'static>(collection: &mut RouteCollection) {
-    #[cfg(feature = "ts-rs")]
-    collection.register_type::<T>();
-    #[cfg(not(feature = "ts-rs"))]
-    let _ = collection;
-}
-
 // ---------------------------------------------------------------------------
-// Metadata sideband (thread-local)
+// Registered handler + IntoEndpointHandler
 // ---------------------------------------------------------------------------
 
-/// Function pointer type for applying endpoint metadata.
-type MetaApplierFn = fn(&mut RouteDefinition, &mut RouteCollection);
-
-thread_local! {
-    /// Sideband for passing metadata from `register!()` to the builder methods.
-    ///
-    /// `register!()` sets this before the handler is passed to `.post()` etc.
-    /// The builder method reads and clears it after applying the metadata.
-    /// This avoids needing separate method overloads.
-    static PENDING_META: std::cell::RefCell<Option<MetaApplierFn>> = const {
-        std::cell::RefCell::new(None)
-    };
+/// Zero-cost wrapper that carries an endpoint's inferred type metadata at the *type* level.
+///
+/// Produced by [`register!`](crate::register). Unlike a thread-local sideband, keeping the
+/// [`EndpointMeta`](crate::EndpointMeta) type on the wrapper lets the builder apply metadata
+/// through whichever [`Collector`] it is using — so the lean (`NoCollect`) and collecting
+/// (`TypeRegistry`) router monomorphizations are kept separate.
+pub struct Registered<H, Meta: crate::EndpointMeta> {
+    handler: H,
+    _meta: PhantomData<Meta>,
 }
 
-/// Set the pending metadata applier. Called by `register!()`.
-pub fn set_pending_meta(apply_fn: MetaApplierFn) {
-    PENDING_META.with(|m| {
-        *m.borrow_mut() = Some(apply_fn);
-    });
+impl<H, Meta: crate::EndpointMeta> Registered<H, Meta> {
+    /// Wrap a handler with its endpoint metadata. Called by `register!`.
+    pub fn new(handler: H) -> Self {
+        Self {
+            handler,
+            _meta: PhantomData,
+        }
+    }
 }
 
-/// Take and clear the pending metadata applier. Called by the builder methods.
-fn take_pending_meta() -> Option<MetaApplierFn> {
-    PENDING_META.with(|m| m.borrow_mut().take())
+/// Anything passable to a router method (`.post`, `.get`, …) as a handler.
+///
+/// Blanket-impl'd for raw axum handlers (no metadata applied) and explicitly for
+/// [`Registered`] (which applies its [`EndpointMeta`](crate::EndpointMeta) through the router's
+/// collector). The handler's extractor-tuple type `T` is a trait parameter so the blanket impl
+/// over `Handler<T, S>` satisfies the "constrained type parameter" rule.
+pub trait IntoEndpointHandler<S, T> {
+    /// The underlying axum handler type.
+    type Handler;
+
+    /// Extract the handler for routing.
+    fn into_handler(self) -> Self::Handler;
+
+    /// Apply this endpoint's inferred type metadata through `collector`.
+    /// No-op for raw handlers.
+    fn apply_meta<C: Collector>(def: &mut RouteDefinition, collector: &mut C);
+}
+
+impl<H, T, S> IntoEndpointHandler<S, T> for H
+where
+    H: Handler<T, S> + 'static,
+    T: 'static,
+{
+    type Handler = H;
+    fn into_handler(self) -> Self::Handler {
+        self
+    }
+
+    fn apply_meta<C: Collector>(_: &mut RouteDefinition, _: &mut C) {}
+}
+
+impl<H, Meta, S, T> IntoEndpointHandler<S, T> for Registered<H, Meta>
+where
+    Meta: crate::EndpointMeta,
+{
+    type Handler = H;
+    fn into_handler(self) -> Self::Handler {
+        self.handler
+    }
+
+    fn apply_meta<C: Collector>(def: &mut RouteDefinition, collector: &mut C) {
+        <Meta as crate::EndpointMeta>::apply::<C>(def, collector);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -176,30 +211,40 @@ fn default_name_from_handler<H: 'static>() -> String {
 // ---------------------------------------------------------------------------
 
 /// Builder that constructs both an [`axum::Router`] and a [`RouteCollection`].
-pub struct ApiRouter<S = ()>
-where
-    S: Clone + Send + Sync + 'static,
-{
+///
+/// Generic over the state `S` and a [`Collector`] `C` (defaulting to [`NoCollect`]). With the
+/// default `NoCollect` collector, no TypeScript type collection happens and none of the ts-rs
+/// export machinery is pulled into the binary. Pass [`crate::TypeRegistry`] as `C` to collect
+/// types for binding generation.
+pub struct ApiRouter<S = (), C: Collector = NoCollect> {
     router: Router<S>,
-    routes: RouteCollection,
+    routes: Vec<RouteDefinition>,
+    collector: C,
     current_group: Option<String>,
     current_prefix: Option<String>,
     default_auth: bool,
 }
 
-impl<S> ApiRouter<S>
+impl<S, C> ApiRouter<S, C>
 where
     S: Clone + Send + Sync + 'static,
+    C: Collector,
 {
-    /// Create a new empty builder.
+    /// Create a new empty builder using this collector (freshly default-constructed).
     pub fn new() -> Self {
         Self {
             router: Router::new(),
-            routes: RouteCollection::new(),
+            routes: Vec::new(),
+            collector: C::default(),
             current_group: None,
             current_prefix: None,
             default_auth: false,
         }
+    }
+
+    /// Borrow the collector (e.g. to call `export` after building).
+    pub fn collector(&self) -> &C {
+        &self.collector
     }
 
     /// Set a URL prefix for all subsequent routes.
@@ -264,12 +309,13 @@ where
     /// ```
     pub fn group_with<F>(mut self, name: &str, routes: F) -> Self
     where
-        F: FnOnce(ApiRouter<S>) -> ApiRouter<S>,
+        F: FnOnce(ApiRouter<S, C>) -> ApiRouter<S, C>,
     {
         let default_prefix = format!("/{}", name);
         let inner = ApiRouter {
             router: Router::new(),
-            routes: RouteCollection::new(),
+            routes: Vec::new(),
+            collector: C::default(),
             current_group: Some(name.to_string()),
             current_prefix: Some(default_prefix),
             default_auth: false,
@@ -279,85 +325,108 @@ where
 
         self.router = self.router.merge(inner.router);
         self.routes.extend(inner.routes);
+        self.collector.merge_collection(inner.collector);
         self
     }
 
     /// Merge another `ApiRouter`'s router and routes into this one.
-    pub fn merge(mut self, other: ApiRouter<S>) -> Self {
+    pub fn merge(mut self, other: ApiRouter<S, C>) -> Self {
         self.router = self.router.merge(other.router);
         self.routes.extend(other.routes);
+        self.collector.merge_collection(other.collector);
         self
     }
 
     /// Consume the builder and return the router and collected route metadata.
     pub fn build(self) -> (Router<S>, RouteCollection) {
-        (self.router, self.routes)
+        let collection =
+            RouteCollection::assemble(self.routes, self.collector.into_type_registry());
+        (self.router, collection)
     }
 
     // --- Standard HTTP method helpers ---
 
-    /// Add a GET route.
-    ///
-    /// If the handler was wrapped in `register!()`, body/response/query types are
-    /// auto-applied from the `#[endpoint]` metadata. Otherwise, use `.body()`,
-    /// `.response()`, etc. to specify types manually.
-    pub fn get<H, T>(self, path: &str, handler: H) -> RouteBuilder<S>
+    /// Shared registration core for the HTTP method helpers.
+    fn register<EH, T>(
+        mut self,
+        path: &str,
+        method: HttpMethod,
+        to_method_router: fn(EH::Handler) -> MethodRouter<S>,
+        ep: EH,
+    ) -> RouteBuilder<S, C>
     where
-        H: Handler<T, S> + 'static,
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
         T: 'static,
     {
-        let name = default_name_from_handler::<H>();
-        let mut builder = self.route(path, HttpMethod::Get, routing::get(handler), name);
-        builder.apply_pending_meta();
-        builder
+        let mut def = route_into_def(
+            &mut self.router,
+            path,
+            method,
+            to_method_router,
+            ep,
+            &self.current_prefix,
+            self.default_auth,
+            &self.current_group,
+            false,
+        );
+        EH::apply_meta::<C>(&mut def, &mut self.collector);
+        RouteBuilder { parent: self, def }
+    }
+
+    /// Add a GET route.
+    ///
+    /// Accepts either a raw handler or a `register!()`-wrapped handler. When wrapped,
+    /// body/response/query types are auto-applied from the `#[endpoint]` metadata through the
+    /// router's collector. Otherwise, use `.body()`, `.response()`, etc. to specify types
+    /// manually.
+    pub fn get<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    where
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
+        T: 'static,
+    {
+        self.register(path, HttpMethod::Get, routing::get, ep)
     }
 
     /// Add a POST route.
-    pub fn post<H, T>(self, path: &str, handler: H) -> RouteBuilder<S>
+    pub fn post<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
     where
-        H: Handler<T, S> + 'static,
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
         T: 'static,
     {
-        let name = default_name_from_handler::<H>();
-        let mut builder = self.route(path, HttpMethod::Post, routing::post(handler), name);
-        builder.apply_pending_meta();
-        builder
+        self.register(path, HttpMethod::Post, routing::post, ep)
     }
 
     /// Add a PUT route.
-    pub fn put<H, T>(self, path: &str, handler: H) -> RouteBuilder<S>
+    pub fn put<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
     where
-        H: Handler<T, S> + 'static,
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
         T: 'static,
     {
-        let name = default_name_from_handler::<H>();
-        let mut builder = self.route(path, HttpMethod::Put, routing::put(handler), name);
-        builder.apply_pending_meta();
-        builder
+        self.register(path, HttpMethod::Put, routing::put, ep)
     }
 
     /// Add a PATCH route.
-    pub fn patch<H, T>(self, path: &str, handler: H) -> RouteBuilder<S>
+    pub fn patch<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
     where
-        H: Handler<T, S> + 'static,
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
         T: 'static,
     {
-        let name = default_name_from_handler::<H>();
-        let mut builder = self.route(path, HttpMethod::Patch, routing::patch(handler), name);
-        builder.apply_pending_meta();
-        builder
+        self.register(path, HttpMethod::Patch, routing::patch, ep)
     }
 
     /// Add a DELETE route.
-    pub fn delete<H, T>(self, path: &str, handler: H) -> RouteBuilder<S>
+    pub fn delete<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
     where
-        H: Handler<T, S> + 'static,
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
         T: 'static,
     {
-        let name = default_name_from_handler::<H>();
-        let mut builder = self.route(path, HttpMethod::Delete, routing::delete(handler), name);
-        builder.apply_pending_meta();
-        builder
+        self.register(path, HttpMethod::Delete, routing::delete, ep)
     }
 
     /// Add a WebSocket route.
@@ -365,71 +434,140 @@ where
     /// Returns a [`WsRouteBuilder`] that only exposes WS-relevant methods
     /// (`.query()`, `.events()`, `.auth()`, `.done()`). Internally uses
     /// `routing::get()` since WebSocket upgrades start as HTTP GET requests.
-    pub fn ws<H, T>(mut self, path: &str, handler: H) -> WsRouteBuilder<S>
+    pub fn ws<EH, T>(mut self, path: &str, ep: EH) -> WsRouteBuilder<S, C>
     where
-        H: Handler<T, S> + 'static,
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
         T: 'static,
     {
-        let name = default_name_from_handler::<H>();
-        let full_path = self.resolve_path(path);
-        self.router = self.router.route(&full_path, routing::get(handler));
-        let def = RouteDefinition {
-            name,
-            method: HttpMethod::Get,
-            path: full_path,
-            auth: self.default_auth,
-            body_type: None,
-            response_type: None,
-            query_type: None,
-            path_params: crate::extract_path_params(path),
-            group: self.current_group.clone(),
-            redirect: false,
-            websocket: true,
-            ws_send_type: None,
-            ws_receive_type: None,
-        };
-
+        let mut def = route_into_def(
+            &mut self.router,
+            path,
+            HttpMethod::Get,
+            routing::get,
+            ep,
+            &self.current_prefix,
+            self.default_auth,
+            &self.current_group,
+            true,
+        );
+        EH::apply_meta::<C>(&mut def, &mut self.collector);
         WsRouteBuilder { parent: self, def }
-    }
-
-    fn resolve_path(&self, path: &str) -> String {
-        match &self.current_prefix {
-            Some(prefix) => format!("{}{}", prefix, path),
-            None => path.to_string(),
-        }
-    }
-
-    fn route(
-        mut self,
-        path: &str,
-        method: HttpMethod,
-        method_router: MethodRouter<S>,
-        default_name: String,
-    ) -> RouteBuilder<S> {
-        let full_path = self.resolve_path(path);
-        self.router = self.router.route(&full_path, method_router);
-        let def = RouteDefinition {
-            name: default_name,
-            method,
-            path: full_path,
-            auth: self.default_auth,
-            body_type: None,
-            response_type: None,
-            query_type: None,
-            path_params: crate::extract_path_params(path),
-            group: self.current_group.clone(),
-            redirect: false,
-            websocket: false,
-            ws_send_type: None,
-            ws_receive_type: None,
-        };
-        RouteBuilder { parent: self, def }
     }
 }
 
-impl<S> Default for ApiRouter<S>
+/// Resolve a route path against an optional prefix (collector-independent helper).
+fn resolve_prefix(prefix: &Option<String>, path: &str) -> String {
+    match prefix {
+        Some(prefix) => format!("{}{}", prefix, path),
+        None => path.to_string(),
+    }
+}
+
+/// Register `ep` into `router`, derive its client method name, and build the initial
+/// [`RouteDefinition`].
+///
+/// Generic over the handler but **not** over the collector, so this per-endpoint work (name
+/// derivation, routing, the 13-field definition literal) is monomorphized once per handler type
+/// rather than once per handler-per-collector. The collector-specific part (`apply_meta`) stays in
+/// the caller, keeping the lean and collecting router builds from duplicating this body.
+fn route_into_def<S, EH, T>(
+    router: &mut Router<S>,
+    path: &str,
+    method: HttpMethod,
+    to_method_router: fn(EH::Handler) -> MethodRouter<S>,
+    ep: EH,
+    prefix: &Option<String>,
+    default_auth: bool,
+    group: &Option<String>,
+    websocket: bool,
+) -> RouteDefinition
 where
     S: Clone + Send + Sync + 'static,
+    EH: IntoEndpointHandler<S, T>,
+    EH::Handler: Handler<T, S> + 'static,
+    T: 'static,
+{
+    let name = default_name_from_handler::<EH::Handler>();
+    let handler = ep.into_handler();
+    let full_path = resolve_prefix(prefix, path);
+    *router = std::mem::take(router).route(&full_path, to_method_router(handler));
+    RouteDefinition {
+        name,
+        method,
+        path: full_path,
+        auth: default_auth,
+        body_type: None,
+        response_type: None,
+        query_type: None,
+        path_params: crate::extract_path_params(path),
+        group: group.clone(),
+        redirect: false,
+        websocket,
+        ws_send_type: None,
+        ws_receive_type: None,
+    }
+}
+
+/// Build the lean server [`Router`] from a route-definition function.
+///
+/// `define` is invoked once with a fresh `ApiRouter<S, NoCollect>` and must return it with all
+/// routes added. No type collection happens, so the ts-rs export machinery is kept out of the
+/// binary. Pass the *same* `define` function to [`collect_routes`] from a debug-only codegen
+/// entry point to produce the TypeScript bindings from the identical route table.
+///
+/// Apply `.with_state(state)` and any middleware to the returned router at the call site.
+///
+/// # Example
+/// ```rust,ignore
+/// fn routes<S, C: axotyped::Collector>(r: axotyped::ApiRouter<S, C>) -> axotyped::ApiRouter<S, C> {
+///     r.get("/health", axotyped::register!(health)).done()
+/// }
+///
+/// let router = axotyped::build_routes(routes).with_state(state);
+/// ```
+pub fn build_routes<S, F>(define: F) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    F: FnOnce(ApiRouter<S, NoCollect>) -> ApiRouter<S, NoCollect>,
+{
+    define(ApiRouter::<S, NoCollect>::new()).build().0
+}
+
+/// Collect route types (for TypeScript binding generation) from the same route-definition
+/// function passed to [`build_routes`].
+///
+/// Call this only from a debug-only codegen entry point so the collecting monomorphization is
+/// dead-code-eliminated from release builds.
+#[cfg(feature = "ts-rs")]
+pub fn collect_routes<S, F>(define: F) -> RouteCollection
+where
+    S: Clone + Send + Sync + 'static,
+    F: FnOnce(ApiRouter<S, TypeRegistry>) -> ApiRouter<S, TypeRegistry>,
+{
+    define(ApiRouter::<S, TypeRegistry>::new()).build().1
+}
+
+/// Build both the server [`Router`] and the collected [`RouteCollection`] from a single
+/// collecting pass (uses [`TypeRegistry`]).
+///
+/// For when you need the router *and* the route types together. Like [`collect_routes`], this is
+/// a collecting build — call it only where the ts-rs export machinery is acceptable (typically a
+/// debug-only entry point) so it can be dead-code-eliminated from release builds. For the lean
+/// production router, use [`build_routes`].
+#[cfg(feature = "ts-rs")]
+pub fn build_typed<S, F>(define: F) -> (Router<S>, RouteCollection)
+where
+    S: Clone + Send + Sync + 'static,
+    F: FnOnce(ApiRouter<S, TypeRegistry>) -> ApiRouter<S, TypeRegistry>,
+{
+    define(ApiRouter::<S, TypeRegistry>::new()).build()
+}
+
+impl<S, C> Default for ApiRouter<S, C>
+where
+    S: Clone + Send + Sync + 'static,
+    C: Collector,
 {
     fn default() -> Self {
         Self::new()
@@ -442,44 +580,34 @@ where
 
 /// In-progress route definition. Chain `.body::<T>()`, `.response::<T>()`,
 /// `.auth()`, `.redirect()`, then finalize with `.done()` or `.as_("name")`.
-pub struct RouteBuilder<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    parent: ApiRouter<S>,
+pub struct RouteBuilder<S, C: Collector = NoCollect> {
+    parent: ApiRouter<S, C>,
     def: RouteDefinition,
 }
 
-impl<S> RouteBuilder<S>
+impl<S, C> RouteBuilder<S, C>
 where
     S: Clone + Send + Sync + 'static,
+    C: Collector,
 {
-    /// Apply any pending metadata from `register!()`. Called internally by the
-    /// HTTP method helpers right after route registration.
-    fn apply_pending_meta(&mut self) {
-        if let Some(apply_fn) = take_pending_meta() {
-            apply_fn(&mut self.def, &mut self.parent.routes);
-        }
-    }
-
     /// Set the request body type.
     pub fn body<T: MaybeTs + 'static>(mut self) -> Self {
         self.def.body_type = Some(type_string::<T>());
-        collect_type::<T>(&mut self.parent.routes);
+        self.parent.collector.register::<T>();
         self
     }
 
     /// Set the response type.
     pub fn response<T: MaybeTs + 'static>(mut self) -> Self {
         self.def.response_type = Some(type_string::<T>());
-        collect_type::<T>(&mut self.parent.routes);
+        self.parent.collector.register::<T>();
         self
     }
 
     /// Set the query parameters type.
     pub fn query<T: MaybeTs + 'static>(mut self) -> Self {
         self.def.query_type = Some(type_string::<T>());
-        collect_type::<T>(&mut self.parent.routes);
+        self.parent.collector.register::<T>();
         self
     }
 
@@ -494,8 +622,8 @@ where
     pub fn json<B: MaybeTs + 'static, R: MaybeTs + 'static>(mut self) -> Self {
         self.def.body_type = Some(type_string::<B>());
         self.def.response_type = Some(type_string::<R>());
-        collect_type::<B>(&mut self.parent.routes);
-        collect_type::<R>(&mut self.parent.routes);
+        self.parent.collector.register::<B>();
+        self.parent.collector.register::<R>();
         self
     }
 
@@ -512,14 +640,14 @@ where
     }
 
     /// Finalize the route using the auto-derived name (handler function name → camelCase).
-    pub fn done(mut self) -> ApiRouter<S> {
-        // name was already set from the handler in ApiRouter::route()
+    pub fn done(mut self) -> ApiRouter<S, C> {
+        // name was already set from the handler in ApiRouter::register()
         self.parent.routes.push(self.def);
         self.parent
     }
 
     /// Finalize the route with an explicit client method name, overriding the auto-derived name.
-    pub fn as_(mut self, name: &str) -> ApiRouter<S> {
+    pub fn as_(mut self, name: &str) -> ApiRouter<S, C> {
         self.def.name = name.to_string();
         self.parent.routes.push(self.def);
         self.parent
@@ -540,22 +668,20 @@ where
 ///
 /// Methods that don't make sense for WS (`.body()`, `.response()`, `.json()`,
 /// `.redirect()`) are not available.
-pub struct WsRouteBuilder<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    parent: ApiRouter<S>,
+pub struct WsRouteBuilder<S, C: Collector = NoCollect> {
+    parent: ApiRouter<S, C>,
     def: RouteDefinition,
 }
 
-impl<S> WsRouteBuilder<S>
+impl<S, C> WsRouteBuilder<S, C>
 where
     S: Clone + Send + Sync + 'static,
+    C: Collector,
 {
     /// Set the query parameters type.
     pub fn query<T: MaybeTs + 'static>(mut self) -> Self {
         self.def.query_type = Some(type_string::<T>());
-        collect_type::<T>(&mut self.parent.routes);
+        self.parent.collector.register::<T>();
         self
     }
 
@@ -569,8 +695,8 @@ where
     pub fn events<Send: MaybeTs + 'static, Receive: MaybeTs + 'static>(mut self) -> Self {
         self.def.ws_send_type = Some(type_string::<Send>());
         self.def.ws_receive_type = Some(type_string::<Receive>());
-        collect_type::<Send>(&mut self.parent.routes);
-        collect_type::<Receive>(&mut self.parent.routes);
+        self.parent.collector.register::<Send>();
+        self.parent.collector.register::<Receive>();
         self
     }
 
@@ -581,13 +707,13 @@ where
     }
 
     /// Finalize the route using the auto-derived name (handler function name → camelCase).
-    pub fn done(mut self) -> ApiRouter<S> {
+    pub fn done(mut self) -> ApiRouter<S, C> {
         self.parent.routes.push(self.def);
         self.parent
     }
 
     /// Finalize the route with an explicit client method name, overriding the auto-derived name.
-    pub fn as_(mut self, name: &str) -> ApiRouter<S> {
+    pub fn as_(mut self, name: &str) -> ApiRouter<S, C> {
         self.def.name = name.to_string();
         self.parent.routes.push(self.def);
         self.parent

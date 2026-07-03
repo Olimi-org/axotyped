@@ -72,6 +72,37 @@ pub struct RouteDefinition {
 #[cfg(feature = "ts-rs")]
 type ExportFn = fn(&crate::ts::Config) -> Result<(), crate::ts::ExportError>;
 
+/// What happens when a route names a type `T` for TypeScript export.
+///
+/// The default collector [`NoCollect`] is a no-op: routers built with it never touch the ts-rs
+/// export machinery, so none of the export codegen is pulled into the binary. To actually collect
+/// types (e.g. for binding generation), build the router with [`TypeRegistry`] as the collector.
+///
+/// This is the compile-time switch that keeps the export chain out of binaries that don't export:
+/// because `NoCollect::register` has an empty body, the lean router monomorphization never
+/// references `T::export_all`, so LLVM dead-code-eliminates the entire export pipeline when no
+/// collecting collector is used.
+pub trait Collector: Default {
+    /// Register `T`. The default is a no-op; collecting collectors override this.
+    fn register<T: crate::MaybeTs + 'static>(&mut self) {}
+
+    /// Merge another collector of the same kind into this one (used by `merge` / `group_with`).
+    fn merge_collection(&mut self, _other: Self) {}
+
+    /// Consume the collector into the [`TypeRegistry`] it accumulated.
+    fn into_type_registry(self) -> TypeRegistry;
+}
+
+/// Lean collector — registers nothing. The default collector for [`crate::ApiRouter`].
+#[derive(Debug, Clone, Default)]
+pub struct NoCollect;
+
+impl Collector for NoCollect {
+    fn into_type_registry(self) -> TypeRegistry {
+        TypeRegistry::default()
+    }
+}
+
 /// Collects types encountered during route building so their TypeScript
 /// declarations can be exported via ts-rs's `export_all()` mechanism.
 /// Deduplicates by `TypeId` to handle generic instantiations correctly
@@ -99,22 +130,6 @@ impl TypeRegistry {
         Self::default()
     }
 
-    /// Register a type's export function. Deduplicates by `TypeId`.
-    ///
-    /// Skips container wrappers (`Vec<T>`, `Option<T>`) since they can't be
-    /// exported as standalone ts-rs types. The inner `T` is registered
-    /// separately through its own route registration.
-    pub fn register<T: crate::ts::TS + 'static>(&mut self) {
-        let type_name = std::any::type_name::<T>();
-        if is_container_wrapper(type_name) {
-            return;
-        }
-        let type_id = std::any::TypeId::of::<T>();
-        if self.seen.insert(type_id) {
-            self.slots.push((type_id, T::export_all));
-        }
-    }
-
     /// Whether a type has already been registered.
     pub fn contains_type<T: 'static>(&self) -> bool {
         self.seen.contains(&std::any::TypeId::of::<T>())
@@ -140,6 +155,28 @@ impl TypeRegistry {
                 self.slots.push((type_id, export_fn));
             }
         }
+    }
+}
+
+#[cfg(feature = "ts-rs")]
+impl Collector for TypeRegistry {
+    fn register<T: crate::MaybeTs + 'static>(&mut self) {
+        let type_name = std::any::type_name::<T>();
+        if is_container_wrapper(type_name) {
+            return;
+        }
+        let type_id = std::any::TypeId::of::<T>();
+        if self.seen.insert(type_id) {
+            self.slots.push((type_id, T::export_all));
+        }
+    }
+
+    fn merge_collection(&mut self, other: Self) {
+        self.extend(other);
+    }
+
+    fn into_type_registry(self) -> TypeRegistry {
+        self
     }
 }
 
@@ -177,6 +214,12 @@ impl RouteCollection {
         Self::default()
     }
 
+    /// Assemble a `RouteCollection` from route definitions and a collected type registry.
+    /// Used by [`crate::ApiRouter::build`] to produce the final output.
+    pub(crate) fn assemble(routes: Vec<RouteDefinition>, types: TypeRegistry) -> Self {
+        Self { routes, types }
+    }
+
     pub fn push(&mut self, route: RouteDefinition) {
         self.routes.push(route);
     }
@@ -192,12 +235,6 @@ impl RouteCollection {
 
     pub fn types(&self) -> &TypeRegistry {
         &self.types
-    }
-
-    /// Register a type for TypeScript export. Deduplicates by TypeId.
-    #[cfg(feature = "ts-rs")]
-    pub fn register_type<T: crate::ts::TS + 'static>(&mut self) {
-        self.types.register::<T>();
     }
 
     /// Export all collected types (and their transitive dependencies) to the

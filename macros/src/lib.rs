@@ -51,8 +51,8 @@ pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let inner = unwrap_container_types(t);
             quote! {
                 __def.body_type = Some(::axotyped::__private::type_string::<#t>());
-                ::axotyped::__private::collect_type::<#t>(__registry);
-                #(::axotyped::__private::collect_type::<#inner>(__registry);)*
+                __c.register::<#t>();
+                #(__c.register::<#inner>();)*
             }
         }
         None => quote! {},
@@ -63,8 +63,8 @@ pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let inner = unwrap_container_types(t);
             quote! {
                 __def.query_type = Some(::axotyped::__private::type_string::<#t>());
-                ::axotyped::__private::collect_type::<#t>(__registry);
-                #(::axotyped::__private::collect_type::<#inner>(__registry);)*
+                __c.register::<#t>();
+                #(__c.register::<#inner>();)*
             }
         }
         None => quote! {},
@@ -75,8 +75,8 @@ pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let inner = unwrap_container_types(t);
             quote! {
                 __def.response_type = Some(::axotyped::__private::type_string::<#t>());
-                ::axotyped::__private::collect_type::<#t>(__registry);
-                #(::axotyped::__private::collect_type::<#inner>(__registry);)*
+                __c.register::<#t>();
+                #(__c.register::<#inner>();)*
             }
         }
         None => quote! {},
@@ -91,7 +91,7 @@ pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
         pub struct #meta_struct_name;
 
         impl ::axotyped::EndpointMeta for #meta_struct_name {
-            fn apply(__def: &mut ::axotyped::RouteDefinition, __registry: &mut ::axotyped::RouteCollection) {
+            fn apply<C: ::axotyped::Collector>(__def: &mut ::axotyped::RouteDefinition, __c: &mut C) {
                 #body_register
                 #query_register
                 #response_register
@@ -106,11 +106,11 @@ pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
 // register!() — call-site macro that registers a handler with its metadata
 // ---------------------------------------------------------------------------
 
-/// Register a handler with its auto-inferred metadata.
+/// Wrap a handler with its auto-inferred `#[endpoint]` metadata.
 ///
-/// Sets the metadata sideband and evaluates to the raw handler, so the builder's
-/// `.post()`, `.get()`, etc. methods can apply the inferred types transparently.
-/// The builder reads and clears the sideband — no separate method needed.
+/// Expands to a [`Registered`](axotyped::Registered) value carrying the handler and its
+/// `EndpointMeta` at the type level. Pass it to `.post()`, `.get()`, etc.; the builder applies
+/// the inferred body/response/query types through its collector.
 ///
 /// Requires the handler function to be annotated with `#[endpoint]`.
 ///
@@ -134,10 +134,7 @@ pub fn register(input: TokenStream) -> TokenStream {
     }
 
     let expanded = quote! {
-        {
-            ::axotyped::__private::set_pending_meta(<#meta_path as ::axotyped::EndpointMeta>::apply);
-            #path
-        }
+        ::axotyped::Registered::<_, #meta_path>::new(#path)
     };
 
     TokenStream::from(expanded)
