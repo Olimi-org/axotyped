@@ -509,6 +509,57 @@ where
     }
 }
 
+/// Trait for types that can be automatically finalized into an [`ApiRouter`].
+pub trait IntoApiRouter<S, C: Collector> {
+    fn into_api_router(self) -> ApiRouter<S, C>;
+}
+
+impl<S, C: Collector> IntoApiRouter<S, C> for ApiRouter<S, C> {
+    fn into_api_router(self) -> ApiRouter<S, C> {
+        self
+    }
+}
+
+impl<S, C> IntoApiRouter<S, C> for RouteBuilder<S, C>
+where
+    S: Clone + Send + Sync + 'static,
+    C: Collector,
+{
+    fn into_api_router(self) -> ApiRouter<S, C> {
+        self.done()
+    }
+}
+
+impl<S, C> IntoApiRouter<S, C> for WsRouteBuilder<S, C>
+where
+    S: Clone + Send + Sync + 'static,
+    C: Collector,
+{
+    fn into_api_router(self) -> ApiRouter<S, C> {
+        self.done()
+    }
+}
+
+impl<S, C> From<RouteBuilder<S, C>> for ApiRouter<S, C>
+where
+    S: Clone + Send + Sync + 'static,
+    C: Collector,
+{
+    fn from(builder: RouteBuilder<S, C>) -> Self {
+        builder.done()
+    }
+}
+
+impl<S, C> From<WsRouteBuilder<S, C>> for ApiRouter<S, C>
+where
+    S: Clone + Send + Sync + 'static,
+    C: Collector,
+{
+    fn from(builder: WsRouteBuilder<S, C>) -> Self {
+        builder.done()
+    }
+}
+
 /// Build the lean server [`Router`] from a route-definition function.
 ///
 /// `define` is invoked once with a fresh `ApiRouter<S, NoCollect>` and must return it with all
@@ -521,17 +572,18 @@ where
 /// # Example
 /// ```rust,ignore
 /// fn routes<S, C: axotyped::Collector>(r: axotyped::ApiRouter<S, C>) -> axotyped::ApiRouter<S, C> {
-///     r.get("/health", axotyped::register!(health)).done()
+///     r.get("/health", axotyped::register!(health))
 /// }
 ///
 /// let router = axotyped::build_routes(routes).with_state(state);
 /// ```
-pub fn build_routes<S, F>(define: F) -> Router<S>
+pub fn build_routes<S, R, F>(define: F) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
-    F: FnOnce(ApiRouter<S, NoCollect>) -> ApiRouter<S, NoCollect>,
+    F: FnOnce(ApiRouter<S, NoCollect>) -> R,
+    R: IntoApiRouter<S, NoCollect>,
 {
-    define(ApiRouter::<S, NoCollect>::new()).build().0
+    define(ApiRouter::<S, NoCollect>::new()).into_api_router().build().0
 }
 
 /// Collect route types (for TypeScript binding generation) from the same route-definition
@@ -540,12 +592,13 @@ where
 /// Call this only from a debug-only codegen entry point so the collecting monomorphization is
 /// dead-code-eliminated from release builds.
 #[cfg(feature = "ts-rs")]
-pub fn collect_routes<S, F>(define: F) -> RouteCollection
+pub fn collect_routes<S, R, F>(define: F) -> RouteCollection
 where
     S: Clone + Send + Sync + 'static,
-    F: FnOnce(ApiRouter<S, TypeRegistry>) -> ApiRouter<S, TypeRegistry>,
+    F: FnOnce(ApiRouter<S, TypeRegistry>) -> R,
+    R: IntoApiRouter<S, TypeRegistry>,
 {
-    define(ApiRouter::<S, TypeRegistry>::new()).build().1
+    define(ApiRouter::<S, TypeRegistry>::new()).into_api_router().build().1
 }
 
 /// Build both the server [`Router`] and the collected [`RouteCollection`] from a single
@@ -556,12 +609,79 @@ where
 /// debug-only entry point) so it can be dead-code-eliminated from release builds. For the lean
 /// production router, use [`build_routes`].
 #[cfg(feature = "ts-rs")]
-pub fn build_typed<S, F>(define: F) -> (Router<S>, RouteCollection)
+pub fn build_typed<S, R, F>(define: F) -> (Router<S>, RouteCollection)
 where
     S: Clone + Send + Sync + 'static,
-    F: FnOnce(ApiRouter<S, TypeRegistry>) -> ApiRouter<S, TypeRegistry>,
+    F: FnOnce(ApiRouter<S, TypeRegistry>) -> R,
+    R: IntoApiRouter<S, TypeRegistry>,
 {
-    define(ApiRouter::<S, TypeRegistry>::new()).build()
+    define(ApiRouter::<S, TypeRegistry>::new()).into_api_router().build()
+}
+
+/// Trait for declaring application route tables with zero-cost lean and collecting builder methods.
+///
+/// Implement `define` to declare your routes using [`ApiRouter`]. The default trait methods
+/// [`router()`][Self::router] and [`collect_types()`][Self::collect_types] automatically handle
+/// the lean (`NoCollect`) vs collecting (`TypeRegistry`) builds.
+///
+/// You can implement this trait manually on a struct, or use the [`crate::define_routes!`] macro
+/// which implements it for you.
+///
+/// # Example
+/// ```rust,ignore
+/// use axotyped::{ApiRouter, Collector, RouteTable, register};
+///
+/// pub struct AppRoutes;
+///
+/// impl RouteTable<Arc<AppState>> for AppRoutes {
+///     fn define<C: Collector, R: IntoApiRouter<Arc<AppState>, C>>(
+///         r: ApiRouter<Arc<AppState>, C>,
+///     ) -> R {
+///         r.get("/health", register!(health))
+///          .group_prefixed("admin", |g| g.auth_all().post("/x", register!(create_x)))
+///     }
+/// }
+///
+/// // Server startup (lean build — NoCollect):
+/// let router = AppRoutes::router().with_state(state);
+///
+/// // Codegen script / test (collecting build — TypeRegistry):
+/// let collection = AppRoutes::collect_types();
+/// ```
+pub trait RouteTable<S> {
+    /// Declare routes on the given [`ApiRouter`].
+    fn define<C: Collector>(r: ApiRouter<S, C>) -> ApiRouter<S, C>;
+
+    /// Build the lean production server [`Router`] (no type collection — `NoCollect`).
+    ///
+    /// Keeps the ts-rs export machinery completely out of release binaries.
+    fn router() -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        build_routes(|r| Self::define(r))
+    }
+
+    /// Collect TypeScript type data for binding generation (`TypeRegistry`).
+    ///
+    /// Call from a debug-only codegen entry point or test so the collecting monomorphization
+    /// is dead-code-eliminated from release builds.
+    #[cfg(feature = "ts-rs")]
+    fn collect_types() -> RouteCollection
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        collect_routes(|r| Self::define(r))
+    }
+
+    /// Collecting build — returns both the `Router` and collected `RouteCollection`.
+    #[cfg(feature = "ts-rs")]
+    fn build() -> (Router<S>, RouteCollection)
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        build_typed(|r| Self::define(r))
+    }
 }
 
 impl<S, C> Default for ApiRouter<S, C>
@@ -639,8 +759,8 @@ where
         self
     }
 
-    /// Finalize the route using the auto-derived name (handler function name → camelCase).
-    pub fn done(mut self) -> ApiRouter<S, C> {
+    /// Internal helper: finalize the route into parent ApiRouter.
+    fn done(mut self) -> ApiRouter<S, C> {
         // name was already set from the handler in ApiRouter::register()
         self.parent.routes.push(self.def);
         self.parent
@@ -651,6 +771,101 @@ where
         self.def.name = name.to_string();
         self.parent.routes.push(self.def);
         self.parent
+    }
+
+    // --- Auto-closing forwarding route methods ---
+
+    /// Add a GET route, auto-finalizing the current route in the chain.
+    pub fn get<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    where
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
+        T: 'static,
+    {
+        self.done().get(path, ep)
+    }
+
+    /// Add a POST route, auto-finalizing the current route in the chain.
+    pub fn post<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    where
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
+        T: 'static,
+    {
+        self.done().post(path, ep)
+    }
+
+    /// Add a PUT route, auto-finalizing the current route in the chain.
+    pub fn put<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    where
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
+        T: 'static,
+    {
+        self.done().put(path, ep)
+    }
+
+    /// Add a PATCH route, auto-finalizing the current route in the chain.
+    pub fn patch<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    where
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
+        T: 'static,
+    {
+        self.done().patch(path, ep)
+    }
+
+    /// Add a DELETE route, auto-finalizing the current route in the chain.
+    pub fn delete<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    where
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
+        T: 'static,
+    {
+        self.done().delete(path, ep)
+    }
+
+    /// Add a WebSocket route, auto-finalizing the current route in the chain.
+    pub fn ws<EH, T>(self, path: &str, ep: EH) -> WsRouteBuilder<S, C>
+    where
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
+        T: 'static,
+    {
+        self.done().ws(path, ep)
+    }
+
+    /// Scoped closure-based group, auto-finalizing the current route in the chain.
+    pub fn group<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    where
+        F: FnOnce(ApiRouter<S, C>) -> R,
+        R: IntoApiRouter<S, C>,
+    {
+        self.done().group(name, routes)
+    }
+
+    /// Scoped closure-based prefixed group, auto-finalizing the current route in the chain.
+    pub fn group_prefixed<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    where
+        F: FnOnce(ApiRouter<S, C>) -> R,
+        R: IntoApiRouter<S, C>,
+    {
+        self.done().group_prefixed(name, routes)
+    }
+
+    /// Set a URL prefix on the parent router, auto-finalizing the current route in the chain.
+    pub fn set_prefix(self, prefix: &str) -> ApiRouter<S, C> {
+        self.done().set_prefix(prefix)
+    }
+
+    /// Require authentication on all subsequent routes, auto-finalizing the current route in the chain.
+    pub fn auth_all(self) -> ApiRouter<S, C> {
+        self.done().auth_all()
+    }
+
+    /// Finalize the route and consume the builder to return the [`axum::Router`] and [`RouteCollection`].
+    pub fn build(self) -> (Router<S>, RouteCollection) {
+        self.done().build()
     }
 }
 
@@ -706,8 +921,8 @@ where
         self
     }
 
-    /// Finalize the route using the auto-derived name (handler function name → camelCase).
-    pub fn done(mut self) -> ApiRouter<S, C> {
+    /// Internal helper: finalize the route into parent ApiRouter.
+    fn done(mut self) -> ApiRouter<S, C> {
         self.parent.routes.push(self.def);
         self.parent
     }
@@ -717,6 +932,101 @@ where
         self.def.name = name.to_string();
         self.parent.routes.push(self.def);
         self.parent
+    }
+
+    // --- Auto-closing forwarding route methods ---
+
+    /// Add a GET route, auto-finalizing the current WS route in the chain.
+    pub fn get<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    where
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
+        T: 'static,
+    {
+        self.done().get(path, ep)
+    }
+
+    /// Add a POST route, auto-finalizing the current WS route in the chain.
+    pub fn post<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    where
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
+        T: 'static,
+    {
+        self.done().post(path, ep)
+    }
+
+    /// Add a PUT route, auto-finalizing the current WS route in the chain.
+    pub fn put<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    where
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
+        T: 'static,
+    {
+        self.done().put(path, ep)
+    }
+
+    /// Add a PATCH route, auto-finalizing the current WS route in the chain.
+    pub fn patch<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    where
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
+        T: 'static,
+    {
+        self.done().patch(path, ep)
+    }
+
+    /// Add a DELETE route, auto-finalizing the current WS route in the chain.
+    pub fn delete<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    where
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
+        T: 'static,
+    {
+        self.done().delete(path, ep)
+    }
+
+    /// Add a WebSocket route, auto-finalizing the current WS route in the chain.
+    pub fn ws<EH, T>(self, path: &str, ep: EH) -> WsRouteBuilder<S, C>
+    where
+        EH: IntoEndpointHandler<S, T>,
+        EH::Handler: Handler<T, S> + 'static,
+        T: 'static,
+    {
+        self.done().ws(path, ep)
+    }
+
+    /// Scoped closure-based group, auto-finalizing the current WS route in the chain.
+    pub fn group<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    where
+        F: FnOnce(ApiRouter<S, C>) -> R,
+        R: IntoApiRouter<S, C>,
+    {
+        self.done().group(name, routes)
+    }
+
+    /// Scoped closure-based prefixed group, auto-finalizing the current WS route in the chain.
+    pub fn group_prefixed<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    where
+        F: FnOnce(ApiRouter<S, C>) -> R,
+        R: IntoApiRouter<S, C>,
+    {
+        self.done().group_prefixed(name, routes)
+    }
+
+    /// Set a URL prefix on the parent router, auto-finalizing the current WS route in the chain.
+    pub fn set_prefix(self, prefix: &str) -> ApiRouter<S, C> {
+        self.done().set_prefix(prefix)
+    }
+
+    /// Require authentication on all subsequent routes, auto-finalizing the current WS route in the chain.
+    pub fn auth_all(self) -> ApiRouter<S, C> {
+        self.done().auth_all()
+    }
+
+    /// Finalize the route and consume the builder to return the [`axum::Router`] and [`RouteCollection`].
+    pub fn build(self) -> (Router<S>, RouteCollection) {
+        self.done().build()
     }
 }
 

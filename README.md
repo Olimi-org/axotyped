@@ -200,6 +200,93 @@ ApiRouter::<AppState>::new()
     .build()
 ```
 
+## Route Table Patterns & Zero-Cost Production Builds
+
+`axotyped` uses generic monomorphization (`ApiRouter<S, C>`) so that TypeScript export code is **dead-code-eliminated (DCE) from production release builds**.
+
+### 1. Macro (`define_routes!`)
+
+Generates a struct implementing `RouteTable` with `.router()` and `.collect_types()` methods:
+
+```rust
+use axotyped::{define_routes, register};
+
+define_routes! {
+    pub Routes for Arc<AppState>, |r| {
+        r.get("/health", register!(health))
+         .group_prefixed("admin", |g| {
+             g.auth_all().post("/project", register!(create_project))
+         })
+    }
+}
+
+// Server startup (lean — no ts-rs code in release binary):
+let router = Routes::router().with_state(state);
+
+// Type collection (debug/tests):
+let collection = Routes::collect_types();
+```
+
+### 2. Trait (`RouteTable` — Macro-Free)
+
+Implement `RouteTable` directly for macro-free route definitions with full IDE support:
+
+```rust
+use axotyped::{ApiRouter, Collector, RouteTable, register};
+
+pub struct Routes;
+
+impl RouteTable<Arc<AppState>> for Routes {
+    fn define<C: Collector>(
+        r: ApiRouter<Arc<AppState>, C>,
+    ) -> ApiRouter<Arc<AppState>, C> {
+        r.get("/health", register!(health))
+         .group_prefixed("admin", |g| {
+             g.auth_all().post("/project", register!(create_project))
+         })
+    }
+}
+
+let router = Routes::router().with_state(state);
+let collection = Routes::collect_types();
+```
+
+### 3. Generic Function
+
+Pass a generic function into `build_routes` and `collect_routes`:
+
+```rust
+use axotyped::{ApiRouter, Collector, build_routes, collect_routes, register};
+
+fn routes<S, C: Collector>(r: ApiRouter<S, C>) -> ApiRouter<S, C> {
+    r.get("/health", register!(health))
+     .group_prefixed("admin", |g| {
+         g.auth_all().post("/project", register!(create_project))
+     })
+}
+
+let router = build_routes(routes).with_state(state);
+let collection = collect_routes(routes);
+```
+
+### 4. Direct Builder
+
+Construct `ApiRouter` directly without structs or functions:
+
+```rust
+use axotyped::{ApiRouter, TypedApiRouter, register};
+
+// Server startup (NoCollect):
+let (router, _) = ApiRouter::<Arc<AppState>>::new()
+    .get("/health", register!(health))
+    .build();
+
+// Type collection (TypeRegistry):
+let (_, collection) = TypedApiRouter::<Arc<AppState>>::new()
+    .get("/health", register!(health))
+    .build();
+```
+
 ## Generating the client
 
 Generation needs your compiled route functions, so we need to configure the setup to run after compile-time.
