@@ -267,61 +267,74 @@ where
         self
     }
 
-    /// Set the group for all subsequent routes (TS client namespace only).
+    /// Closure-based group: scoped TS client namespace without modifying route path prefixes.
     ///
-    /// For the closure-based version with prefix and auth, see
-    /// [`group_with`](Self::group_with).
-    pub fn group(mut self, name: &str) -> Self {
-        self.current_group = Some(name.to_string());
+    /// Routes inside the closure inherit `name` as their TS group namespace.
+    ///
+    /// For the version that also prepends `/{name}` as a URL path prefix, see
+    /// [`group_prefixed`](Self::group_prefixed).
+    pub fn group<R, F>(mut self, name: &str, routes: F) -> Self
+    where
+        F: FnOnce(ApiRouter<S, C>) -> R,
+        R: IntoApiRouter<S, C>,
+    {
+        let inner = ApiRouter {
+            router: Router::new(),
+            routes: Vec::new(),
+            collector: C::default(),
+            current_group: Some(name.to_string()),
+            current_prefix: self.current_prefix.clone(),
+            default_auth: self.default_auth,
+        };
+
+        let inner = routes(inner).into_api_router();
+
+        self.router = self.router.merge(inner.router);
+        self.routes.extend(inner.routes);
+        self.collector.merge_collection(inner.collector);
         self
     }
 
-    /// Clear group, prefix, and default auth (for fluent `group()` usage).
-    pub fn no_group(mut self) -> Self {
-        self.current_group = None;
-        self.current_prefix = None;
-        self.default_auth = false;
-        self
-    }
-
-    /// Closure-based group: scoped prefix, auth, and TS namespace.
+    /// Closure-based group: scoped TS namespace AND URL path prefix.
     ///
     /// Creates an isolated scope where all routes inherit the group's
-    /// prefix, auth setting, and TS client namespace. The group's config
+    /// prefix (`/{name}`), auth setting, and TS client namespace. The group's config
     /// does not leak to routes registered after the closure.
     ///
-    /// The prefix defaults to `"/{name}"` but can be overridden with
-    /// `.set_prefix()` inside the closure.
+    /// The prefix defaults to `"/{name}"` (or `{outer_prefix}/{name}`) but can be
+    /// overridden with `.set_prefix()` inside the closure.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// .group_with("admin", |g| {
+    /// .group_prefixed("admin", |g| {
     ///     g.auth_all()
     ///      .post("/course", create_course)
     ///         .body::<CreateCourseRequest>()
     ///         .response::<CourseRecord>()
-    ///         .done()
     ///      .get("/course", list_courses)
     ///         .response::<Vec<CourseRecord>>()
-    ///         .done()
     /// })
     /// ```
-    pub fn group_with<F>(mut self, name: &str, routes: F) -> Self
+    pub fn group_prefixed<R, F>(mut self, name: &str, routes: F) -> Self
     where
-        F: FnOnce(ApiRouter<S, C>) -> ApiRouter<S, C>,
+        F: FnOnce(ApiRouter<S, C>) -> R,
+        R: IntoApiRouter<S, C>,
     {
-        let default_prefix = format!("/{}", name);
+        let default_prefix = match &self.current_prefix {
+            Some(p) => format!("{}/{}", p.trim_end_matches('/'), name),
+            None => format!("/{}", name),
+        };
         let inner = ApiRouter {
             router: Router::new(),
             routes: Vec::new(),
             collector: C::default(),
             current_group: Some(name.to_string()),
             current_prefix: Some(default_prefix),
-            default_auth: false,
+            default_auth: self.default_auth,
         };
 
-        let inner = routes(inner);
+        let inner = routes(inner).into_api_router();
 
         self.router = self.router.merge(inner.router);
         self.routes.extend(inner.routes);

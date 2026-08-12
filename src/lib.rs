@@ -21,7 +21,7 @@
 //! }
 //!
 //! let (router, routes) = ApiRouter::<AppState>::new()
-//!     .group_with("admin", |g| {
+//!     .group_prefixed("admin", |g| {
 //!         g.auth_all()
 //!          .get("/projects", register!(list_projects))
 //!              .done()
