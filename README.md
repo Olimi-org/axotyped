@@ -32,18 +32,19 @@ pub async fn create_project(
     // ...
 }
 
-// register!() wires the handler into both the Axum router and type metadata
-fn routes() -> (Router<AppState>, RouteCollection) {
-    ApiRouter::<AppState>::new()
-        .group_with("projects", |g| {
+// define_routes! builds both the server router and TypeScript metadata
+define_routes! {
+    pub Routes for AppState, |r| {
+        r.group_prefixed("projects", |g| {
             g.auth_all()
-             .get("/projects", register!(list_projects))
-                 .done()
-             .post("/projects", register!(create_project))
-                 .done()
+             .get("/projects", register!(list_projects)).done()
+             .post("/projects", register!(create_project)).done()
         })
-        .build()
+    }
 }
+
+// Server startup:
+let app = Routes::router().with_state(state);
 ```
 
 Generates a TypeScript client:
@@ -122,7 +123,7 @@ pub async fn delete_project(
 }
 
 ApiRouter::<Arc<AppState>>::new()
-    .group_with("admin", |g| {
+    .group_prefixed("admin", |g| {
         g.auth_all()
          .post("/project", register!(create_project))
              .done()
@@ -150,24 +151,25 @@ Inner types of `Vec<T>` and `Option<T>` are automatically collected for TypeScri
 
 ### Grouping routes
 
-**`.group(name)`** — sets the TypeScript namespace for subsequent routes (no URL prefix):
+**`.group(name, closure)`** — sets the TypeScript namespace for routes inside the closure (no URL path prefix):
 
 ```rust
 ApiRouter::<AppState>::new()
-    .group("admin")
-    .get("/reports", register!(list_reports))
-        .auth()
-        .done()
-    // ...
+    .group("auth", |g| {
+        g.post("/login", register!(login)).done()
+         .post("/register", register!(register_user)).done()
+    })
+    .build()
+// Generates api.auth.login() and api.auth.registerUser() targeting /login and /register
 ```
 
-**`.group_with(name, closure)`** — closure-based grouping with scoped URL prefix, default auth, and TypeScript namespace. The group's config does not leak to routes registered after the closure.
+**`.group_prefixed(name, closure)`** — closure-based grouping with scoped URL path prefix (`/{name}`), default auth, and TypeScript namespace. The group's config does not leak to routes registered after the closure.
 
 The prefix defaults to `"/{name}"` but can be overridden with `.set_prefix()` inside the closure.
 
 ```rust
 ApiRouter::<Arc<AppState>>::new()
-    .group_with("admin", |g| {
+    .group_prefixed("admin", |g| {
         g.auth_all()
          .post("/project", register!(create_project))
              .done()
