@@ -22,24 +22,25 @@
 //!
 //! let (router, routes) = ApiRouter::<AppState>::new()
 //!     .group_prefixed("admin", |g| {
-//!         g.auth_all()
-//!          .get("/projects", register!(list_projects))
+//!         g.get("/projects", register!(list_projects))
 //!              .done()
 //!     })
 //!     .build();
 //! ```
 
+mod builder;
 mod generator;
 mod types;
-mod builder;
 #[macro_use]
 mod macros;
 
 // Re-export public API
-pub use generator::{CheckError, GeneratorConfig, check, generate, generate_to_file};
+pub use generator::{
+    CheckError, GeneratorConfig, check, generate, generate_to_file, generate_with_warnings,
+};
 pub use types::{
     Collector, HttpMethod, NoCollect, PathParam, RouteCollection, RouteDefinition, TypeRegistry,
-    extract_path_params,
+    extract_path_params, is_valid_js_identifier,
 };
 
 pub use builder::{

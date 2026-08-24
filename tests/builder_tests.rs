@@ -31,10 +31,7 @@ async fn list_users(
     Json(vec![])
 }
 
-async fn get_user(
-    State(_state): State<AppState>,
-    Path(_id): Path<String>,
-) -> Json<UserResponse> {
+async fn get_user(State(_state): State<AppState>, Path(_id): Path<String>) -> Json<UserResponse> {
     Json(UserResponse { _id: "1".into() })
 }
 
@@ -174,15 +171,11 @@ fn builder_group_scoping() {
 
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group("users", |g| {
-            g.get("/users", list_users)
-                .response::<Vec<UserResponse>>()
+            g.get("/users", list_users).response::<Vec<UserResponse>>()
         })
         .get("/health", health)
         .as_("health")
-        .group("admin", |g| {
-            g.delete("/users/{id}", delete_user)
-                .auth()
-        })
+        .group("admin", |g| g.delete("/users/{id}", delete_user))
         .build();
 
     assert_eq!(routes.routes()[0].group.as_deref(), Some("users"));
@@ -196,17 +189,12 @@ fn builder_group_scoping() {
 
 #[test]
 fn builder_merge() {
-    let users = ApiRouter::<AppState>::new()
-        .group("users", |g| {
-            g.get("/users", list_users)
-                .response::<Vec<UserResponse>>()
-        });
+    let users = ApiRouter::<AppState>::new().group("users", |g| {
+        g.get("/users", list_users).response::<Vec<UserResponse>>()
+    });
 
-    let admin = ApiRouter::<AppState>::new()
-        .group("admin", |g| {
-            g.delete("/users/{id}", delete_user)
-                .auth()
-        });
+    let admin =
+        ApiRouter::<AppState>::new().group("admin", |g| g.delete("/users/{id}", delete_user));
 
     let (_router, routes) = ApiRouter::<AppState>::new()
         .merge(users)

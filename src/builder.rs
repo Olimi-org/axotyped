@@ -36,6 +36,23 @@ use crate::types::{
 };
 
 // ---------------------------------------------------------------------------
+// Layer support
+// ---------------------------------------------------------------------------
+
+/// Type-erased layer application: wraps a router with a concrete tower layer.
+///
+/// Layers registered through [`ApiRouter::layer`] are stored in this erased
+/// form so a scope can hold an arbitrary mix of concrete layer types while
+/// keeping the builder's public API simple. Application happens per-route at
+/// registration time, so a layer only ever wraps routes from its own scope.
+type LayerApplier<S> = std::sync::Arc<dyn Fn(Router<S>) -> Router<S> + Send + Sync>;
+
+/// Apply every active scope layer to a freshly-built single-route router.
+fn apply_scope_layers<S>(router: Router<S>, layers: &[LayerApplier<S>]) -> Router<S> {
+    layers.iter().fold(router, |r, apply| apply(r))
+}
+
+// ---------------------------------------------------------------------------
 // Type-collection trait bound
 // ---------------------------------------------------------------------------
 
@@ -222,7 +239,15 @@ pub struct ApiRouter<S = (), C: Collector = NoCollect> {
     collector: C,
     current_group: Option<String>,
     current_prefix: Option<String>,
-    default_auth: bool,
+    /// Whether routes registered in this scope are public (`auth: false` in
+    /// codegen metadata).
+    ///
+    /// Routes are private unless opened: [`group_public`](Self::group_public)
+    /// plus `#[endpoint(public)]` on individual handlers.
+    scope_public: bool,
+    /// Layers active in this scope; applied to every route registered after
+    /// they were added (and inherited by nested group scopes).
+    layers: Vec<LayerApplier<S>>,
 }
 
 impl<S, C> ApiRouter<S, C>
@@ -238,7 +263,8 @@ where
             collector: C::default(),
             current_group: None,
             current_prefix: None,
-            default_auth: false,
+            scope_public: false,
+            layers: Vec::new(),
         }
     }
 
@@ -257,13 +283,93 @@ where
         self
     }
 
-    /// Make all subsequent routes require authentication by default.
+    /// Closure-based group containing **public-only** routes.
     ///
-    /// The generated TypeScript client will include `auth: true` for every
-    /// route, causing the `Authorization: Bearer <token>` header to be sent.
-    /// Individual routes can still call `.auth()` (no-op if already set).
-    pub fn auth_all(mut self) -> Self {
-        self.default_auth = true;
+    /// Every route is treated as requiring authentication unless it is declared
+    /// public either by living in a [`group_public`] scope or by its handler
+    /// carrying `#[endpoint(public)]`.
+    ///
+    /// Routes inside the closure inherit `name` as their TS client namespace
+    /// (no URL prefix is added — combine with [`set_prefix`](Self::set_prefix)
+    /// inside the closure for prefixed public groups, e.g. webhooks).
+    ///
+    /// The public scope does not leak: routes registered after the closure are
+    /// private again, and nested scopes inherit whatever their parent had.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// r.group_public("webhooks", |g| {
+    ///     g.set_prefix("/webhooks")
+    ///      .post("/stripe", register!(stripe_hook))
+    ///      .post("/github", register!(github_hook))   // both public
+    /// })
+    /// .post("/course", register!(create_course))       // requires auth
+    /// ```
+    pub fn group_public<R, F>(mut self, name: &str, routes: F) -> Self
+    where
+        F: FnOnce(ApiRouter<S, C>) -> R,
+        R: IntoApiRouter<S, C>,
+    {
+        let inner = ApiRouter {
+            router: Router::new(),
+            routes: Vec::new(),
+            collector: C::default(),
+            current_group: Some(name.to_string()),
+            current_prefix: self.current_prefix.clone(),
+            scope_public: true,
+            layers: self.layers.clone(),
+        };
+
+        let inner = routes(inner).into_api_router();
+
+        self.router = self.router.merge(inner.router);
+        self.routes.extend(inner.routes);
+        self.collector.merge_collection(inner.collector);
+        self
+    }
+
+    /// Closure-based group: scoped TS client namespace without modifying route path prefixes.
+    /// call within the current scope.
+    ///
+    /// Scope semantics (mirroring the other scope knobs):
+    /// - applies to routes registered after it in the current router/group
+    /// - inherited by nested [`group`](Self::group) / [`group_prefixed`](Self::group_prefixed)
+    ///   closures entered afterwards
+    /// - does not leak to the parent scope or sibling groups
+    /// - has zero effect on codegen: the [`RouteCollection`] is identical
+    ///   with or without layers
+    ///
+    /// Accepts any `tower::Layer` compatible with axum's routing — including
+    /// `axum::middleware::from_fn` / `from_fn_with_state` outputs and anything
+    /// from `tower-http`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// r.group_prefixed("admin", |g| {
+    ///     g.layer(axum::middleware::from_fn(require_admin))
+    ///         .post("/course", register!(create_course)) // layered
+    ///         .get("/course", register!(list_courses))   // layered
+    /// })
+    /// .get("/health", register!(health)) // NOT layered
+    /// ```
+    pub fn layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<axum::extract::Request, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Response:
+            axum::response::IntoResponse,
+        <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
+    {
+        self.layers
+            .push(std::sync::Arc::new(move |router: Router<S>| {
+                router.layer(layer.clone())
+            }));
         self
     }
 
