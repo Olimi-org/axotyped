@@ -73,7 +73,7 @@ pub use axotyped_macros::{endpoint, register};
 /// axotyped::define_routes! {
 ///     pub Routes for Arc<AppState>, |r| {
 ///         r.get("/health", axotyped::register!(health)).done()
-///             .group_prefixed("admin", |g| g.auth_all().post("/x", axotyped::register!(create_x)).done())
+///             .group_prefixed("admin", |g| g.post("/x", axotyped::register!(create_x)).done()) // private by default
 ///     }
 /// }
 ///

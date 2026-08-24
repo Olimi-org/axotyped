@@ -255,7 +255,9 @@ impl RouteCollection {
         }
 
         fs::create_dir_all(dir)?;
-        let cfg = crate::ts::Config::new().with_out_dir(dir.to_path_buf());
+        // from_env, not new: the documented TS_RS_* env vars (e.g.
+        // TS_RS_LARGE_INT) must apply to the export path too.
+        let cfg = crate::ts::Config::from_env().with_out_dir(dir.to_path_buf());
 
         for (_, export_fn) in self.types.slots() {
             if let Err(e) = export_fn(&cfg) {
@@ -332,19 +334,119 @@ impl<'a> IntoIterator for &'a RouteCollection {
     }
 }
 
+/// Whether `name` is a valid JavaScript identifier, safe to splice into
+/// generated code as a variable name as-is.
+///
+/// This is a conservative ASCII check (letters, `_`, `$`, digits — not starting
+/// with a digit) plus ECMAScript reserved-word rejection. Anything rejected
+/// here is replaced with a synthetic parameter name by
+/// [`extract_path_params`] / [`crate::generate`].
+pub fn is_valid_js_identifier(name: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "import",
+        "in",
+        "instanceof",
+        "new",
+        "null",
+        "return",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+    ];
+
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') && !RESERVED.contains(&name)
+}
+
 /// Extract path parameters from a route path string.
 ///
 /// For example, `/admin/users/{id}` returns `[PathParam { name: "id" }]`.
+///
+/// Every `{...}` brace group counts as a parameter regardless of surrounding
+/// text in its segment (matching axum's inline-capture forms like `{id}suffix`),
+/// and repeats collapse to their first occurrence.
+///
+/// Contents that are not valid JS identifiers are replaced with deterministic
+/// synthetic names (`__param_N`, by first-occurrence order); route paths are
+/// server-side strings and cannot be assumed safe for direct use as parameter
+/// names. The generator applies the exact same mapping when building path
+/// templates, keeping the emitted signature and the interpolated placeholders
+/// in sync.
 pub fn extract_path_params(path: &str) -> Vec<PathParam> {
-    path.split('/')
-        .filter_map(|seg| {
-            seg.strip_prefix('{')
-                .and_then(|s| s.strip_suffix('}'))
-                .map(|name| PathParam {
-                    name: name.to_string(),
-                })
+    scan_raw_path_params(path)
+        .into_iter()
+        .enumerate()
+        .map(|(index, raw)| PathParam {
+            name: sanitize_param_name(raw, index),
         })
         .collect()
+}
+
+/// Scan `path` left-to-right for `{...}` brace groups, returning the raw inner
+/// text of each group in first-occurrence order (duplicates dropped).
+///
+/// An unterminated `{` yields no group and stops the scan; the generator treats
+/// the remainder as literal text.
+fn scan_raw_path_params(path: &str) -> Vec<&str> {
+    let mut raws: Vec<&str> = Vec::new();
+    let mut rest = path;
+    while let Some(open) = rest.find('{') {
+        match rest[open..].find('}') {
+            Some(close_rel) => {
+                let raw = &rest[open + 1..open + close_rel];
+                if !raws.contains(&raw) {
+                    raws.push(raw);
+                }
+                rest = &rest[open + close_rel + 1..];
+            }
+            None => break,
+        }
+    }
+    raws
+}
+
+/// Deterministic raw-name → emitted-name mapping shared by parameter
+/// extraction and template generation, so a param's name in the generated
+/// signature always matches its placeholder in the path template.
+pub(crate) fn sanitize_param_name(raw: &str, index: usize) -> String {
+    if is_valid_js_identifier(raw) {
+        raw.to_string()
+    } else {
+        format!("__param_{index}")
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +472,41 @@ mod tests {
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].name, "org_id");
         assert_eq!(params[1].name, "user_id");
+    }
+
+    #[test]
+    fn extract_inline_capture_with_suffix() {
+        // axum accepts `{id}suffix`; the param must not vanish from the signature
+        let params = extract_path_params("/u/{id}v2");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "id");
+    }
+
+    #[test]
+    fn non_identifier_param_contents_become_synthetic_names() {
+        let params = extract_path_params("/u/{x`; alert(document.cookie); y}");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "__param_0");
+    }
+
+    #[test]
+    fn duplicate_params_collapse_to_first_occurrence() {
+        let params = extract_path_params("/{a}/{b}/{a}");
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "a");
+        assert_eq!(params[1].name, "b");
+    }
+
+    #[test]
+    fn js_identifier_validation() {
+        assert!(is_valid_js_identifier("id"));
+        assert!(is_valid_js_identifier("_private"));
+        assert!(is_valid_js_identifier("$ref"));
+        assert!(!is_valid_js_identifier("2fa"));
+        assert!(!is_valid_js_identifier("a b"));
+        assert!(!is_valid_js_identifier("class")); // reserved word
+        assert!(!is_valid_js_identifier(""));
+        assert!(!is_valid_js_identifier("a;evil()"));
     }
 
     #[test]

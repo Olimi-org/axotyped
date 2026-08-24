@@ -14,12 +14,13 @@
 ///         body: LoginRequest -> LoginResponse;
 ///     verify: POST "/verify-email"
 ///         body: VerifyEmailRequest -> MessageResponse;
-///     changePassword: POST "/change-password" [auth]
+///     changePassword: POST "/change-password"
 ///         body: ChangePasswordRequest -> MessageResponse;
-///     listUsers: GET "/admin/users" [auth]
+///     listUsers: GET "/admin/users"
 ///         query: ListUsersQuery -> Vec<UserResponse>;
-///     getUser: GET "/admin/users/{id}" [auth]
+///     getUser: GET "/admin/users/{id}"
 ///         -> UserResponse;
+///     healthCheck: GET "/health" [public]
 ///     authorize: GET "/oauth/{provider}/authorize" [redirect]
 ///         query: AuthorizeQuery;
 /// };
@@ -27,8 +28,10 @@
 ///
 /// # Elements
 ///
+/// Routes require authentication by default; `[public]` opts out.
+///
 /// - `@group <name>` — sets the group for all following routes (generates nested object)
-/// - `[auth]` — marks route as requiring authentication
+/// - `[public]` — marks route as public (no auth in the generated client)
 /// - `[redirect]` — marks route as a browser redirect (URL builder, not fetch)
 /// - `[ws]` — marks route as a WebSocket endpoint (generates typed WS client)
 /// - `send: <Type>` — client-to-server event type for WS routes
@@ -78,7 +81,7 @@ macro_rules! api_routes {
             name: stringify!($name).to_string(),
             method: $crate::api_routes!(@method $method),
             path: $path.to_string(),
-            auth: $crate::api_routes!(@has_flag auth $([$($flag),*])?),
+            auth: !$crate::api_routes!(@has_flag public $([$($flag),*])?),
             body_type: None,
             response_type: None,
             query_type: $crate::api_routes!(@opt_type $($qo $(<$qi>)?)?),
@@ -106,7 +109,7 @@ macro_rules! api_routes {
             name: stringify!($name).to_string(),
             method: $crate::api_routes!(@method $method),
             path: $path.to_string(),
-            auth: $crate::api_routes!(@has_flag auth $([$($flag),*])?),
+            auth: !$crate::api_routes!(@has_flag public $([$($flag),*])?),
             body_type: $crate::api_routes!(@opt_type $($bo $(<$bi>)?)?),
             response_type: $crate::api_routes!(@opt_type $($ro $(<$ri>)?)?),
             query_type: $crate::api_routes!(@opt_type $($qo $(<$qi>)?)?),

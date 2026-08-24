@@ -34,6 +34,17 @@ pub struct GeneratorConfig {
     /// Optional shell command to format the generated file (e.g., `"biome format --write"`).
     /// The output file path is appended as the last argument.
     pub format_command: Option<String>,
+    /// Path of the server endpoint issuing single-use WebSocket tickets
+    /// (e.g., `Some("/ws/ticket")`).
+    ///
+    /// When set, every `[ws][auth]` route is generated as an async ticket
+    /// handshake: an authenticated POST returns `{ ticket: string }`, and only
+    /// that short-lived single-use proof touches the WS URL — keeping
+    /// long-lived credentials out of access logs, proxies, and history.
+    ///
+    /// When `None` (default), `[ws][auth]` routes generate a client with **no**
+    /// credential pathway, and [`generate_with_warnings`] emits a diagnostic.
+    pub ws_ticket_path: Option<String>,
 }
 
 impl Default for GeneratorConfig {
@@ -48,6 +59,7 @@ impl Default for GeneratorConfig {
             default_credentials: "include".into(),
             type_import_prefix: String::new(),
             format_command: None,
+            ws_ticket_path: None,
         }
     }
 }
@@ -268,20 +280,115 @@ fn compute_import_prefix(config: &GeneratorConfig) -> String {
 
 /// Build the path template string for TypeScript.
 ///
-/// `/admin/users/{id}` -> `` `/admin/users/${id}` ``
+/// `/admin/users/{id}` -> `` `/admin/users/${encodeURIComponent(id)}` ``
+///
+/// Behavior notes:
+/// - literal text is escaped for its target string context — backslash,
+///   backtick, and `${` are neutralized inside template literals and `\`/`"`
+///   inside plain strings — so every character in a route path is emitted as
+///   inert string data;
+/// - brace groups become `${encodeURIComponent(<param>)}` placeholders whose
+///   names go through the exact same deterministic sanitization as
+///   [`crate::extract_path_params`], keeping signatures and templates in sync;
+/// - parameters are URL-encoded at runtime so values cannot smuggle path
+///   traversal (`../`) or query syntax (`?`, `#`) into the request path.
 fn build_path_template(path: &str) -> String {
     if !path.contains('{') {
-        return format!("\"{path}\"");
+        return format!("\"{}\"", escape_double_quoted(path));
     }
+
     let mut template = String::new();
-    for ch in path.chars() {
-        if ch == '{' {
-            template.push_str("${");
-        } else {
-            template.push(ch);
+    // raw name -> emitted name, mirroring scan order in `extract_path_params`
+    let mut seen: Vec<(&str, String)> = Vec::new();
+    let mut rest = path;
+
+    loop {
+        match rest.find('{') {
+            None => {
+                push_escaped_template_text(&mut template, rest);
+                break;
+            }
+            Some(open) => {
+                push_escaped_template_text(&mut template, &rest[..open]);
+                let after = &rest[open..];
+                match after[1..].find('}') {
+                    None => {
+                        // Unterminated brace: emit as inert literal text.
+                        push_escaped_template_text(&mut template, after);
+                        break;
+                    }
+                    Some(close_rel) => {
+                        let raw = &after[1..1 + close_rel];
+                        let safe = match seen.iter().find(|(r, _)| *r == raw) {
+                            Some((_, safe)) => safe.clone(),
+                            None => {
+                                let safe = crate::types::sanitize_param_name(raw, seen.len());
+                                seen.push((raw, safe.clone()));
+                                safe
+                            }
+                        };
+                        template.push_str("${encodeURIComponent(");
+                        template.push_str(&safe);
+                        template.push_str(")}");
+                        rest = &after[1 + close_rel + 1..];
+                    }
+                }
+            }
         }
     }
+
     format!("`{template}`")
+}
+
+/// Escape `text` for interpolation inside a JS double-quoted string literal.
+fn escape_double_quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape `text` for interpolation inside a JS template literal: neutralizes
+/// backslash, backtick, and `${` sequence starts.
+fn push_escaped_template_text(out: &mut String, text: &str) {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '`' => out.push_str("\\`"),
+            '$' if chars.peek() == Some(&'{') => out.push_str("$\\{"),
+            _ => out.push(c),
+        }
+    }
+}
+
+/// Escape `text` for use as a double-quoted JS property key / string:
+/// backslash, quote, control characters, and line-separator code points that
+/// are valid JSON escapes but syntactically dangerous in JS source.
+pub(crate) fn escape_js_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' | '\u{2029}' => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Generate a function's parameter list for a route.
@@ -339,6 +446,14 @@ const OPTIONS_INTERFACE: &str = r#"export interface __OPTS__ {
   credentials?: RequestCredentials;
   fetch?: typeof fetch;
   onError?: (error: __ERROR__) => void;
+  /**
+   * Opt-in ONLY for development against a non-loopback http:// target
+   * (e.g. an Expo device hitting your LAN IP). Loopback hosts
+   * (localhost / 127.0.0.1 / ::1 / *.localhost) are always permitted over
+   * http without this flag. Never set in production — CI should assert its
+   * absence.
+   */
+  allowInsecureHttp?: boolean;
 }
 "#;
 
@@ -351,7 +466,42 @@ type RequestOptions = {
 };
 ";
 
-const REQUEST_HELPER: &str = r#"function createRequest(options: __OPTS__) {
+const REQUEST_HELPER: &str = r#"function assertSecureTransport(
+  url: string,
+  allowInsecureHttp: boolean,
+): void {
+  // Transport guard: credentials must only ride https. Loopback hosts are
+  // inherently local and always allowed over http; anything else requires
+  // the explicit allowInsecureHttp development opt-in. Fails closed on
+  // unparseable URLs and non-http(s) protocols.
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(
+      `Client produced an unparseable URL (${JSON.stringify(url)}); refusing to send credentials.`,
+    );
+  }
+  if (parsed.protocol === "https:") return;
+  const h = parsed.hostname;
+  const isLoopback =
+    h === "localhost" ||
+    h.endsWith(".localhost") ||
+    h === "127.0.0.1" ||
+    h === "::1" ||
+    h === "[::1]";
+  const insecureAllowed =
+    parsed.protocol === "http:" && (isLoopback || allowInsecureHttp);
+  if (!insecureAllowed) {
+    throw new Error(
+      parsed.protocol === "http:"
+        ? `Refusing to send credentials over http:// to non-loopback host "${h}". Use https:// in production; set allowInsecureHttp on the client options for LAN/device development.`
+        : `Unsupported protocol ${parsed.protocol} for credential-bearing requests.`,
+    );
+  }
+}
+
+function createRequest(options: __OPTS__) {
   const { baseUrl, credentials = "__CREDS__" } = options;
   async function request<T>(
     path: string,
@@ -377,16 +527,32 @@ const REQUEST_HELPER: &str = r#"function createRequest(options: __OPTS__) {
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };
 
-    if (auth && options.getToken) {
+    // Credentials are only sent over https, to loopback hosts over http,
+    // or when the client was explicitly configured with allowInsecureHttp.
+    assertSecureTransport(url, options.allowInsecureHttp === true);
+
+    // An [auth] route requires a token: without one configured or returned,
+    // the request is aborted rather than sent unauthenticated.
+    if (auth) {
+      if (!options.getToken) {
+        throw new Error(
+          `Route declared [auth] but options.getToken was not configured (${method} ${path})`,
+        );
+      }
       const token = await options.getToken();
-      if (token) headers.Authorization = `Bearer ${token}`;
+      if (!token) {
+        throw new Error(
+          `options.getToken() returned no token for an [auth] route (${method} ${path})`,
+        );
+      }
+      headers.Authorization = `Bearer ${token}`;
     }
 
     const response = await fetchFn(url, {
       method,
       credentials,
       headers,
-      body: body ? JSON.stringify(body) : undefined,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
     });
 
     if (!response.ok) {
@@ -446,7 +612,43 @@ const TYPED_WS_HELPER: &str = r#"function createTypedWebSocket<TSend, TReceive>(
 // ---------------------------------------------------------------------------
 
 /// Generate the full TypeScript client source code.
+///
+/// Discards diagnostics — prefer [`generate_with_warnings`] in CI/codegen
+/// entry points so configuration gaps (e.g. `[ws][auth]` without a ticket
+/// endpoint) surface instead of passing silently.
 pub fn generate(routes: &RouteCollection, config: &GeneratorConfig) -> String {
+    generate_with_warnings(routes, config).0
+}
+
+/// Generate the client source alongside non-fatal diagnostics.
+///
+/// Warnings are human-readable strings describing routes whose generated
+/// client cannot honor their declared metadata — currently:
+/// - a `[ws][auth]` route while [`GeneratorConfig::ws_ticket_path`] is unset:
+///   browsers cannot set headers on the WS handshake, so the generated client
+///   has no credential pathway and consumers will resort to query-string
+///   tokens.
+pub fn generate_with_warnings(
+    routes: &RouteCollection,
+    config: &GeneratorConfig,
+) -> (String, Vec<String>) {
+    let mut warnings = Vec::new();
+    if config.ws_ticket_path.is_none() {
+        for route in routes.iter().filter(|r| r.websocket && r.auth) {
+            warnings.push(format!(
+                "route '{}': declared [ws][auth] but the generated WebSocket client has no \
+                 credential pathway (browsers cannot set headers on the WS handshake). Set \
+                 GeneratorConfig::ws_ticket_path to emit the ticket-handshake flow, otherwise \
+                 consumers will push tokens into the query string where they leak to logs.",
+                route.name
+            ));
+        }
+    }
+
+    (generate_client(routes, config), warnings)
+}
+
+fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String {
     let mut out = String::new();
 
     // Header
@@ -526,9 +728,9 @@ pub fn generate(routes: &RouteCollection, config: &GeneratorConfig) -> String {
     w!(out, "  return {{");
 
     if config.enable_groups {
-        generate_grouped_routes(&mut out, routes);
+        generate_grouped_routes(&mut out, routes, config);
     } else {
-        generate_flat_routes(&mut out, routes);
+        generate_flat_routes(&mut out, routes, config);
     }
 
     w!(out, "  }};");
@@ -546,7 +748,7 @@ pub fn generate(routes: &RouteCollection, config: &GeneratorConfig) -> String {
 }
 
 /// Generate routes organized into groups (nested objects).
-fn generate_grouped_routes(out: &mut String, routes: &RouteCollection) {
+fn generate_grouped_routes(out: &mut String, routes: &RouteCollection, config: &GeneratorConfig) {
     let mut ungrouped: Vec<&RouteDefinition> = Vec::new();
     let mut groups: BTreeMap<String, Vec<&RouteDefinition>> = BTreeMap::new();
 
@@ -559,7 +761,7 @@ fn generate_grouped_routes(out: &mut String, routes: &RouteCollection) {
 
     for route in &ungrouped {
         write!(out, "    ").unwrap();
-        generate_route_method(out, route, 4);
+        generate_route_method(out, route, 4, config);
         w!(out, ",");
     }
 
@@ -567,10 +769,12 @@ fn generate_grouped_routes(out: &mut String, routes: &RouteCollection) {
         if !ungrouped.is_empty() || groups.keys().next() != Some(group_name) {
             w!(out);
         }
-        w!(out, "    {group_name}: {{");
+        // Group names come from free-form &str at registration time; quote and
+        // emit it as a quoted, escaped property key.
+        w!(out, "    \"{}\": {{", escape_js_string(group_name));
         for route in group_routes {
             write!(out, "      ").unwrap();
-            generate_route_method(out, route, 6);
+            generate_route_method(out, route, 6, config);
             w!(out, ",");
         }
         w!(out, "    }},");
@@ -578,18 +782,23 @@ fn generate_grouped_routes(out: &mut String, routes: &RouteCollection) {
 }
 
 /// Generate routes in a flat structure (no grouping).
-fn generate_flat_routes(out: &mut String, routes: &RouteCollection) {
+fn generate_flat_routes(out: &mut String, routes: &RouteCollection, config: &GeneratorConfig) {
     for route in routes {
         write!(out, "    ").unwrap();
-        generate_route_method(out, route, 4);
+        generate_route_method(out, route, 4, config);
         w!(out, ",");
     }
 }
 
 /// Generate a single route method.
-fn generate_route_method(out: &mut String, route: &RouteDefinition, indent: usize) {
+fn generate_route_method(
+    out: &mut String,
+    route: &RouteDefinition,
+    indent: usize,
+    config: &GeneratorConfig,
+) {
     if route.websocket {
-        generate_ws_method(out, route, indent);
+        generate_ws_method(out, route, indent, config);
     } else if route.redirect {
         generate_redirect_method(out, route, indent);
     } else {
@@ -684,13 +893,32 @@ fn derive_type_name(factory_name: &str) -> String {
 /// When send/receive types are defined, produces a TypeScript factory that
 /// returns a `TypedWebSocket<S, R>` with typed `send()` and `onMessage()`.
 /// Otherwise produces a bare `new WebSocket(url)`.
-fn generate_ws_method(out: &mut String, route: &RouteDefinition, indent: usize) {
+///
+/// Authenticated routes ([`GeneratorConfig::ws_ticket_path`] set + `auth`) are
+/// generated as an async ticket handshake: an authenticated POST to the
+/// ticket endpoint yields a single-use short-TTL ticket, and only that proof
+/// is appended to the WS URL — long-lived credentials never enter the URL,
+/// where they would leak to access logs, proxies, and browser history. The
+/// server must consume tickets atomically on upgrade.
+fn generate_ws_method(
+    out: &mut String,
+    route: &RouteDefinition,
+    indent: usize,
+    config: &GeneratorConfig,
+) {
     let name = &route.name;
     let path_template = build_path_template(&route.path);
     let path_inner = &path_template[1..path_template.len() - 1];
     let pad = " ".repeat(indent);
     let pad2 = " ".repeat(indent + 2);
     let pad4 = " ".repeat(indent + 4);
+
+    // Ticket-handshake mode applies to [auth] routes when configured:
+    let ticket_mode = if route.auth {
+        config.ws_ticket_path.as_ref()
+    } else {
+        None
+    };
 
     // Build function parameters: path params + optional query
     let mut fn_params = Vec::new();
@@ -704,21 +932,51 @@ fn generate_ws_method(out: &mut String, route: &RouteDefinition, indent: usize) 
 
     // Determine return type
     let has_types = route.ws_send_type.is_some() && route.ws_receive_type.is_some();
-    let return_type = if has_types {
+    let ws_type = if has_types {
         let send_ts = rust_type_to_ts(route.ws_send_type.as_ref().unwrap());
         let recv_ts = rust_type_to_ts(route.ws_receive_type.as_ref().unwrap());
-        format!("TypedWebSocket<{}, {}>", send_ts, recv_ts)
+        format!("TypedWebSocket<{send_ts}, {recv_ts}>")
     } else {
         "WebSocket".into()
     };
+    let return_type = if ticket_mode.is_some() {
+        format!("Promise<{ws_type}>")
+    } else {
+        ws_type.clone()
+    };
 
-    w!(out, "{name}: ({all_params}): {return_type} => {{");
+    w!(
+        out,
+        "{name}: {}({all_params}): {return_type} => {{",
+        if ticket_mode.is_some() { "async " } else { "" }
+    );
 
     // Convert http(s) to ws(s)
     w!(
         out,
         "{pad2}const baseUrl = options.baseUrl.replace(/^http/, (m) => m === \"https\" ? \"wss\" : \"ws\");"
     );
+
+    // Ticket handshake first: the long-lived credential rides the header
+    // channel; only the single-use proof it returns touches the URL below.
+    if let Some(ticket_path) = ticket_mode {
+        w!(out);
+        w!(
+            out,
+            "{pad2}// Authenticated ticket roundtrip — server must issue a single-use,"
+        );
+        w!(
+            out,
+            "{pad2}// short-TTL ticket bound to the caller and consume it on upgrade."
+        );
+        w!(
+            out,
+            "{pad2}const {{ ticket: __wsTicket }} = await request<{{ ticket: string }}>(\"{}\",",
+            escape_double_quoted(ticket_path)
+        );
+        w!(out, "{pad2}  {{ method: \"POST\", auth: true }},");
+        w!(out, "{pad2});");
+    }
 
     // Build path with params
     w!(out, "{pad2}let url = `${{baseUrl}}{path_inner}`;");
@@ -741,15 +999,31 @@ fn generate_ws_method(out: &mut String, route: &RouteDefinition, indent: usize) 
         w!(out, "{pad2}}}");
     }
 
+    // Append the single-use ticket last so it composes with any query string
+    if ticket_mode.is_some() {
+        w!(
+            out,
+            "{pad2}url += `${{url.includes(\"?\") ? \"&\" : \"?\"}}ticket=${{encodeURIComponent(__wsTicket)}}`;"
+        );
+    }
+
     if has_types {
-        w!(out, "{pad2}const ws = new WebSocket(url);");
         let send_ts = rust_type_to_ts(route.ws_send_type.as_ref().unwrap());
         let recv_ts = rust_type_to_ts(route.ws_receive_type.as_ref().unwrap());
+        w!(
+            out,
+            "{pad2}assertSecureTransport(url, options.allowInsecureHttp === true);"
+        );
+        w!(out, "{pad2}const ws = new WebSocket(url);");
         w!(
             out,
             "{pad2}return createTypedWebSocket<{send_ts}, {recv_ts}>(ws);"
         );
     } else {
+        w!(
+            out,
+            "{pad2}assertSecureTransport(url, options.allowInsecureHttp === true);"
+        );
         w!(out, "{pad2}return new WebSocket(url);");
     }
 
@@ -917,12 +1191,27 @@ mod tests {
     fn test_build_path_template_with_params() {
         assert_eq!(
             build_path_template("/admin/users/{id}"),
-            "`/admin/users/${id}`"
+            "`/admin/users/${encodeURIComponent(id)}`"
         );
         assert_eq!(
             build_path_template("/orgs/{org}/users/{id}"),
-            "`/orgs/${org}/users/${id}`"
+            "`/orgs/${encodeURIComponent(org)}/users/${encodeURIComponent(id)}`"
         );
+    }
+
+    #[test]
+    fn test_build_path_template_escapes_special_characters() {
+        // Backticks / ${ cannot break out of the emitted template literal:
+        assert_eq!(
+            build_path_template("/x/{id}`+alert(1)+`"),
+            "`/x/${encodeURIComponent(id)}\\`+alert(1)+\\``"
+        );
+        assert!(
+            !build_path_template("/x${evil}y").contains("${evil"),
+            "dollar-brace sequences in literal text must be escaped"
+        );
+        // Double-quoted branch escapes quotes/backslashes:
+        assert_eq!(build_path_template("/a\"b"), "\"/a\\\"b\"");
     }
 
     #[test]

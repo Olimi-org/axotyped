@@ -10,17 +10,16 @@
 //! use axotyped::ApiRouter;
 //!
 //! // Manual type specification (still supported):
+//! // Routes are PRIVATE by default; use group_public or #[endpoint(public)] to open them.
 //! let (router, routes) = ApiRouter::<AppState>::new()
 //!     .get("/users", list_users)
 //!         .response::<Vec<UserResponse>>()
-//!         .auth()
 //!         .done()
 //!     .build();
 //!
 //! // Auto-inferred types via #[endpoint] + register!():
 //! let (router, routes) = ApiRouter::<AppState>::new()
 //!     .get("/users", register!(list_users))
-//!         .auth()
 //!         .done()
 //!     .build();
 //! ```
@@ -390,7 +389,8 @@ where
             collector: C::default(),
             current_group: Some(name.to_string()),
             current_prefix: self.current_prefix.clone(),
-            default_auth: self.default_auth,
+            scope_public: self.scope_public,
+            layers: self.layers.clone(),
         };
 
         let inner = routes(inner).into_api_router();
@@ -414,8 +414,7 @@ where
     ///
     /// ```rust,ignore
     /// .group_prefixed("admin", |g| {
-    ///     g.auth_all()
-    ///      .post("/course", create_course)
+    ///     g.post("/course", create_course)
     ///         .body::<CreateCourseRequest>()
     ///         .response::<CourseRecord>()
     ///      .get("/course", list_courses)
@@ -437,7 +436,8 @@ where
             collector: C::default(),
             current_group: Some(name.to_string()),
             current_prefix: Some(default_prefix),
-            default_auth: self.default_auth,
+            scope_public: self.scope_public,
+            layers: self.layers.clone(),
         };
 
         let inner = routes(inner).into_api_router();
@@ -485,9 +485,10 @@ where
             to_method_router,
             ep,
             &self.current_prefix,
-            self.default_auth,
+            self.scope_public,
             &self.current_group,
             false,
+            &self.layers,
         );
         EH::apply_meta::<C>(&mut def, &mut self.collector);
         RouteBuilder { parent: self, def }
@@ -566,9 +567,10 @@ where
             routing::get,
             ep,
             &self.current_prefix,
-            self.default_auth,
+            self.scope_public,
             &self.current_group,
             true,
+            &self.layers,
         );
         EH::apply_meta::<C>(&mut def, &mut self.collector);
         WsRouteBuilder { parent: self, def }
@@ -586,6 +588,11 @@ fn resolve_prefix(prefix: &Option<String>, path: &str) -> String {
 /// Register `ep` into `router`, derive its client method name, and build the initial
 /// [`RouteDefinition`].
 ///
+/// The route is built into an isolated single-route [`Router`], wrapped with
+/// every layer active in the current scope (`layers`), then merged into
+/// `router`. Per-route application guarantees a layer only ever wraps routes
+/// from its own scope — no double-application across group merges.
+///
 /// Generic over the handler but **not** over the collector, so this per-endpoint work (name
 /// derivation, routing, the 13-field definition literal) is monomorphized once per handler type
 /// rather than once per handler-per-collector. The collector-specific part (`apply_meta`) stays in
@@ -597,9 +604,10 @@ fn route_into_def<S, EH, T>(
     to_method_router: fn(EH::Handler) -> MethodRouter<S>,
     ep: EH,
     prefix: &Option<String>,
-    default_auth: bool,
+    public_scope: bool,
     group: &Option<String>,
     websocket: bool,
+    layers: &[LayerApplier<S>],
 ) -> RouteDefinition
 where
     S: Clone + Send + Sync + 'static,
@@ -610,12 +618,14 @@ where
     let name = default_name_from_handler::<EH::Handler>();
     let handler = ep.into_handler();
     let full_path = resolve_prefix(prefix, path);
-    *router = std::mem::take(router).route(&full_path, to_method_router(handler));
+    let mini = Router::<S>::new().route(&full_path, to_method_router(handler));
+    let layered = apply_scope_layers(mini, layers);
+    *router = std::mem::take(router).merge(layered);
     RouteDefinition {
         name,
         method,
         path: full_path,
-        auth: default_auth,
+        auth: !public_scope,
         body_type: None,
         response_type: None,
         query_type: None,
@@ -702,7 +712,10 @@ where
     F: FnOnce(ApiRouter<S, NoCollect>) -> R,
     R: IntoApiRouter<S, NoCollect>,
 {
-    define(ApiRouter::<S, NoCollect>::new()).into_api_router().build().0
+    define(ApiRouter::<S, NoCollect>::new())
+        .into_api_router()
+        .build()
+        .0
 }
 
 /// Collect route types (for TypeScript binding generation) from the same route-definition
@@ -717,7 +730,10 @@ where
     F: FnOnce(ApiRouter<S, TypeRegistry>) -> R,
     R: IntoApiRouter<S, TypeRegistry>,
 {
-    define(ApiRouter::<S, TypeRegistry>::new()).into_api_router().build().1
+    define(ApiRouter::<S, TypeRegistry>::new())
+        .into_api_router()
+        .build()
+        .1
 }
 
 /// Build both the server [`Router`] and the collected [`RouteCollection`] from a single
@@ -734,7 +750,9 @@ where
     F: FnOnce(ApiRouter<S, TypeRegistry>) -> R,
     R: IntoApiRouter<S, TypeRegistry>,
 {
-    define(ApiRouter::<S, TypeRegistry>::new()).into_api_router().build()
+    define(ApiRouter::<S, TypeRegistry>::new())
+        .into_api_router()
+        .build()
 }
 
 /// Trait for declaring application route tables with zero-cost lean and collecting builder methods.
@@ -757,7 +775,7 @@ where
 ///         r: ApiRouter<Arc<AppState>, C>,
 ///     ) -> R {
 ///         r.get("/health", register!(health))
-///          .group_prefixed("admin", |g| g.auth_all().post("/x", register!(create_x)))
+///          r.group_prefixed("admin", |g| g.post("/x", register!(create_x))) // private by default
 ///     }
 /// }
 ///
@@ -801,6 +819,29 @@ pub trait RouteTable<S> {
     {
         build_typed(|r| Self::define(r))
     }
+
+    /// Without the `ts-rs` feature there are no types to export, but route
+    /// *metadata* (names, paths, auth flags, params) still collects — matching
+    /// [`MaybeTs`]'s no-op-collection design — so callers behave identically
+    /// minus the type bindings.
+    #[cfg(not(feature = "ts-rs"))]
+    fn build() -> (Router<S>, RouteCollection)
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        Self::define(ApiRouter::<S, NoCollect>::new())
+            .into_api_router()
+            .build()
+    }
+
+    /// Collect route metadata without the `ts-rs` feature (no type bindings).
+    #[cfg(not(feature = "ts-rs"))]
+    fn collect_types() -> RouteCollection
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        Self::build().1
+    }
 }
 
 impl<S, C> Default for ApiRouter<S, C>
@@ -818,7 +859,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// In-progress route definition. Chain `.body::<T>()`, `.response::<T>()`,
-/// `.auth()`, `.redirect()`, then finalize with `.done()` or `.as_("name")`.
+/// `.redirect()`, then finalize with `.done()` or `.as_("name")`.
 pub struct RouteBuilder<S, C: Collector = NoCollect> {
     parent: ApiRouter<S, C>,
     def: RouteDefinition,
@@ -855,7 +896,6 @@ where
     /// ```rust,ignore
     /// .post("/users", create_user)
     ///     .json::<CreateUserRequest, UserResponse>()
-    ///     .auth()
     ///     .done()
     /// ```
     pub fn json<B: MaybeTs + 'static, R: MaybeTs + 'static>(mut self) -> Self {
@@ -863,12 +903,6 @@ where
         self.def.response_type = Some(type_string::<R>());
         self.parent.collector.register::<B>();
         self.parent.collector.register::<R>();
-        self
-    }
-
-    /// Mark this route as requiring authentication.
-    pub fn auth(mut self) -> Self {
-        self.def.auth = true;
         self
     }
 
@@ -977,11 +1011,6 @@ where
         self.done().set_prefix(prefix)
     }
 
-    /// Require authentication on all subsequent routes, auto-finalizing the current route in the chain.
-    pub fn auth_all(self) -> ApiRouter<S, C> {
-        self.done().auth_all()
-    }
-
     /// Finalize the route and consume the builder to return the [`axum::Router`] and [`RouteCollection`].
     pub fn build(self) -> (Router<S>, RouteCollection) {
         self.done().build()
@@ -995,9 +1024,8 @@ where
 /// Constrained builder for WebSocket routes.
 ///
 /// Only exposes methods relevant to WebSocket endpoints:
-/// - `.query::<T>()` — query parameters (e.g., auth token)
+/// - `.query::<T>()` — query parameters
 /// - `.events::<S, R>()` — client-to-server (`S`) and server-to-client (`R`) event types
-/// - `.auth()` — mark as requiring authentication
 /// - `.done()` / `.as_("name")` — finalize
 ///
 /// Methods that don't make sense for WS (`.body()`, `.response()`, `.json()`,
@@ -1034,13 +1062,10 @@ where
         self
     }
 
-    /// Mark this route as requiring authentication.
-    pub fn auth(mut self) -> Self {
-        self.def.auth = true;
-        self
-    }
-
     /// Internal helper: finalize the route into parent ApiRouter.
+    ///
+    /// Public visibility for WebSocket routes comes from `group_public` or
+    /// `#[endpoint(public)]`, like every other route.
     fn done(mut self) -> ApiRouter<S, C> {
         self.parent.routes.push(self.def);
         self.parent
@@ -1136,11 +1161,6 @@ where
     /// Set a URL prefix on the parent router, auto-finalizing the current WS route in the chain.
     pub fn set_prefix(self, prefix: &str) -> ApiRouter<S, C> {
         self.done().set_prefix(prefix)
-    }
-
-    /// Require authentication on all subsequent routes, auto-finalizing the current WS route in the chain.
-    pub fn auth_all(self) -> ApiRouter<S, C> {
-        self.done().auth_all()
     }
 
     /// Finalize the route and consume the builder to return the [`axum::Router`] and [`RouteCollection`].

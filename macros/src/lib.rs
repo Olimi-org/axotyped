@@ -28,6 +28,13 @@ use syn::{FnArg, ItemFn, PathArguments, ReturnType, Type, parse_macro_input};
 /// Generates a companion struct `<fn_name>__EndpointMeta` implementing `EndpointMeta`,
 /// which carries the inferred `body_type`, `response_type`, and `query_type`.
 ///
+/// # Visibility
+///
+/// Routes require authentication unless declared public. Use
+/// `#[endpoint(public)]` to mark an individual handler's route public (the
+/// scope-wide alternative is [`ApiRouter::group_public`] / `group_public` on
+/// the builder).
+///
 /// # Extracted types
 ///
 /// - **Body type**: inner `T` from `Json<T>` in function parameters
@@ -36,8 +43,26 @@ use syn::{FnArg, ItemFn, PathArguments, ReturnType, Type, parse_macro_input};
 ///
 /// Handlers returning `Result<StatusCode, StatusCode>` (no body) produce no response type.
 #[proc_macro_attribute]
-pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
+
+    // Options: `#[endpoint]` or `#[endpoint(public)]` — anything else is a
+    // compile error so typos can never silently flip visibility.
+    let mut is_public = false;
+    let attr_tts: Vec<proc_macro::TokenTree> = attr.into_iter().collect();
+    match attr_tts.as_slice() {
+        [] => {}
+        [proc_macro::TokenTree::Ident(id)] if id.to_string() == "public" => is_public = true,
+        _ => {
+            return quote! {
+                compile_error!(
+                    "axotyped: #[endpoint] accepts no arguments or exactly `public` \
+                     — e.g. #[endpoint(public)]"
+                );
+            }
+            .into();
+        }
+    }
 
     let fn_name = &item_fn.sig.ident;
     let meta_struct_name = quote::format_ident!("{}__EndpointMeta", fn_name);
@@ -82,6 +107,13 @@ pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! {},
     };
 
+    // Only `#[endpoint(public)]` opens a route.
+    let visibility_stmt = if is_public {
+        quote! { __def.auth = false; }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         // Original function unchanged
         #item_fn
@@ -95,6 +127,7 @@ pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 #body_register
                 #query_register
                 #response_register
+                #visibility_stmt
             }
         }
     };

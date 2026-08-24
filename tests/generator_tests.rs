@@ -11,6 +11,7 @@ fn yauth_config() -> GeneratorConfig {
         default_credentials: "include".into(),
         type_import_prefix: "../../../../bindings".into(),
         format_command: None,
+        ws_ticket_path: None,
     }
 }
 
@@ -158,10 +159,10 @@ fn generates_grouped_routes() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Group structure
-    assert!(output.contains("emailPassword: {"));
-    assert!(output.contains("admin: {"));
-    assert!(output.contains("oauth: {"));
+    // Group structure (keys are quoted+escaped property names)
+    assert!(output.contains("\"emailPassword\": {"));
+    assert!(output.contains("\"admin\": {"));
+    assert!(output.contains("\"oauth\": {"));
 
     // Group methods
     assert!(output.contains("register: (body: RegisterRequest)"));
@@ -174,9 +175,9 @@ fn generates_path_params() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Path params become function args and template literals
+    // Path params become function args and encoded template literals
     assert!(output.contains("getUser: (id: string)"));
-    assert!(output.contains("`/admin/users/${id}`"));
+    assert!(output.contains("`/admin/users/${encodeURIComponent(id)}`"));
     assert!(output.contains("banUser: (id: string, body: BanRequest)"));
 }
 
@@ -435,8 +436,8 @@ fn generates_websocket_route() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Should have the realtime group
-    assert!(output.contains("realtime: {"));
+    // Should have the realtime group (quoted+escaped key)
+    assert!(output.contains("\"realtime\": {"));
 
     // Should have TypedWebSocket interface and helper
     assert!(output.contains("export interface TypedWebSocket<TSend, TReceive>"));
@@ -508,8 +509,8 @@ fn generates_websocket_with_path_params() {
     // Should have path param as function arg
     assert!(output.contains("sessionWs: (sessionId: string, query?: WsParams)"));
 
-    // Should use template literal for path
-    assert!(output.contains("${sessionId}"));
+    // Should use encoded template literal for path
+    assert!(output.contains("${encodeURIComponent(sessionId)}"));
 
     // Should return typed WS
     assert!(output.contains("TypedWebSocket<ClientEvent, ServerEvent>"));

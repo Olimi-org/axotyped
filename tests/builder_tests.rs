@@ -1,4 +1,4 @@
-use axotyped::{ApiRouter, HttpMethod};
+use axotyped::{ApiRouter, HttpMethod, IntoApiRouter};
 use axum::extract::{Json, Path, State};
 use serde::Deserialize;
 
@@ -91,7 +91,6 @@ fn json_shorthand() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .post("/users", create_user)
         .json::<CreateUserRequest, UserResponse>()
-        .auth()
         .build();
 
     let r = &routes.routes()[0];
@@ -115,7 +114,6 @@ fn json_shorthand_put() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .put("/users/{id}", update_user)
         .json::<CreateUserRequest, UserResponse>()
-        .auth()
         .build();
 
     let r = &routes.routes()[0];
@@ -136,16 +134,12 @@ fn builder_full_api() {
         .group("users", |g| {
             g.get("/users", list_users)
                 .response::<Vec<UserResponse>>()
-                .auth()
                 .get("/users/{id}", get_user)
                 .response::<UserResponse>()
-                .auth()
                 .as_("getById")
                 .post("/users", create_user)
                 .json::<CreateUserRequest, UserResponse>()
-                .auth()
                 .delete("/users/{id}", delete_user)
-                .auth()
         })
         .build();
 
@@ -233,7 +227,8 @@ fn builder_redirect() {
 
     let r = &routes.routes()[0];
     assert!(r.redirect);
-    assert!(!r.auth);
+    // deny-by-default: redirect routes are private too (open-redirect hardening)
+    assert!(r.auth);
     assert_eq!(r.path_params[0].name, "provider");
     assert_eq!(r.name, "authorize");
 }
@@ -273,7 +268,8 @@ fn builder_websocket_typed() {
     let r = &routes.routes()[0];
     assert!(r.websocket);
     assert!(!r.redirect);
-    assert!(!r.auth);
+    // deny-by-default: WS routes are private by default
+    assert!(r.auth);
     assert!(r.query_type.as_ref().unwrap().contains("WsParams"));
     assert!(r.ws_send_type.as_ref().unwrap().contains("ClientEvent"));
     assert!(r.ws_receive_type.as_ref().unwrap().contains("ServerEvent"));
@@ -328,7 +324,6 @@ fn builder_websocket_with_auth() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .ws("/ws", ws_upgrade)
         .events::<ClientEvent, ServerEvent>()
-        .auth()
         .build();
 
     let r = &routes.routes()[0];
@@ -372,10 +367,8 @@ fn builder_generates_valid_ts() {
         .group("users", |g| {
             g.get("/users", list_users)
                 .response::<Vec<UserResponse>>()
-                .auth()
                 .post("/users", create_user)
                 .json::<CreateUserRequest, UserResponse>()
-                .auth()
         })
         .build();
 
@@ -388,7 +381,7 @@ fn builder_generates_valid_ts() {
     assert!(output.contains("listUsers"));
     assert!(output.contains("createUser"));
     assert!(output.contains("UserResponse[]")); // Vec<UserResponse> → UserResponse[]
-    assert!(output.contains("users:")); // group
+    assert!(output.contains("\"users\":")); // group (quoted+escaped property key)
 }
 
 // ---------------------------------------------------------------------------
@@ -399,8 +392,7 @@ fn builder_generates_valid_ts() {
 fn group_does_not_apply_prefix() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group("auth", |g| {
-            g.get("/login", list_users)
-                .response::<Vec<UserResponse>>()
+            g.get("/login", list_users).response::<Vec<UserResponse>>()
         })
         .build();
 
@@ -413,8 +405,7 @@ fn group_does_not_apply_prefix() {
 fn group_prefixed_applies_prefix() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_prefixed("admin", |g| {
-            g.get("/users", list_users)
-                .response::<Vec<UserResponse>>()
+            g.get("/users", list_users).response::<Vec<UserResponse>>()
         })
         .build();
 
@@ -424,11 +415,10 @@ fn group_prefixed_applies_prefix() {
 }
 
 #[test]
-fn group_prefixed_auth_all() {
+fn group_prefixed_private_by_default() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_prefixed("admin", |g| {
-            g.auth_all()
-                .get("/users", list_users)
+            g.get("/users", list_users)
                 .response::<Vec<UserResponse>>()
                 .post("/users", create_user)
                 .json::<CreateUserRequest, UserResponse>()
@@ -437,11 +427,11 @@ fn group_prefixed_auth_all() {
 
     assert!(
         routes.routes()[0].auth,
-        "GET should have auth from auth_all"
+        "deny-by-default: GET routes are private without any annotation"
     );
     assert!(
         routes.routes()[1].auth,
-        "POST should have auth from auth_all"
+        "deny-by-default: POST routes are private without any annotation"
     );
 }
 
@@ -463,10 +453,8 @@ fn group_prefixed_does_not_leak_state() {
     async fn health(State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .group_prefixed("admin", |g| {
-            g.auth_all().delete("/users/{id}", delete_user)
-        })
-        // Routes after group_prefixed should NOT have admin group/prefix/auth
+        .group_prefixed("admin", |g| g.delete("/users/{id}", delete_user))
+        // Routes after group_prefixed should NOT have admin group/prefix
         .get("/health", health)
         .build();
 
@@ -478,15 +466,83 @@ fn group_prefixed_does_not_leak_state() {
     let health_route = &routes.routes()[1];
     assert_eq!(health_route.path, "/health");
     assert_eq!(health_route.group, None);
-    assert!(!health_route.auth);
+    // deny-by-default: no scope means private, same as inside the group
+    assert!(health_route.auth);
+}
+
+// ---------------------------------------------------------------------------
+// Deny-by-default & group_public
+// ---------------------------------------------------------------------------
+
+#[test]
+fn routes_are_private_by_default() {
+    async fn health(State(_s): State<AppState>) {}
+
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .get("/users", list_users)
+        .response::<Vec<UserResponse>>()
+        .get("/health", health)
+        .as_("health")
+        .ws("/events", health)
+        .into_api_router()
+        .build();
+
+    for r in routes.routes() {
+        assert!(r.auth, "route '{}' must be private by default", r.name);
+    }
+}
+
+#[test]
+fn group_public_marks_routes_public_and_does_not_leak() {
+    async fn hook(State(_s): State<AppState>) {}
+
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .group_public("webhooks", |g| {
+            g.set_prefix("/webhooks")
+                .post("/stripe", hook)
+                .post("/github", hook)
+        })
+        .group("admin", |g| g.delete("/users/{id}", delete_user))
+        .build();
+
+    assert!(
+        !routes.routes()[0].auth,
+        "group_public route must be public"
+    );
+    assert!(
+        !routes.routes()[1].auth,
+        "group_public route must be public"
+    );
+    assert_eq!(routes.routes()[0].path, "/webhooks/stripe");
+    assert_eq!(routes.routes()[0].group.as_deref(), Some("webhooks"));
+
+    // public scope must not leak into sibling scopes
+    assert!(
+        routes.routes()[2].auth,
+        "routes after a group_public are private again"
+    );
+}
+
+#[test]
+fn nested_group_inside_group_public_inherits_publicity() {
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .group_public("pub", |g| {
+            g.group_prefixed("deep", |h| h.get("/res", list_users))
+        })
+        .build();
+
+    let r = &routes.routes()[0];
+    assert_eq!(r.path, "/deep/res");
+    // group names overwrite (not nest), consistent with `group`/`group_prefixed`
+    assert_eq!(r.group.as_deref(), Some("deep"));
+    assert!(!r.auth, "nested groups inherit the public scope");
 }
 
 #[test]
 fn group_prefixed_multiple_methods() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_prefixed("admin", |g| {
-            g.auth_all()
-                .get("/users", list_users)
+            g.get("/users", list_users)
                 .response::<Vec<UserResponse>>()
                 .post("/users", create_user)
                 .json::<CreateUserRequest, UserResponse>()
@@ -518,9 +574,9 @@ fn route_table_trait_manual_impl() {
 
     impl RouteTable<AppState> for ManualRoutes {
         fn define<C: Collector>(r: ApiRouter<AppState, C>) -> ApiRouter<AppState, C> {
-            r.get("/health", list_users).as_("health").group_prefixed("admin", |g| {
-                g.auth_all().delete("/users/{id}", delete_user)
-            })
+            r.get("/health", list_users)
+                .as_("health")
+                .group_prefixed("admin", |g| g.delete("/users/{id}", delete_user))
         }
     }
 
@@ -536,7 +592,6 @@ fn route_table_trait_manual_impl() {
 fn set_prefix_without_group_with() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .set_prefix("/api/v1")
-        .auth_all()
         .get("/users", list_users)
         .response::<Vec<UserResponse>>()
         .build();

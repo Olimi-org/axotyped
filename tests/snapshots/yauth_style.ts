@@ -35,6 +35,14 @@ export interface YAuthClientOptions {
   credentials?: RequestCredentials;
   fetch?: typeof fetch;
   onError?: (error: YAuthError) => void;
+  /**
+   * Opt-in ONLY for development against a non-loopback http:// target
+   * (e.g. an Expo device hitting your LAN IP). Loopback hosts
+   * (localhost / 127.0.0.1 / ::1 / *.localhost) are always permitted over
+   * http without this flag. Never set in production — CI should assert its
+   * absence.
+   */
+  allowInsecureHttp?: boolean;
 }
 
 type RequestOptions = {
@@ -43,6 +51,41 @@ type RequestOptions = {
   query?: Record<string, unknown>;
   auth?: boolean;
 };
+
+function assertSecureTransport(
+  url: string,
+  allowInsecureHttp: boolean,
+): void {
+  // Transport guard: credentials must only ride https. Loopback hosts are
+  // inherently local and always allowed over http; anything else requires
+  // the explicit allowInsecureHttp development opt-in. Fails closed on
+  // unparseable URLs and non-http(s) protocols.
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(
+      `Client produced an unparseable URL (${JSON.stringify(url)}); refusing to send credentials.`,
+    );
+  }
+  if (parsed.protocol === "https:") return;
+  const h = parsed.hostname;
+  const isLoopback =
+    h === "localhost" ||
+    h.endsWith(".localhost") ||
+    h === "127.0.0.1" ||
+    h === "::1" ||
+    h === "[::1]";
+  const insecureAllowed =
+    parsed.protocol === "http:" && (isLoopback || allowInsecureHttp);
+  if (!insecureAllowed) {
+    throw new Error(
+      parsed.protocol === "http:"
+        ? `Refusing to send credentials over http:// to non-loopback host "${h}". Use https:// in production; set allowInsecureHttp on the client options for LAN/device development.`
+        : `Unsupported protocol ${parsed.protocol} for credential-bearing requests.`,
+    );
+  }
+}
 
 function createRequest(options: YAuthClientOptions) {
   const { baseUrl, credentials = "include" } = options;
@@ -70,16 +113,32 @@ function createRequest(options: YAuthClientOptions) {
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };
 
-    if (auth && options.getToken) {
+    // Credentials are only sent over https, to loopback hosts over http,
+    // or when the client was explicitly configured with allowInsecureHttp.
+    assertSecureTransport(url, options.allowInsecureHttp === true);
+
+    // An [auth] route requires a token: without one configured or returned,
+    // the request is aborted rather than sent unauthenticated.
+    if (auth) {
+      if (!options.getToken) {
+        throw new Error(
+          `Route declared [auth] but options.getToken was not configured (${method} ${path})`,
+        );
+      }
       const token = await options.getToken();
-      if (token) headers.Authorization = `Bearer ${token}`;
+      if (!token) {
+        throw new Error(
+          `options.getToken() returned no token for an [auth] route (${method} ${path})`,
+        );
+      }
+      headers.Authorization = `Bearer ${token}`;
     }
 
     const response = await fetchFn(url, {
       method,
       credentials,
       headers,
-      body: body ? JSON.stringify(body) : undefined,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
     });
 
     if (!response.ok) {
@@ -140,31 +199,31 @@ export function createYAuthClient(options: YAuthClientOptions) {
     updateProfile: (body: UpdateProfileRequest) =>
       request<ProfileResponse>("/me", { method: "PATCH", auth: true, body }),
 
-    admin: {
+    "admin": {
       listUsers: (query?: ListUsersQuery) =>
         request<ListUsersResponse>("/admin/users", { auth: true, query }),
       getUser: (id: string) =>
-        request<UserResponse>(`/admin/users/${id}`, { auth: true }),
+        request<UserResponse>(`/admin/users/${encodeURIComponent(id)}`, { auth: true }),
       deleteUser: (id: string) =>
-        request<void>(`/admin/users/${id}`, { method: "DELETE", auth: true }),
+        request<void>(`/admin/users/${encodeURIComponent(id)}`, { method: "DELETE", auth: true }),
       banUser: (id: string, body: BanRequest) =>
-        request<UserResponse>(`/admin/users/${id}/ban`, { method: "POST", auth: true, body }),
+        request<UserResponse>(`/admin/users/${encodeURIComponent(id)}/ban`, { method: "POST", auth: true, body }),
     },
 
-    emailPassword: {
+    "emailPassword": {
       register: (body: RegisterRequest) =>
-        request<MessageResponse>("/register", { method: "POST", body }),
+        request<MessageResponse>("/register", { method: "POST", auth: true, body }),
       login: (body: LoginRequest) =>
-        request<LoginResponse>("/login", { method: "POST", body }),
+        request<LoginResponse>("/login", { method: "POST", auth: true, body }),
       verify: (body: VerifyEmailRequest) =>
-        request<MessageResponse>("/verify-email", { method: "POST", body }),
+        request<MessageResponse>("/verify-email", { method: "POST", auth: true, body }),
       changePassword: (body: ChangePasswordRequest) =>
         request<MessageResponse>("/change-password", { method: "POST", auth: true, body }),
     },
 
-    oauth: {
+    "oauth": {
       authorize: (provider: string, query?: AuthorizeQuery) => {
-        let url = `${options.baseUrl}/oauth/${provider}/authorize`;
+        let url = `${options.baseUrl}/oauth/${encodeURIComponent(provider)}/authorize`;
         if (query) {
           const params = new URLSearchParams();
           for (const [key, value] of Object.entries(query)) {
@@ -176,10 +235,10 @@ export function createYAuthClient(options: YAuthClientOptions) {
         return url;
       },
       callback: (provider: string, body: CallbackBody) =>
-        request<AuthResponse>(`/oauth/${provider}/callback`, { method: "POST", body }),
+        request<AuthResponse>(`/oauth/${encodeURIComponent(provider)}/callback`, { method: "POST", auth: true, body }),
     },
 
-    realtime: {
+    "realtime": {
       wsUpgrade: (query?: WsParams): TypedWebSocket<ClientEvent, ServerEvent> => {
         const baseUrl = options.baseUrl.replace(/^http/, (m) => m === "https" ? "wss" : "ws");
         let url = `${baseUrl}/ws`;
@@ -191,6 +250,7 @@ export function createYAuthClient(options: YAuthClientOptions) {
           const qs = params.toString();
           if (qs) url += `?${qs}`;
         }
+        assertSecureTransport(url, options.allowInsecureHttp === true);
         const ws = new WebSocket(url);
         return createTypedWebSocket<ClientEvent, ServerEvent>(ws);
       },
