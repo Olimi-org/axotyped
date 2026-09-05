@@ -1,4 +1,7 @@
-use axotyped::{GeneratorConfig, api_routes, generate};
+use axotyped::{
+    AuthScheme, GeneratorConfig, HttpMethod, RouteCollection, RouteDefinition, api_routes,
+    generate, generate_with_warnings,
+};
 
 fn yauth_config() -> GeneratorConfig {
     GeneratorConfig {
@@ -12,6 +15,9 @@ fn yauth_config() -> GeneratorConfig {
         type_import_prefix: "../../../../bindings".into(),
         format_command: None,
         ws_ticket_path: None,
+        large_int_type: "number".into(),
+        auth_scheme: AuthScheme::Bearer,
+        csrf_header_name: None,
     }
 }
 
@@ -136,10 +142,16 @@ fn generates_valid_output() {
     assert!(output.contains("export interface YAuthClientOptions"));
 
     // Factory function
-    assert!(output.contains("export function createYAuthClient(options: YAuthClientOptions)"));
+    assert!(
+        output.contains(
+            "export function createYAuthClient(options: YAuthClientOptions): YAuthClient"
+        )
+    );
 
     // Type export
-    assert!(output.contains("export type YAuthClient = ReturnType<typeof createYAuthClient>;"));
+    assert!(
+        output.contains("export type YAuthClient = ReturnType<typeof createYAuthClientRoutes> & {")
+    );
 }
 
 #[test]
@@ -548,4 +560,169 @@ fn generates_websocket_typed_send_and_receive() {
     // createTypedWebSocket should use JSON.stringify/parse
     assert!(output.contains("JSON.stringify(event)"));
     assert!(output.contains("JSON.parse(raw.data"));
+}
+
+// ===========================================================================
+// Auth scheme dimension (bearer | cookie | none)
+// ===========================================================================
+
+#[test]
+fn default_config_is_bearer_fail_closed_with_same_origin_credentials() {
+    let routes = api_routes! {
+        getSession: GET "/session" [auth] -> SessionResponse;
+    };
+    let output = generate(&routes, &GeneratorConfig::default());
+
+    assert!(output.contains("getToken?: () => Promise<string | null>"));
+    assert!(output.contains("headers.Authorization = `Bearer ${token}`"));
+    // Cookies no longer leak cross-origin by default; token clients don't need them.
+    assert!(output.contains("credentials = \"same-origin\""));
+}
+
+#[test]
+fn cookie_scheme_swaps_get_token_for_csrf_and_refuses_omitted_credentials() {
+    let routes = api_routes! {
+        getSession: GET "/session" [auth] -> SessionResponse;
+        updateProfile: PATCH "/me" [auth] body: UpdateProfileRequest -> ProfileResponse;
+    };
+    let mut config = yauth_config();
+    config.auth_scheme = AuthScheme::Cookie;
+    config.csrf_header_name = Some("X-CSRF-Token".into());
+    let output = generate(&routes, &config);
+
+    // No Bearer machinery anywhere.
+    assert!(
+        !output.contains("getToken"),
+        "cookie client must not emit getToken"
+    );
+    assert!(
+        !output.contains("Authorization"),
+        "cookie client must not emit Authorization headers"
+    );
+
+    // Typed CSRF option + header attach on mutating requests.
+    assert!(output.contains("csrfToken?: () => Promise<string | null> | string | null"));
+    assert!(output.contains("headers[\"X-CSRF-Token\"] = csrfToken"));
+
+    // Fail-closed analog: stripping cookies from an auth route aborts the call.
+    assert!(
+        output.contains(
+            "options.credentials is \"omit\"; refusing to send an unauthenticated request"
+        )
+    );
+}
+
+#[test]
+fn cookie_scheme_without_csrf_config_emits_no_plumbing() {
+    let routes = api_routes! {
+        updateProfile: PATCH "/me" [auth] body: UpdateProfileRequest -> ProfileResponse;
+    };
+    let mut config = yauth_config();
+    config.auth_scheme = AuthScheme::Cookie;
+    let output = generate(&routes, &config);
+
+    assert!(output.contains("options.credentials is \"omit\""));
+    assert!(!output.contains("csrfToken"));
+    assert!(!output.contains("X-CSRF-Token"));
+}
+
+#[test]
+fn cookie_ws_auth_rides_cookies_without_ticket_handshake() {
+    let routes = api_routes! {
+        wsUpgrade: GET "/ws" [ws, auth]
+            send: ClientEvent, receive: ServerEvent;
+    };
+    let mut config = yauth_config();
+    config.auth_scheme = AuthScheme::Cookie;
+    let (output, warnings) = generate_with_warnings(&routes, &config);
+
+    // No diagnostic: session cookies ride same-origin WS upgrades natively.
+    assert!(
+        warnings.is_empty(),
+        "cookie scheme has a native WS credential pathway: {warnings:?}"
+    );
+    assert!(
+        !output.contains("__wsTicket"),
+        "cookie WS must not use ticket handshake"
+    );
+}
+
+#[test]
+fn none_scheme_generates_no_auth_machinery_and_warns_on_auth_routes() {
+    let routes = api_routes! {
+        getSession: GET "/session" [auth] -> SessionResponse;
+        health: GET "/health" [public] -> SuccessResponse;
+    };
+    let mut config = yauth_config();
+    config.auth_scheme = AuthScheme::None;
+    let (output, warnings) = generate_with_warnings(&routes, &config);
+
+    assert!(
+        !output.contains("getToken"),
+        "none client must not emit getToken"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("getSession")),
+        "authenticated route under scheme none must warn, got {warnings:?}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w.contains("health")),
+        "public routes must not warn under scheme none"
+    );
+}
+
+// ===========================================================================
+// Server-derived auth metadata (declared-public contradiction)
+// ===========================================================================
+
+fn manual_route(name: &str, path: &str, auth: bool, declared_public: bool) -> RouteDefinition {
+    RouteDefinition {
+        name: name.into(),
+        method: HttpMethod::Get,
+        path: path.into(),
+        auth,
+        declared_public,
+        body_type: None,
+        response_type: None,
+        query_type: None,
+        path_params: axotyped::extract_path_params(path),
+        group: None,
+        redirect: false,
+        websocket: false,
+        ws_send_type: None,
+        ws_receive_type: None,
+    }
+}
+
+#[test]
+fn public_declared_but_protected_route_produces_contradiction_warning() {
+    let mut routes = RouteCollection::new();
+    routes.push(manual_route("hook", "/webhooks/hook", true, true));
+    routes.push(manual_route("admin", "/admin/users", true, false));
+
+    let (_, warnings) = generate_with_warnings(&routes, &yauth_config());
+
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("hook") && w.contains("auth layer")),
+        "contradiction between public declaration and protection must warn, got {warnings:?}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w.contains("admin")),
+        "protected-without-declaration is the expected steady state"
+    );
+}
+
+#[test]
+fn consistently_public_or_protected_routes_never_warn_about_layering() {
+    let mut routes = RouteCollection::new();
+    routes.push(manual_route("open", "/health", false, true));
+    routes.push(manual_route("gated", "/me", true, false));
+
+    let (_, warnings) = generate_with_warnings(&routes, &yauth_config());
+    assert!(
+        warnings.is_empty(),
+        "consistent declarations produce no diagnostics: {warnings:?}"
+    );
 }

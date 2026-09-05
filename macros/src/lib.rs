@@ -107,9 +107,11 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! {},
     };
 
-    // Only `#[endpoint(public)]` opens a route.
+    // Only `#[endpoint(public)]` opens a route. The declaration is recorded
+    // separately from the effective `auth` flag so an auth layer in scope can
+    // override it back on (server enforcement is the ground truth).
     let visibility_stmt = if is_public {
-        quote! { __def.auth = false; }
+        quote! { __def.declared_public = true; __def.auth = false; }
     } else {
         quote! {}
     };

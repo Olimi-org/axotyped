@@ -91,6 +91,22 @@ impl Attr for FieldAttr {
             )
         }
 
+        // `Option` fields can serialize as `null`; a `#[ts(type)]`
+        // override must include `null` to match the wire shape.
+        if let (Some(ov), field_ty) = (&self.type_override, &field.ty) {
+            if !self.maybe_omitted
+                && crate::ts::optional::is_option_ty(field_ty)
+                && !ov.contains("null")
+            {
+                syn_err_spanned!(
+                    field;
+                    "`#[ts(type)]` on an Option field must include `null` \
+                     (e.g. \"string | null\") — the field can serialize None; \
+                     add `| null`, use skip_serializing_if, or a boundary type"
+                );
+            }
+        }
+
         if self.type_override.is_some() {
             if self.type_as.is_some() {
                 syn_err_spanned!(field; "`type` is not compatible with `as`")

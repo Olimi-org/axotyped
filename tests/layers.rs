@@ -8,11 +8,11 @@
 
 use axotyped::{ApiRouter, IntoApiRouter, RouteCollection};
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{Extension, Request};
 use axum::http::{Request as HttpRequest, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
-use tower::{Service, ServiceExt};
+use tower::Service;
 
 #[derive(Clone, Default)]
 struct AppState;
@@ -159,4 +159,74 @@ async fn codegen_metadata_identical_with_and_without_layers() {
         collect_routes(layered),
         "layers must not touch codegen metadata"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Identity-propagation mechanics
+//
+// The encore-style pattern consumers build on this library: an outermost
+// middleware decodes credentials once and publishes the result on request
+// extensions; downstream scoped middleware and the final handler consume it
+// without re-decoding. Every route lives in its own isolated single-route
+// router before merging, so published state must survive that boundary.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+struct Identity(&'static str);
+
+/// Stands in for a global auth resolver: computes identity once, publishes it.
+async fn resolve_identity(mut req: Request, next: Next) -> Result<Response, StatusCode> {
+    req.extensions_mut().insert(Identity("decoded-once"));
+    Ok(next.run(req).await)
+}
+
+/// Stands in for scoped RBAC middleware: consumes the published identity.
+async fn require_identity(
+    Extension(id): Extension<Identity>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if id.0 == "decoded-once" {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// Final consumer: extracts what upstream middleware already computed.
+async fn whoami(Extension(id): Extension<Identity>) -> String {
+    id.0.to_string()
+}
+
+#[tokio::test]
+async fn extensions_published_by_outer_wrapper_reach_scope_layered_handlers() {
+    // `require_identity` wraps the route inside axotyped's per-route
+    // isolation; the resolver is attached after build(), like a real app's
+    // global auth middleware. Execution order must be resolver ->
+    // require_identity -> handler, with the extension crossing the merge
+    // boundary between the app router and the isolated route routers.
+    let router = ApiRouter::<AppState>::new()
+        .layer(axum::middleware::from_fn(require_identity))
+        .get("/me", whoami)
+        .build()
+        .0
+        .layer(axum::middleware::from_fn(resolve_identity));
+
+    let mut svc = router.with_state(AppState);
+    let req = HttpRequest::builder()
+        .uri("/me")
+        .body(Body::empty())
+        .unwrap();
+    let res = <axum::Router as tower::ServiceExt<Request>>::ready(&mut svc)
+        .await
+        .unwrap()
+        .call(req)
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"decoded-once");
 }

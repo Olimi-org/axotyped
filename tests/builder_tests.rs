@@ -617,3 +617,123 @@ fn define_routes_custom_identifier_name() {
     assert_eq!(collection.len(), 1);
     assert_eq!(collection.routes()[0].name, "health");
 }
+
+// ---------------------------------------------------------------------------
+// Server-derived auth metadata (auth_layer)
+// ---------------------------------------------------------------------------
+
+/// Pass-through middleware standing in for real authentication.
+async fn auth_mw(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    next.run(req).await
+}
+
+#[test]
+fn auth_layer_derives_auth_metadata_inside_public_scope() {
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .group_public("pub", |g| {
+            g.get("/open", list_users)
+                .into_api_router()
+                .auth_layer(axum::middleware::from_fn(auth_mw))
+                .get("/gated", get_user)
+        })
+        .build();
+
+    let open = routes.routes().iter().find(|r| r.path == "/open").unwrap();
+    let gated = routes.routes().iter().find(|r| r.path == "/gated").unwrap();
+    assert!(!open.auth, "route before the auth layer stays public");
+    assert!(
+        open.declared_public,
+        "public-scope membership is itself the declaration"
+    );
+    assert!(
+        gated.auth,
+        "auth layer derives authenticated metadata for subsequent routes"
+    );
+    assert!(
+        gated.declared_public,
+        "the scope's public declaration is preserved so generation can flag the contradiction"
+    );
+}
+
+#[test]
+fn auth_layer_overrides_public_declarations_and_records_contradiction() {
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .group_public("mixed", |g| {
+            g.auth_layer(axum::middleware::from_fn(auth_mw))
+                .post("/hook", create_user)
+        })
+        .build();
+
+    let r = &routes.routes()[0];
+    assert!(
+        r.auth,
+        "server enforcement wins: protected route is authenticated"
+    );
+    assert!(
+        r.declared_public,
+        "the public declaration is preserved so generation can flag it"
+    );
+}
+
+#[test]
+fn auth_layer_does_not_leak_to_sibling_scopes() {
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .group_public("pub", |g| {
+            g.group_prefixed("admin", |a| {
+                a.auth_layer(axum::middleware::from_fn(auth_mw))
+                    .get("/inner", get_user)
+            })
+            .group_prefixed("other", |o| o.get("/sibling", get_user))
+        })
+        .build();
+
+    let inner = routes
+        .routes()
+        .iter()
+        .find(|r| r.path == "/admin/inner")
+        .unwrap();
+    let sibling = routes
+        .routes()
+        .iter()
+        .find(|r| r.path == "/other/sibling")
+        .unwrap();
+    assert!(inner.auth);
+    assert!(!sibling.auth, "protection must not leak to sibling scopes");
+}
+
+#[test]
+fn auth_layer_inherits_into_nested_groups() {
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .group_prefixed("v1", |v1| {
+            v1.auth_layer(axum::middleware::from_fn(auth_mw))
+                .group_prefixed("admin", |a| a.get("/users", list_users))
+        })
+        .build();
+
+    let r = &routes.routes()[0];
+    assert_eq!(r.path, "/v1/admin/users");
+    assert!(r.auth, "nested groups inherit the protected scope");
+}
+
+#[test]
+fn plain_layer_leaves_auth_metadata_untouched() {
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .group_public("pub", |g| {
+            g.layer(axum::middleware::from_fn(auth_mw))
+                .get("/rate_limited", get_user)
+        })
+        .build();
+
+    let r = &routes.routes()[0];
+    assert!(
+        !r.auth,
+        ".layer() is a transport concern, not authentication"
+    );
+    assert!(
+        r.declared_public,
+        "public-scope membership is preserved regardless of plain layering"
+    );
+}

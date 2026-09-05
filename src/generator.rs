@@ -11,6 +11,17 @@ macro_rules! w {
     ($dst:expr, $($arg:tt)*) => { writeln!($dst, $($arg)*).unwrap() };
 }
 
+/// How the generated client authenticates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthScheme {
+    /// `Authorization` header via `ClientOptions.getToken`; auth routes throw without a token.
+    Bearer,
+    /// Session cookies (automatic); refuses `credentials: "omit"` on auth routes.
+    Cookie,
+    /// No auth machinery; auth routes emit diagnostics.
+    None,
+}
+
 /// Configuration for the TypeScript client generator.
 #[derive(Debug, Clone)]
 pub struct GeneratorConfig {
@@ -26,24 +37,23 @@ pub struct GeneratorConfig {
     pub error_class_name: String,
     /// Name of the options interface (e.g., `"ClientOptions"` or `"YAuthClientOptions"`).
     pub options_interface_name: String,
-    /// Whether to include credentials by default.
+    /// Default `RequestCredentials` (default `"same-origin"`).
     pub default_credentials: String,
-    /// Import path prefix for types (relative from generated file to bindings dir).
-    /// If empty, computed from bindings_dir relative to output_path.
+    /// Type import prefix; if empty, computed from `bindings_dir` vs `output_path`.
     pub type_import_prefix: String,
-    /// Optional shell command to format the generated file (e.g., `"biome format --write"`).
-    /// The output file path is appended as the last argument.
+    /// Optional formatter command; output path is appended as last arg.
     pub format_command: Option<String>,
-    /// Path of the server endpoint issuing single-use WebSocket tickets
-    /// (e.g., `Some("/ws/ticket")`).
-    ///
-    /// When set, every `[ws][auth]` route is generated as an async ticket
-    /// handshake: an authenticated POST returns `{ ticket: string }`, and only
-    /// that short-lived single-use proof touches the WS URL — keeping
-    /// long-lived credentials out of access logs, proxies, and history.
-    ///
-    /// When `None` (default), `[ws][auth]` routes generate a client with **no**
-    /// credential pathway, and [`generate_with_warnings`] emits a diagnostic.
+    /// TS type for integers beyond JS safe range (`u64`/`i64`/`u128`/`i128`/`usize`/`isize`).
+    /// Default `"number"` (loses precision above 2^53); `"bigint"` or `"string"` preserve it.
+    pub large_int_type: String,
+    /// Auth model of the generated client (default [`AuthScheme::Bearer`]).
+    pub auth_scheme: AuthScheme,
+    /// CSRF header for mutating requests under [`AuthScheme::Cookie`].
+    /// `None` emits no CSRF plumbing. Ignored under other schemes.
+    pub csrf_header_name: Option<String>,
+    /// Ticket endpoint for `[ws][auth]` routes under Bearer (e.g. `Some("/ws/ticket")`).
+    /// Emits an async ticket handshake; when `None`, those routes have no
+    /// credential pathway and produce a diagnostic.
     pub ws_ticket_path: Option<String>,
 }
 
@@ -56,11 +66,23 @@ impl Default for GeneratorConfig {
             enable_groups: true,
             error_class_name: "ApiError".into(),
             options_interface_name: "ClientOptions".into(),
-            default_credentials: "include".into(),
+            default_credentials: "same-origin".into(),
             type_import_prefix: String::new(),
             format_command: None,
             ws_ticket_path: None,
+            large_int_type: "number".into(),
+            auth_scheme: AuthScheme::Bearer,
+            csrf_header_name: None,
         }
+    }
+}
+
+impl GeneratorConfig {
+    /// Returns a ts-rs [`Config`](crate::ts::Config) with matching `large_int_type`,
+    /// for use with [`RouteCollection::export_types_with`](crate::RouteCollection::export_types_with).
+    #[cfg(feature = "ts-rs")]
+    pub fn ts_config(&self) -> crate::ts::Config {
+        crate::ts::Config::default().with_large_int(self.large_int_type.clone())
     }
 }
 
@@ -112,13 +134,13 @@ const PRIMITIVES: &[&str] = &[
     "f64", "usize", "isize",
 ];
 
-/// Rust stdlib container types that don't need TS imports.
-/// Only Vec and Option realistically appear as wire types — they're handled
-/// by converting to TS equivalents (Vec → T[], Option → T | null).
-/// Others are listed for completeness but won't appear in practice.
+/// Integer types rendered via the configured `large_int_type`.
+const LARGE_INT_TYPES: &[&str] = &["u64", "i64", "u128", "i128", "usize", "isize"];
+
+/// Stdlib containers handled inline without TS imports.
 const CONTAINERS: &[&str] = &["Vec", "Option"];
 
-/// Recursively strip `Vec<>`/`Option<>` wrappers, returning the innermost type name.
+/// Strips `Vec`/`Option` wrappers to the innermost type.
 #[cfg(test)]
 fn unwrap_inner(rust_type: &str) -> &str {
     let t = rust_type.trim();
@@ -132,36 +154,38 @@ fn unwrap_inner(rust_type: &str) -> &str {
     t
 }
 
-/// Convert a Rust type name (from `stringify!`) to a TypeScript type string.
-fn rust_type_to_ts(rust_type: &str) -> String {
+/// Converts a Rust type to TS, mapping wide integers via `large_int`.
+fn rust_type_to_ts_with(rust_type: &str, large_int: &str) -> String {
     let t = rust_type.trim();
     if let Some(inner) = t.strip_prefix("Vec<").and_then(|s| s.strip_suffix('>')) {
-        return format!("{}[]", rust_type_to_ts(inner));
+        return format!("{}[]", rust_type_to_ts_with(inner, large_int));
     }
     if let Some(inner) = t.strip_prefix("Option<").and_then(|s| s.strip_suffix('>')) {
-        return format!("{} | null", rust_type_to_ts(inner));
+        return format!("{} | null", rust_type_to_ts_with(inner, large_int));
     }
     match t {
         "String" | "&str" | "Uuid" => "string".into(),
         "bool" => "boolean".into(),
+        _ if LARGE_INT_TYPES.contains(&t) => large_int.to_string(),
         _ if PRIMITIVES.contains(&t) => "number".into(),
         _ => t.to_string(),
     }
 }
 
-/// Check if a type is a primitive (doesn't need an import).
+/// Converts a Rust type to TS with default mappings.
+#[cfg(test)]
+fn rust_type_to_ts(rust_type: &str) -> String {
+    rust_type_to_ts_with(rust_type, "bigint")
+}
+
+/// Returns true for primitives needing no import.
 #[cfg(test)]
 fn is_primitive_type(rust_type: &str) -> bool {
     PRIMITIVES.contains(&unwrap_inner(rust_type))
 }
 
-/// Extract all custom type names from a type string for import generation.
-///
-/// Handles generics, Vec, Option, and nested types:
-/// - `ContentResponse<Dialog>` → `["ContentResponse", "Dialog"]`
-/// - `Vec<UserResponse>` → `["UserResponse"]`
-/// - `Option<ContentResponse<Dialog>>` → `["ContentResponse", "Dialog"]`
-/// - `String` → `[]` (primitive)
+/// Collects custom type names for imports.
+/// e.g. `Vec<User>` -> `["User"]`; `ContentResponse<Dialog>` -> `["ContentResponse", "Dialog"]`.
 fn extract_type_names(rust_type: &str) -> Vec<&str> {
     let mut names = Vec::new();
     collect_type_names(rust_type, &mut names);
@@ -205,10 +229,8 @@ fn collect_type_names<'a>(t: &'a str, out: &mut Vec<&'a str>) {
     }
 }
 
-/// Split generic parameters on commas, respecting `<`/`>` nesting.
-///
-/// `"ContentResponse<Dialog>, ApiError"` → `["ContentResponse<Dialog>", " ApiError"]`
-/// `"A<B, C>, D"` → `["A<B, C>", " D"]`
+/// Splits generic params on top-level commas.
+/// e.g. `"ContentResponse<Dialog>, ApiError"` -> `["ContentResponse<Dialog>", " ApiError"]`.
 fn split_generic_params(params: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut depth = 0i32;
@@ -235,7 +257,7 @@ fn split_generic_params(params: &str) -> Vec<&str> {
 // Path and parameter helpers
 // ---------------------------------------------------------------------------
 
-/// Compute the import path prefix for type imports.
+/// Computes the type-import prefix from config or relative paths.
 fn compute_import_prefix(config: &GeneratorConfig) -> String {
     if !config.type_import_prefix.is_empty() {
         return config.type_import_prefix.clone();
@@ -278,28 +300,21 @@ fn compute_import_prefix(config: &GeneratorConfig) -> String {
     prefix
 }
 
-/// Build the path template string for TypeScript.
-///
-/// `/admin/users/{id}` -> `` `/admin/users/${encodeURIComponent(id)}` ``
-///
-/// Behavior notes:
-/// - literal text is escaped for its target string context — backslash,
-///   backtick, and `${` are neutralized inside template literals and `\`/`"`
-///   inside plain strings — so every character in a route path is emitted as
-///   inert string data;
-/// - brace groups become `${encodeURIComponent(<param>)}` placeholders whose
-///   names go through the exact same deterministic sanitization as
-///   [`crate::extract_path_params`], keeping signatures and templates in sync;
-/// - parameters are URL-encoded at runtime so values cannot smuggle path
-///   traversal (`../`) or query syntax (`?`, `#`) into the request path.
+/// Builds a JS path expression. Literals are escaped; `{param}` becomes
+/// `${encodeURIComponent(param)}` with the same sanitization as `extract_path_params`.
+/// e.g. `/admin/users/{id}` -> `` `/admin/users/${encodeURIComponent(id)}` ``.
 fn build_path_template(path: &str) -> String {
     if !path.contains('{') {
         return format!("\"{}\"", escape_double_quoted(path));
     }
 
     let mut template = String::new();
-    // raw name -> emitted name, mirroring scan order in `extract_path_params`
+    // raw name -> emitted name, mirroring the scan order and allocation rules
+    // of `extract_path_params`
     let mut seen: Vec<(&str, String)> = Vec::new();
+    // Names claimed by valid raw identifiers; synthetics must avoid these.
+    let taken: std::collections::BTreeSet<String> = crate::types::scan_taken_param_names(path);
+    let mut next_synthetic = 0usize;
     let mut rest = path;
 
     loop {
@@ -322,7 +337,12 @@ fn build_path_template(path: &str) -> String {
                         let safe = match seen.iter().find(|(r, _)| *r == raw) {
                             Some((_, safe)) => safe.clone(),
                             None => {
-                                let safe = crate::types::sanitize_param_name(raw, seen.len());
+                                let safe = crate::types::sanitize_param_name_with(
+                                    &taken,
+                                    &mut next_synthetic,
+                                    raw,
+                                    seen.len(),
+                                );
                                 seen.push((raw, safe.clone()));
                                 safe
                             }
@@ -340,7 +360,7 @@ fn build_path_template(path: &str) -> String {
     format!("`{template}`")
 }
 
-/// Escape `text` for interpolation inside a JS double-quoted string literal.
+/// Escapes text for a double-quoted JS string.
 fn escape_double_quoted(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -353,8 +373,7 @@ fn escape_double_quoted(text: &str) -> String {
     out
 }
 
-/// Escape `text` for interpolation inside a JS template literal: neutralizes
-/// backslash, backtick, and `${` sequence starts.
+/// Escapes text for a JS template literal (backslash, backtick, `${`).
 fn push_escaped_template_text(out: &mut String, text: &str) {
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -367,9 +386,7 @@ fn push_escaped_template_text(out: &mut String, text: &str) {
     }
 }
 
-/// Escape `text` for use as a double-quoted JS property key / string:
-/// backslash, quote, control characters, and line-separator code points that
-/// are valid JSON escapes but syntactically dangerous in JS source.
+/// Escapes text for a double-quoted JS string (control chars, separators).
 pub(crate) fn escape_js_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -391,22 +408,40 @@ pub(crate) fn escape_js_string(text: &str) -> String {
     out
 }
 
-/// Generate a function's parameter list for a route.
-fn generate_params(route: &RouteDefinition) -> String {
+/// Emits a route name as an object key; quotes and escapes non-identifiers
+/// (e.g. names from `.as_(...)`).
+fn emit_method_name(out: &mut String, name: &str) {
+    if crate::types::is_valid_js_identifier(name) {
+        out.push_str(name);
+    } else {
+        out.push('"');
+        out.push_str(&escape_js_string(name));
+        out.push('"');
+    }
+}
+
+/// Generates the parameter list for a route.
+fn generate_params(route: &RouteDefinition, large_int: &str) -> String {
     let mut params = Vec::new();
     for param in &route.path_params {
         params.push(format!("{}: string", param.name));
     }
     if let Some(ref body_type) = route.body_type {
-        params.push(format!("body: {}", rust_type_to_ts(body_type)));
+        params.push(format!(
+            "body: {}",
+            rust_type_to_ts_with(body_type, large_int)
+        ));
     }
     if let Some(ref query_type) = route.query_type {
-        params.push(format!("query?: {}", rust_type_to_ts(query_type)));
+        params.push(format!(
+            "query?: {}",
+            rust_type_to_ts_with(query_type, large_int)
+        ));
     }
     params.join(", ")
 }
 
-/// Generate the request options object literal for a route.
+/// Generates the request options literal for a route.
 fn generate_request_options(route: &RouteDefinition) -> String {
     let mut opts = Vec::new();
     if route.method != HttpMethod::Get {
@@ -435,18 +470,25 @@ fn generate_request_options(route: &RouteDefinition) -> String {
 const ERROR_CLASS: &str = r#"export class __ERROR__ extends Error {
   constructor(message: string, public status: number, public body?: unknown) {
     super(message);
-    this.name = "__ERROR__";
+
+    // Keep native Error behavior when transpiled to older targets:
+    // name non-enumerable, prototype chain intact, stack trace captured.
+    Object.defineProperty(this, "name", {
+      value: "__ERROR__",
+      enumerable: false,
+      configurable: true,
+    });
+    if (Object.setPrototypeOf !== undefined) {
+      Object.setPrototypeOf(this, __ERROR__.prototype);
+    }
+    if ((Error as any).captureStackTrace !== undefined) {
+      (Error as any).captureStackTrace(this, this.constructor);
+    }
   }
 }
 "#;
 
-const OPTIONS_INTERFACE: &str = r#"export interface __OPTS__ {
-  baseUrl: string;
-  getToken?: () => Promise<string | null>;
-  credentials?: RequestCredentials;
-  fetch?: typeof fetch;
-  onError?: (error: __ERROR__) => void;
-  /**
+const INSECURE_HTTP_DOC: &str = r#"  /**
    * Opt-in ONLY for development against a non-loopback http:// target
    * (e.g. an Expo device hitting your LAN IP). Loopback hosts
    * (localhost / 127.0.0.1 / ::1 / *.localhost) are always permitted over
@@ -454,8 +496,63 @@ const OPTIONS_INTERFACE: &str = r#"export interface __OPTS__ {
    * absence.
    */
   allowInsecureHttp?: boolean;
-}
 "#;
+
+/// ClientOptions fields shared by every scheme (everything after the
+/// scheme-specific auth fields).
+const OPTIONS_TAIL: &str = r#"  credentials?: RequestCredentials;
+  fetch?: typeof fetch;
+  onError?: (error: __ERROR__) => void;
+  /**
+   * Default RequestInit merged into every request. Useful for AbortSignals
+   * (cancellation/timeouts), cache policy, keepalive, and priority hints.
+   * Per-request values passed through a route's options take precedence.
+   */
+  requestInit?: Omit<RequestInit, "headers" | "method" | "body"> & {
+    headers?: Record<string, string>;
+  };
+"#;
+
+const OPTIONS_INTERFACE_BEARER: &str = r#"export interface __OPTS__ {
+  baseUrl: string;
+  getToken?: () => Promise<string | null>;
+"#;
+
+const OPTIONS_INTERFACE_PLAIN_HEAD: &str = r#"export interface __OPTS__ {
+  baseUrl: string;
+"#;
+
+const OPTIONS_CSRF_FIELD: &str = r#"  /**
+   * Returns the anti-CSRF proof attached as the "__CSRF_NAME__" header on
+   * mutating requests (POST / PUT / PATCH / DELETE). Source it from your
+   * framework's cookie or meta-tag convention. When unset, mutating requests
+   * carry no CSRF header — rely on SameSite cookie attributes server-side.
+   */
+  csrfToken?: () => Promise<string | null> | string | null;
+"#;
+
+const OPTIONS_INTERFACE_NONE: &str = r#"export interface __OPTS__ {
+  baseUrl: string;
+"#;
+
+/// Assemble the options interface for the configured auth scheme.
+fn options_interface(config: &GeneratorConfig) -> String {
+    let mut s = String::new();
+    match config.auth_scheme {
+        AuthScheme::Bearer => s.push_str(OPTIONS_INTERFACE_BEARER),
+        AuthScheme::Cookie => {
+            s.push_str(OPTIONS_INTERFACE_PLAIN_HEAD);
+            if config.csrf_header_name.is_some() {
+                s.push_str(OPTIONS_CSRF_FIELD);
+            }
+        }
+        AuthScheme::None => s.push_str(OPTIONS_INTERFACE_NONE),
+    }
+    s.push_str(OPTIONS_TAIL);
+    s.push_str(INSECURE_HTTP_DOC);
+    s.push_str("}\n");
+    s
+}
 
 const REQUEST_OPTIONS_TYPE: &str = "\
 type RequestOptions = {
@@ -464,9 +561,12 @@ type RequestOptions = {
   query?: Record<string, unknown>;
   auth?: boolean;
 };
+
+/** The `request` helper produced by `createRequest`, for the routes factory. */
+type RequestFn = <T>(path: string, opts?: RequestOptions) => Promise<T>;
 ";
 
-const REQUEST_HELPER: &str = r#"function assertSecureTransport(
+const REQUEST_HELPER_PRE: &str = r#"function assertSecureTransport(
   url: string,
   allowInsecureHttp: boolean,
 ): void {
@@ -503,34 +603,54 @@ const REQUEST_HELPER: &str = r#"function assertSecureTransport(
 
 function createRequest(options: __OPTS__) {
   const { baseUrl, credentials = "__CREDS__" } = options;
+  // Bind fetch to its original receiver: calling an unbound
+  // globalThis.fetch reference throws "Illegal invocation" in several
+  // browser engines.
+  const boundFetch =
+    options.fetch !== undefined ? options.fetch : globalThis.fetch.bind(globalThis);
+
+  async function request<T>(path: string, opts?: RequestOptions): Promise<T>;
+  async function request<T>(
+    path: string,
+    opts: RequestOptions | undefined,
+    rawResponse: true,
+  ): Promise<Response>;
   async function request<T>(
     path: string,
     opts: RequestOptions = {},
-  ): Promise<T> {
+    rawResponse?: boolean,
+  ): Promise<T | Response> {
     const { method = "GET", body, query, auth } = opts;
-    // Resolve fetch at call time (not at client creation) so OTel
-    // instrumentation patches are picked up even when the client
-    // module is imported before telemetry initializes.
-    const fetchFn = options.fetch ?? globalThis.fetch;
-
     let url = `${baseUrl}${path}`;
     if (query) {
       const params = new URLSearchParams();
       for (const [key, value] of Object.entries(query)) {
-        if (value !== undefined && value !== null) {
-          params.set(key, String(value));
+        // Arrays expand to repeated keys (?tag=a&tag=b), the conventional
+        // encoding for list-valued parameters.
+        for (const v of Array.isArray(value) ? value : [value]) {
+          if (v !== undefined && v !== null) {
+            params.append(key, String(v));
+          }
         }
       }
       const qs = params.toString();
       if (qs) url += `?${qs}`;
     }
 
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...(options.requestInit?.headers ?? {}),
+    };
 
     // Credentials are only sent over https, to loopback hosts over http,
     // or when the client was explicitly configured with allowInsecureHttp.
     assertSecureTransport(url, options.allowInsecureHttp === true);
+"#;
 
+/// Auth section of the request helper for [`AuthScheme::Bearer`]: an
+/// authenticated route aborts unless a token source is configured **and**
+/// resolves — an unauthenticated request is never sent.
+const REQUEST_AUTH_BEARER: &str = r#"
     // An [auth] route requires a token: without one configured or returned,
     // the request is aborted rather than sent unauthenticated.
     if (auth) {
@@ -547,8 +667,36 @@ function createRequest(options: __OPTS__) {
       }
       headers.Authorization = `Bearer ${token}`;
     }
+"#;
 
-    const response = await fetchFn(url, {
+/// Auth section of the request helper for [`AuthScheme::Cookie`]: browsers
+/// attach session cookies automatically, so the only way an authenticated
+/// route can go out unauthenticated is a consumer explicitly stripping them.
+const REQUEST_AUTH_COOKIE: &str = r#"
+    // An [auth] route rides the browser's session cookies; refuse consumer
+    // configurations that would strip them instead of sending the request
+    // unauthenticated.
+    if (auth && (options.credentials ?? "__CREDS__") === "omit") {
+      throw new Error(
+        `Route declared [auth] but options.credentials is "omit"; refusing to send an unauthenticated request (${method} ${path})`,
+      );
+    }
+"#;
+
+/// Anti-CSRF plumbing, appended under [`AuthScheme::Cookie`] when
+/// [`GeneratorConfig::csrf_header_name`] is set.
+const REQUEST_CSRF_BLOCK: &str = r#"
+    // Attach anti-CSRF proof on mutating requests when a token source is
+    // configured. GET/HEAD/OPTIONS are safe methods and never carry it.
+    if (!["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase())) {
+      const csrfToken = await options.csrfToken?.();
+      if (csrfToken) headers["__CSRF_NAME__"] = csrfToken;
+    }
+"#;
+
+const REQUEST_HELPER_POST: &str = r#"
+    const response = await boundFetch(url, {
+      ...options.requestInit,
       method,
       credentials,
       headers,
@@ -571,6 +719,8 @@ function createRequest(options: __OPTS__) {
       throw error;
     }
 
+    if (rawResponse) return response;
+
     const text = await response.text();
     return (text ? JSON.parse(text) : undefined) as T;
   }
@@ -578,6 +728,23 @@ function createRequest(options: __OPTS__) {
   return request;
 }
 "#;
+
+/// Assemble the request helper for the configured auth scheme.
+fn request_helper(config: &GeneratorConfig) -> String {
+    let mut s = String::from(REQUEST_HELPER_PRE);
+    match config.auth_scheme {
+        AuthScheme::Bearer => s.push_str(REQUEST_AUTH_BEARER),
+        AuthScheme::Cookie => {
+            s.push_str(REQUEST_AUTH_COOKIE);
+            if config.csrf_header_name.is_some() {
+                s.push_str(REQUEST_CSRF_BLOCK);
+            }
+        }
+        AuthScheme::None => {}
+    }
+    s.push_str(REQUEST_HELPER_POST);
+    s
+}
 
 const TYPED_WS_INTERFACE: &str = r#"export interface TypedWebSocket<TSend, TReceive> {
   send(event: TSend): void;
@@ -611,37 +778,47 @@ const TYPED_WS_HELPER: &str = r#"function createTypedWebSocket<TSend, TReceive>(
 // Code generation
 // ---------------------------------------------------------------------------
 
-/// Generate the full TypeScript client source code.
-///
-/// Discards diagnostics — prefer [`generate_with_warnings`] in CI/codegen
-/// entry points so configuration gaps (e.g. `[ws][auth]` without a ticket
-/// endpoint) surface instead of passing silently.
+/// Generates client source, discarding diagnostics.
+/// Use [`generate_with_warnings`] to surface configuration gaps.
 pub fn generate(routes: &RouteCollection, config: &GeneratorConfig) -> String {
     generate_with_warnings(routes, config).0
 }
 
-/// Generate the client source alongside non-fatal diagnostics.
-///
-/// Warnings are human-readable strings describing routes whose generated
-/// client cannot honor their declared metadata — currently:
-/// - a `[ws][auth]` route while [`GeneratorConfig::ws_ticket_path`] is unset:
-///   browsers cannot set headers on the WS handshake, so the generated client
-///   has no credential pathway and consumers will resort to query-string
-///   tokens.
+/// Generates client source plus diagnostics for routes whose metadata
+/// the client cannot honor: public-declared behind an auth layer,
+/// authenticated routes with `AuthScheme::None`, or `[ws][auth]` Bearer
+/// routes without `ws_ticket_path`. No diagnostic for Cookie WS routes.
 pub fn generate_with_warnings(
     routes: &RouteCollection,
     config: &GeneratorConfig,
 ) -> (String, Vec<String>) {
     let mut warnings = Vec::new();
-    if config.ws_ticket_path.is_none() {
-        for route in routes.iter().filter(|r| r.websocket && r.auth) {
+    for route in routes.iter().filter(|r| r.auth) {
+        if route.declared_public {
             warnings.push(format!(
-                "route '{}': declared [ws][auth] but the generated WebSocket client has no \
-                 credential pathway (browsers cannot set headers on the WS handshake). Set \
-                 GeneratorConfig::ws_ticket_path to emit the ticket-handshake flow, otherwise \
-                 consumers will push tokens into the query string where they leak to logs.",
+                "route '{}': declared public but sits behind an auth layer; the generated \
+                 client requires credentials for it. If the middleware is not user \
+                 authentication, register it with `.layer()` instead of `.auth_layer()`.",
                 route.name
             ));
+            continue;
+        }
+        match config.auth_scheme {
+            AuthScheme::None => warnings.push(format!(
+                "route '{}': declared authenticated but the client was generated with \
+                 auth_scheme \"none\"; emitted requests send no credentials.",
+                route.name
+            )),
+            AuthScheme::Bearer if route.websocket && config.ws_ticket_path.is_none() => {
+                warnings.push(format!(
+                    "route '{}': declared [ws][auth] but the generated WebSocket client has no \
+                     credential pathway (browsers cannot set headers on the WS handshake). Set \
+                     GeneratorConfig::ws_ticket_path to emit the ticket-handshake flow, otherwise \
+                     consumers will push tokens into the query string where they leak to logs.",
+                    route.name
+                ));
+            }
+            _ => {}
         }
     }
 
@@ -694,21 +871,23 @@ fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String
     let error_name = &config.error_class_name;
     let opts_name = &config.options_interface_name;
     let default_creds = &config.default_credentials;
+    let csrf_name = config.csrf_header_name.as_deref().unwrap_or("X-CSRF-Token");
 
     let substitute = |template: &str| -> String {
         template
             .replace("__ERROR__", error_name)
             .replace("__OPTS__", opts_name)
             .replace("__CREDS__", default_creds)
+            .replace("__CSRF_NAME__", csrf_name)
     };
 
     out.push_str(&substitute(ERROR_CLASS));
     w!(out);
-    out.push_str(&substitute(OPTIONS_INTERFACE));
+    out.push_str(&substitute(&options_interface(config)));
     w!(out);
     out.push_str(REQUEST_OPTIONS_TYPE);
     w!(out);
-    out.push_str(&substitute(REQUEST_HELPER));
+    out.push_str(&substitute(&request_helper(config)));
     w!(out);
 
     // Typed WebSocket helpers — only if any WS route exists
@@ -720,11 +899,56 @@ fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String
         w!(out);
     }
 
-    // Factory function
+    // Runtime version + factory function
     let factory = &config.factory_name;
-    w!(out, "export function {factory}(options: {opts_name}) {{");
+    let type_name = derive_type_name(factory);
+    w!(
+        out,
+        "// Runtime semantics version — bump when generated helper behavior changes,"
+    );
+    w!(out, "// so consumers can detect stale committed artifacts.");
+    w!(
+        out,
+        "export const RUNTIME_VERSION = \"{version}\";",
+        version = env!("CARGO_PKG_VERSION")
+    );
+    w!(out);
+    // `{type_name}` resolves acyclically because the routes factory is a
+    // separate function; `withOptions`'s self-reference sits under an object
+    // property, which TS resolves lazily. The exported factory is emitted
+    // before the routes factory (function declarations hoist), keeping the
+    // route surface discoverable after `export function` in the file.
+    w!(
+        out,
+        "export type {type_name} = ReturnType<typeof {factory}Routes> & {{"
+    );
+    w!(
+        out,
+        "  withOptions(override: Partial<{opts_name}>): {type_name};"
+    );
+    w!(out, "}};");
+    w!(out);
+    w!(
+        out,
+        "export function {factory}(options: {opts_name}): {type_name} {{"
+    );
     w!(out, "  const request = createRequest(options);");
     w!(out);
+    w!(
+        out,
+        "  /** Derived client with the given options merged over this client's. */"
+    );
+    w!(
+        out,
+        "  const withOptions = (override: Partial<{opts_name}>): {type_name} =>"
+    );
+    w!(out, "    {factory}({{ ...options, ...override }});");
+    w!(out);
+    w!(out, "  const routes = {factory}Routes(request);");
+    w!(out, "  return Object.assign(routes, {{ withOptions }});");
+    w!(out, "}}");
+    w!(out);
+    w!(out, "function {factory}Routes(request: RequestFn) {{");
     w!(out, "  return {{");
 
     if config.enable_groups {
@@ -737,17 +961,10 @@ fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String
     w!(out, "}}");
     w!(out);
 
-    // Type export
-    let type_name = derive_type_name(factory);
-    w!(
-        out,
-        "export type {type_name} = ReturnType<typeof {factory}>;"
-    );
-
     out
 }
 
-/// Generate routes organized into groups (nested objects).
+/// Generates routes into namespace groups.
 fn generate_grouped_routes(out: &mut String, routes: &RouteCollection, config: &GeneratorConfig) {
     let mut ungrouped: Vec<&RouteDefinition> = Vec::new();
     let mut groups: BTreeMap<String, Vec<&RouteDefinition>> = BTreeMap::new();
@@ -781,7 +998,7 @@ fn generate_grouped_routes(out: &mut String, routes: &RouteCollection, config: &
     }
 }
 
-/// Generate routes in a flat structure (no grouping).
+/// Generates routes without grouping.
 fn generate_flat_routes(out: &mut String, routes: &RouteCollection, config: &GeneratorConfig) {
     for route in routes {
         write!(out, "    ").unwrap();
@@ -790,47 +1007,51 @@ fn generate_flat_routes(out: &mut String, routes: &RouteCollection, config: &Gen
     }
 }
 
-/// Generate a single route method.
+/// Generates a single route method.
 fn generate_route_method(
     out: &mut String,
     route: &RouteDefinition,
     indent: usize,
     config: &GeneratorConfig,
 ) {
+    let large_int = config.large_int_type.as_str();
     if route.websocket {
         generate_ws_method(out, route, indent, config);
     } else if route.redirect {
-        generate_redirect_method(out, route, indent);
+        generate_redirect_method(out, route, indent, large_int);
     } else {
         let name = &route.name;
-        let params = generate_params(route);
+        let params = generate_params(route, large_int);
         let path_template = build_path_template(&route.path);
         let return_type = route
             .response_type
             .as_ref()
-            .map(|t| rust_type_to_ts(t))
+            .map(|t| rust_type_to_ts_with(t, large_int))
             .unwrap_or_else(|| "void".into());
         let opts = generate_request_options(route);
 
         if params.is_empty() {
-            write!(
-                out,
-                "{name}: () => request<{return_type}>({path_template}{opts})"
-            )
-            .unwrap();
+            emit_method_name(out, name);
+            write!(out, ": () => request<{return_type}>({path_template}{opts})").unwrap();
         } else {
             let pad = " ".repeat(indent + 2);
+            emit_method_name(out, name);
             write!(
                 out,
-                "{name}: ({params}) =>\n{pad}request<{return_type}>({path_template}{opts})"
+                ": ({params}) =>\n{pad}request<{return_type}>({path_template}{opts})"
             )
             .unwrap();
         }
     }
 }
 
-/// Generate a redirect route (URL-builder, not fetch).
-fn generate_redirect_method(out: &mut String, route: &RouteDefinition, indent: usize) {
+/// Generates a redirect route (URL builder, not fetch).
+fn generate_redirect_method(
+    out: &mut String,
+    route: &RouteDefinition,
+    indent: usize,
+    large_int: &str,
+) {
     let name = &route.name;
     let path_template = build_path_template(&route.path);
     let path_inner = &path_template[1..path_template.len() - 1];
@@ -839,7 +1060,7 @@ fn generate_redirect_method(out: &mut String, route: &RouteDefinition, indent: u
     let pad4 = " ".repeat(indent + 4);
 
     if let Some(ref query_type) = route.query_type {
-        let query_ts = rust_type_to_ts(query_type);
+        let query_ts = rust_type_to_ts_with(query_type, large_int);
         let mut fn_params = Vec::new();
         for param in &route.path_params {
             fn_params.push(format!("{}: string", param.name));
@@ -847,7 +1068,8 @@ fn generate_redirect_method(out: &mut String, route: &RouteDefinition, indent: u
         fn_params.push(format!("query?: {query_ts}"));
         let all_params = fn_params.join(", ");
 
-        w!(out, "{name}: ({all_params}) => {{");
+        emit_method_name(out, name);
+        w!(out, ": ({all_params}) => {{");
         w!(out, "{pad2}let url = `${{options.baseUrl}}{path_inner}`;");
         w!(out, "{pad2}if (query) {{");
         w!(out, "{pad4}const params = new URLSearchParams();");
@@ -865,22 +1087,18 @@ fn generate_redirect_method(out: &mut String, route: &RouteDefinition, indent: u
         w!(out, "{pad2}}}");
         write!(out, "{pad2}return url;\n{pad}}}").unwrap();
     } else {
-        let params = generate_params(route);
+        let params = generate_params(route, large_int);
         if params.is_empty() {
-            write!(out, "{name}: () => `${{options.baseUrl}}{path_inner}`").unwrap();
+            emit_method_name(out, name);
+            write!(out, ": () => `${{options.baseUrl}}{path_inner}`").unwrap();
         } else {
-            write!(
-                out,
-                "{name}: ({params}) => `${{options.baseUrl}}{path_inner}`"
-            )
-            .unwrap();
+            emit_method_name(out, name);
+            write!(out, ": ({params}) => `${{options.baseUrl}}{path_inner}`").unwrap();
         }
     }
 }
 
-/// Derive a type name from a factory function name.
-///
-/// `createYAuthClient` -> `YAuthClient`
+/// Derives a type name from a factory name (`createFooClient` -> `FooClient`).
 fn derive_type_name(factory_name: &str) -> String {
     factory_name
         .strip_prefix("create")
@@ -888,18 +1106,8 @@ fn derive_type_name(factory_name: &str) -> String {
         .to_string()
 }
 
-/// Generate a WebSocket route method.
-///
-/// When send/receive types are defined, produces a TypeScript factory that
-/// returns a `TypedWebSocket<S, R>` with typed `send()` and `onMessage()`.
-/// Otherwise produces a bare `new WebSocket(url)`.
-///
-/// Authenticated routes ([`GeneratorConfig::ws_ticket_path`] set + `auth`) are
-/// generated as an async ticket handshake: an authenticated POST to the
-/// ticket endpoint yields a single-use short-TTL ticket, and only that proof
-/// is appended to the WS URL — long-lived credentials never enter the URL,
-/// where they would leak to access logs, proxies, and browser history. The
-/// server must consume tickets atomically on upgrade.
+/// Generates a WS factory returning `TypedWebSocket<S, R>` (or `WebSocket`).
+/// Bearer `[auth]` routes with `ws_ticket_path` use an async ticket handshake.
 fn generate_ws_method(
     out: &mut String,
     route: &RouteDefinition,
@@ -913,8 +1121,10 @@ fn generate_ws_method(
     let pad2 = " ".repeat(indent + 2);
     let pad4 = " ".repeat(indent + 4);
 
-    // Ticket-handshake mode applies to [auth] routes when configured:
-    let ticket_mode = if route.auth {
+    // Ticket-handshake mode applies to [auth] routes under the Bearer scheme
+    // when configured. Under Cookie, browsers attach session cookies to
+    // same-origin WS upgrades natively — no handshake needed.
+    let ticket_mode = if route.auth && config.auth_scheme == AuthScheme::Bearer {
         config.ws_ticket_path.as_ref()
     } else {
         None
@@ -926,15 +1136,19 @@ fn generate_ws_method(
         fn_params.push(format!("{}: string", param.name));
     }
     if let Some(ref query_type) = route.query_type {
-        fn_params.push(format!("query?: {}", rust_type_to_ts(query_type)));
+        fn_params.push(format!(
+            "query?: {}",
+            rust_type_to_ts_with(query_type, config.large_int_type.as_str())
+        ));
     }
     let all_params = fn_params.join(", ");
 
     // Determine return type
     let has_types = route.ws_send_type.is_some() && route.ws_receive_type.is_some();
     let ws_type = if has_types {
-        let send_ts = rust_type_to_ts(route.ws_send_type.as_ref().unwrap());
-        let recv_ts = rust_type_to_ts(route.ws_receive_type.as_ref().unwrap());
+        let large_int = config.large_int_type.as_str();
+        let send_ts = rust_type_to_ts_with(route.ws_send_type.as_ref().unwrap(), large_int);
+        let recv_ts = rust_type_to_ts_with(route.ws_receive_type.as_ref().unwrap(), large_int);
         format!("TypedWebSocket<{send_ts}, {recv_ts}>")
     } else {
         "WebSocket".into()
@@ -945,9 +1159,10 @@ fn generate_ws_method(
         ws_type.clone()
     };
 
+    emit_method_name(out, name);
     w!(
         out,
-        "{name}: {}({all_params}): {return_type} => {{",
+        ": {}({all_params}): {return_type} => {{",
         if ticket_mode.is_some() { "async " } else { "" }
     );
 
@@ -1008,8 +1223,9 @@ fn generate_ws_method(
     }
 
     if has_types {
-        let send_ts = rust_type_to_ts(route.ws_send_type.as_ref().unwrap());
-        let recv_ts = rust_type_to_ts(route.ws_receive_type.as_ref().unwrap());
+        let large_int = config.large_int_type.as_str();
+        let send_ts = rust_type_to_ts_with(route.ws_send_type.as_ref().unwrap(), large_int);
+        let recv_ts = rust_type_to_ts_with(route.ws_receive_type.as_ref().unwrap(), large_int);
         w!(
             out,
             "{pad2}assertSecureTransport(url, options.allowInsecureHttp === true);"
@@ -1084,8 +1300,57 @@ pub fn generate_to_file(
     Ok(())
 }
 
-/// RAII guard that removes a temp file on drop.
+/// Removes the temp file on drop.
 struct TempFile(std::path::PathBuf);
+
+impl TempFile {
+    /// Creates a unique temp file with `O_EXCL`; fails if the path exists.
+    fn create(prefix: &str, contents: &[u8]) -> Result<Self, std::io::Error> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let mut attempts = 0u32;
+        loop {
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64 | (d.as_secs() << 20))
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "{prefix}_{}_{}_{}",
+                std::process::id(),
+                nanos,
+                unique
+            ));
+
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true) // fails if anything already exists at the path
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    file.write_all(contents)?;
+                    return Ok(TempFile(path));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    attempts += 1;
+                    if attempts > 16 {
+                        return Err(std::io::Error::other(
+                            "could not allocate a unique temporary file path",
+                        ));
+                    }
+                    // Collision (vanishingly unlikely): retry with a new name.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn as_str(&self) -> std::borrow::Cow<'_, str> {
+        self.0.to_string_lossy()
+    }
+}
 
 impl Drop for TempFile {
     fn drop(&mut self) {
@@ -1093,29 +1358,19 @@ impl Drop for TempFile {
     }
 }
 
-/// Check if the generated output matches the committed file.
-///
-/// When `config.format_command` is set, the generated output is written to a temporary file
-/// and formatted before comparing, so the check accounts for formatter changes.
-///
-/// Returns `Ok(())` if in sync, `Err(CheckError)` if not.
+/// Returns `Ok(())` if generated output matches the committed file.
+/// With `format_command`, formats a temp copy before comparing.
 pub fn check(routes: &RouteCollection, config: &GeneratorConfig) -> Result<(), CheckError> {
     let generated = generate(routes, config);
 
     let expected = if let Some(ref cmd) = config.format_command {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let temp = TempFile(
-            std::env::temp_dir().join(format!("axotyped_check_{}_{nanos}.ts", std::process::id())),
-        );
-        let temp_str = temp.0.to_string_lossy().to_string();
-
-        std::fs::write(&temp.0, &generated).map_err(|e| CheckError::ReadError {
-            path: temp_str.clone(),
-            error: e,
+        let temp = TempFile::create("axotyped_check", generated.as_bytes()).map_err(|e| {
+            CheckError::ReadError {
+                path: "temporary file".into(),
+                error: e,
+            }
         })?;
+        let temp_str = temp.as_str().to_string();
 
         run_format_command(cmd, &temp_str).map_err(|e| CheckError::FormatError {
             command: cmd.clone(),
@@ -1155,7 +1410,9 @@ mod tests {
         assert_eq!(rust_type_to_ts("String"), "string");
         assert_eq!(rust_type_to_ts("bool"), "boolean");
         assert_eq!(rust_type_to_ts("u32"), "number");
-        assert_eq!(rust_type_to_ts("i64"), "number");
+        // Wide integers map to bigint by default in the test helper; the
+        // configurable mapping is covered separately.
+        assert_eq!(rust_type_to_ts("i64"), "bigint");
         assert_eq!(rust_type_to_ts("Uuid"), "string");
         assert_eq!(rust_type_to_ts("f64"), "number");
     }

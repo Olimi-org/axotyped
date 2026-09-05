@@ -42,7 +42,14 @@ pub struct RouteDefinition {
     /// Route path (e.g., `/register`, `/admin/users/{id}`).
     pub path: String,
     /// Whether the route requires authentication.
+    ///
+    /// Defaults to `true`; `auth_layer` in scope forces `true`
+    /// even for public-declared routes.
     pub auth: bool,
+    /// Whether the route was declared public (`#[endpoint(public)]`,
+    /// `[public]`, or a `group_public` scope). With `auth == true`,
+    /// indicates an auth-layer override reported by `generate_with_warnings`.
+    pub declared_public: bool,
     /// Rust type name of the request body (stringified via `stringify!()`).
     pub body_type: Option<String>,
     /// Rust type name of the response body (stringified via `stringify!()`).
@@ -72,16 +79,10 @@ pub struct RouteDefinition {
 #[cfg(feature = "ts-rs")]
 type ExportFn = fn(&crate::ts::Config) -> Result<(), crate::ts::ExportError>;
 
-/// What happens when a route names a type `T` for TypeScript export.
+/// Called when a route names type `T` for TypeScript export.
 ///
-/// The default collector [`NoCollect`] is a no-op: routers built with it never touch the ts-rs
-/// export machinery, so none of the export codegen is pulled into the binary. To actually collect
-/// types (e.g. for binding generation), build the router with [`TypeRegistry`] as the collector.
-///
-/// This is the compile-time switch that keeps the export chain out of binaries that don't export:
-/// because `NoCollect::register` has an empty body, the lean router monomorphization never
-/// references `T::export_all`, so LLVM dead-code-eliminates the entire export pipeline when no
-/// collecting collector is used.
+/// [`NoCollect`] ignores registrations; [`TypeRegistry`] collects them
+/// for binding generation.
 pub trait Collector: Default {
     /// Register `T`. The default is a no-op; collecting collectors override this.
     fn register<T: crate::MaybeTs + 'static>(&mut self) {}
@@ -93,7 +94,7 @@ pub trait Collector: Default {
     fn into_type_registry(self) -> TypeRegistry;
 }
 
-/// Lean collector — registers nothing. The default collector for [`crate::ApiRouter`].
+/// Lean collector that registers nothing. The default for [`crate::ApiRouter`].
 #[derive(Debug, Clone, Default)]
 pub struct NoCollect;
 
@@ -103,11 +104,8 @@ impl Collector for NoCollect {
     }
 }
 
-/// Collects types encountered during route building so their TypeScript
-/// declarations can be exported via ts-rs's `export_all()` mechanism.
-/// Deduplicates by `TypeId` to handle generic instantiations correctly
-/// (e.g., `ContentResponse<VocabItem>` and `ContentResponse<Dialog>` share
-/// the same generic `TS` impl and produce the same declaration).
+/// Collects route types for ts-rs export via `export_all()`.
+/// Deduplicates by `TypeId` so shared generic impls emit one declaration.
 #[cfg(feature = "ts-rs")]
 #[derive(Debug, Clone, Default)]
 pub struct TypeRegistry {
@@ -116,9 +114,7 @@ pub struct TypeRegistry {
     seen: std::collections::BTreeSet<std::any::TypeId>,
 }
 
-/// Check if a type name is a stdlib container wrapper that shouldn't be
-/// exported as a standalone ts-rs type (e.g., `alloc::vec::Vec<MyType>`).
-/// The TS generator handles these inline (`T[]`, `T | null`).
+/// Returns true for stdlib wrappers handled inline (`Vec` as `T[]`, `Option` as `T | null`).
 #[cfg(feature = "ts-rs")]
 fn is_container_wrapper(type_name: &str) -> bool {
     type_name.contains("::vec::Vec<") || type_name.contains("::option::Option<")
@@ -214,8 +210,8 @@ impl RouteCollection {
         Self::default()
     }
 
-    /// Assemble a `RouteCollection` from route definitions and a collected type registry.
-    /// Used by [`crate::ApiRouter::build`] to produce the final output.
+    /// Builds a `RouteCollection` from routes and a type registry.
+    /// Used by [`crate::ApiRouter::build`].
     pub(crate) fn assemble(routes: Vec<RouteDefinition>, types: TypeRegistry) -> Self {
         Self { routes, types }
     }
@@ -237,17 +233,23 @@ impl RouteCollection {
         &self.types
     }
 
-    /// Export all collected types (and their transitive dependencies) to the
-    /// given directory using ts-rs's `export_all()` mechanism.
-    ///
-    /// Call this before `generate_to_file()` — the generated client will
-    /// import types from this directory.
-    ///
-    /// This replaces manual `T::export_all(&cfg)` calls for each type.
-    /// Types are auto-discovered from the builder's `.response::<T>()`,
-    /// `.body::<T>()`, `.query::<T>()`, and `.events::<A, B>()` calls.
+    /// Exports collected types and dependencies to `dir` via `export_all()`.
+    /// Call before `generate_to_file()`; replaces manual per-type exports.
+    /// Types come from `.response::<T>()`, `.body::<T>()`, `.query::<T>()`, `.events::<A, B>()`.
     #[cfg(feature = "ts-rs")]
     pub fn export_types(&self, dir: &std::path::Path) -> Result<(), std::io::Error> {
+        self.export_types_with(dir, crate::ts::Config::from_env())
+    }
+
+    /// Exports types with an explicit ts-rs [`Config`](crate::ts::Config).
+    /// Use [`GeneratorConfig::ts_config`](crate::GeneratorConfig::ts_config) to keep
+    /// binding and client integer rendering aligned.
+    #[cfg(feature = "ts-rs")]
+    pub fn export_types_with(
+        &self,
+        dir: &std::path::Path,
+        cfg: crate::ts::Config,
+    ) -> Result<(), std::io::Error> {
         use std::fs;
 
         if self.types.is_empty() {
@@ -255,9 +257,7 @@ impl RouteCollection {
         }
 
         fs::create_dir_all(dir)?;
-        // from_env, not new: the documented TS_RS_* env vars (e.g.
-        // TS_RS_LARGE_INT) must apply to the export path too.
-        let cfg = crate::ts::Config::from_env().with_out_dir(dir.to_path_buf());
+        let cfg = cfg.with_out_dir(dir.to_path_buf());
 
         for (_, export_fn) in self.types.slots() {
             if let Err(e) = export_fn(&cfg) {
@@ -334,15 +334,15 @@ impl<'a> IntoIterator for &'a RouteCollection {
     }
 }
 
-/// Whether `name` is a valid JavaScript identifier, safe to splice into
-/// generated code as a variable name as-is.
-///
-/// This is a conservative ASCII check (letters, `_`, `$`, digits — not starting
-/// with a digit) plus ECMAScript reserved-word rejection. Anything rejected
-/// here is replaced with a synthetic parameter name by
-/// [`extract_path_params`] / [`crate::generate`].
+/// Returns true if `name` can be emitted as-is in generated code.
+/// ASCII identifier check plus reserved-word rejection; rejected names
+/// become synthetic `__param_N` placeholders.
 pub fn is_valid_js_identifier(name: &str) -> bool {
+    // ECMAScript reserved words: strict keywords, future reserved words
+    // (strict mode / modules), and contextual keywords that cannot serve as
+    // plain bindings in generated signatures or module code.
     const RESERVED: &[&str] = &[
+        // Strict keywords (always reserved)
         "await",
         "break",
         "case",
@@ -381,6 +381,20 @@ pub fn is_valid_js_identifier(name: &str) -> bool {
         "while",
         "with",
         "yield",
+        // Future reserved words in strict mode / modules
+        "implements",
+        "interface",
+        "let",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "static",
+        // Contextual keywords rejected conservatively
+        "arguments",
+        "async",
+        "eval",
+        "of",
     ];
 
     let mut chars = name.chars();
@@ -391,35 +405,30 @@ pub fn is_valid_js_identifier(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') && !RESERVED.contains(&name)
 }
 
-/// Extract path parameters from a route path string.
-///
-/// For example, `/admin/users/{id}` returns `[PathParam { name: "id" }]`.
-///
-/// Every `{...}` brace group counts as a parameter regardless of surrounding
-/// text in its segment (matching axum's inline-capture forms like `{id}suffix`),
-/// and repeats collapse to their first occurrence.
-///
-/// Contents that are not valid JS identifiers are replaced with deterministic
-/// synthetic names (`__param_N`, by first-occurrence order); route paths are
-/// server-side strings and cannot be assumed safe for direct use as parameter
-/// names. The generator applies the exact same mapping when building path
-/// templates, keeping the emitted signature and the interpolated placeholders
-/// in sync.
+/// Extracts `{...}` params from a path (e.g. `/users/{id}` -> `[id]`).
+/// Repeats collapse to first occurrence; non-identifiers become `__param_N`,
+/// matching path-template generation.
 pub fn extract_path_params(path: &str) -> Vec<PathParam> {
-    scan_raw_path_params(path)
-        .into_iter()
+    let raws = scan_raw_path_params(path);
+
+    // Names claimed by valid raw identifiers; synthetics must avoid these.
+    let taken: std::collections::BTreeSet<String> = raws
+        .iter()
+        .filter(|raw| is_valid_js_identifier(raw))
+        .map(|raw| (*raw).to_string())
+        .collect();
+
+    let mut next_synthetic = 0usize;
+    raws.into_iter()
         .enumerate()
         .map(|(index, raw)| PathParam {
-            name: sanitize_param_name(raw, index),
+            name: sanitize_param_name_with(&taken, &mut next_synthetic, raw, index),
         })
         .collect()
 }
 
-/// Scan `path` left-to-right for `{...}` brace groups, returning the raw inner
-/// text of each group in first-occurrence order (duplicates dropped).
-///
-/// An unterminated `{` yields no group and stops the scan; the generator treats
-/// the remainder as literal text.
+/// Returns raw `{...}` contents in first-occurrence order.
+/// An unterminated `{` ends the scan; the remainder is literal text.
 fn scan_raw_path_params(path: &str) -> Vec<&str> {
     let mut raws: Vec<&str> = Vec::new();
     let mut rest = path;
@@ -438,14 +447,33 @@ fn scan_raw_path_params(path: &str) -> Vec<&str> {
     raws
 }
 
-/// Deterministic raw-name → emitted-name mapping shared by parameter
-/// extraction and template generation, so a param's name in the generated
-/// signature always matches its placeholder in the path template.
-pub(crate) fn sanitize_param_name(raw: &str, index: usize) -> String {
+/// Raw names in `path` that are valid identifiers.
+pub(crate) fn scan_taken_param_names(path: &str) -> std::collections::BTreeSet<String> {
+    scan_raw_path_params(path)
+        .into_iter()
+        .filter(|raw| is_valid_js_identifier(raw))
+        .map(String::from)
+        .collect()
+}
+
+/// Maps a raw param name to its emitted name, allocating `__param_N`
+/// for invalid identifiers. Shared by param extraction and template generation.
+pub(crate) fn sanitize_param_name_with(
+    taken: &std::collections::BTreeSet<String>,
+    next_synthetic: &mut usize,
+    raw: &str,
+    _index: usize,
+) -> String {
     if is_valid_js_identifier(raw) {
-        raw.to_string()
-    } else {
-        format!("__param_{index}")
+        return raw.to_string();
+    }
+    loop {
+        let candidate = format!("__param_{next_synthetic}");
+        *next_synthetic += 1;
+        // Skip names already taken or equal to the raw input.
+        if !taken.contains(&candidate) && candidate != raw {
+            return candidate;
+        }
     }
 }
 
@@ -517,6 +545,7 @@ mod tests {
             method: HttpMethod::Get,
             path: "/foo".into(),
             auth: false,
+            declared_public: false,
             body_type: None,
             response_type: None,
             query_type: None,
@@ -534,6 +563,7 @@ mod tests {
             method: HttpMethod::Post,
             path: "/bar".into(),
             auth: true,
+            declared_public: false,
             body_type: Some("BarRequest".into()),
             response_type: Some("BarResponse".into()),
             query_type: None,

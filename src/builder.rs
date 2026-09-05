@@ -30,9 +30,9 @@ use axum::Router;
 use axum::handler::Handler;
 use axum::routing::{self, MethodRouter};
 
-use crate::types::{
-    Collector, HttpMethod, NoCollect, RouteCollection, RouteDefinition, TypeRegistry,
-};
+#[cfg(feature = "ts-rs")]
+use crate::types::TypeRegistry;
+use crate::types::{Collector, HttpMethod, NoCollect, RouteCollection, RouteDefinition};
 
 // ---------------------------------------------------------------------------
 // Layer support
@@ -226,26 +226,21 @@ fn default_name_from_handler<H: 'static>() -> String {
 // ApiRouter
 // ---------------------------------------------------------------------------
 
-/// Builder that constructs both an [`axum::Router`] and a [`RouteCollection`].
-///
-/// Generic over the state `S` and a [`Collector`] `C` (defaulting to [`NoCollect`]). With the
-/// default `NoCollect` collector, no TypeScript type collection happens and none of the ts-rs
-/// export machinery is pulled into the binary. Pass [`crate::TypeRegistry`] as `C` to collect
-/// types for binding generation.
+/// Builder producing both an [`axum::Router`] and a [`RouteCollection`].
+/// Generic over state `S` and [`Collector`] `C` (`NoCollect` by default;
+/// `TypeRegistry` to collect types for binding generation).
 pub struct ApiRouter<S = (), C: Collector = NoCollect> {
     router: Router<S>,
     routes: Vec<RouteDefinition>,
     collector: C,
     current_group: Option<String>,
     current_prefix: Option<String>,
-    /// Whether routes registered in this scope are public (`auth: false` in
-    /// codegen metadata).
-    ///
-    /// Routes are private unless opened: [`group_public`](Self::group_public)
-    /// plus `#[endpoint(public)]` on individual handlers.
+    /// Whether routes in this scope are public (`auth: false`).
     scope_public: bool,
-    /// Layers active in this scope; applied to every route registered after
-    /// they were added (and inherited by nested group scopes).
+    /// Whether an auth layer is active; forces `auth: true` even for
+    /// public-declared routes. See [`auth_layer`](Self::auth_layer).
+    scope_protected: bool,
+    /// Layers applied to routes registered after they are added.
     layers: Vec<LayerApplier<S>>,
 }
 
@@ -254,7 +249,7 @@ where
     S: Clone + Send + Sync + 'static,
     C: Collector,
 {
-    /// Create a new empty builder using this collector (freshly default-constructed).
+    /// Create a new empty builder.
     pub fn new() -> Self {
         Self {
             router: Router::new(),
@@ -263,6 +258,7 @@ where
             current_group: None,
             current_prefix: None,
             scope_public: false,
+            scope_protected: false,
             layers: Vec::new(),
         }
     }
@@ -317,6 +313,7 @@ where
             current_group: Some(name.to_string()),
             current_prefix: self.current_prefix.clone(),
             scope_public: true,
+            scope_protected: self.scope_protected,
             layers: self.layers.clone(),
         };
 
@@ -372,12 +369,38 @@ where
         self
     }
 
-    /// Closure-based group: scoped TS client namespace without modifying route path prefixes.
+    /// Like [`layer`](Self::layer), but marks scoped routes authenticated
+    /// (`auth: true`), overriding public declarations. Contradictions are
+    /// reported by [`generate_with_warnings`](crate::generate_with_warnings).
+    /// Use `layer` for non-auth middleware.
     ///
-    /// Routes inside the closure inherit `name` as their TS group namespace.
+    /// # Example
     ///
-    /// For the version that also prepends `/{name}` as a URL path prefix, see
-    /// [`group_prefixed`](Self::group_prefixed).
+    /// ```rust,ignore
+    /// r.group_prefixed("admin", |g| {
+    ///     g.auth_layer(axum::middleware::from_fn_with_state(state, require_admin))
+    ///         .get("/course", register!(list_courses))
+    /// })
+    /// .get("/health", register!(health))
+    /// ```
+    pub fn auth_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<axum::extract::Request, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Response:
+            axum::response::IntoResponse,
+        <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
+    {
+        self.scope_protected = true;
+        self.layer(layer)
+    }
+
+    /// Group with scoped TS namespace; does not modify path prefixes.
+    /// See [`group_prefixed`](Self::group_prefixed) for the prefixed variant.
     pub fn group<R, F>(mut self, name: &str, routes: F) -> Self
     where
         F: FnOnce(ApiRouter<S, C>) -> R,
@@ -390,6 +413,7 @@ where
             current_group: Some(name.to_string()),
             current_prefix: self.current_prefix.clone(),
             scope_public: self.scope_public,
+            scope_protected: self.scope_protected,
             layers: self.layers.clone(),
         };
 
@@ -401,14 +425,8 @@ where
         self
     }
 
-    /// Closure-based group: scoped TS namespace AND URL path prefix.
-    ///
-    /// Creates an isolated scope where all routes inherit the group's
-    /// prefix (`/{name}`), auth setting, and TS client namespace. The group's config
-    /// does not leak to routes registered after the closure.
-    ///
-    /// The prefix defaults to `"/{name}"` (or `{outer_prefix}/{name}`) but can be
-    /// overridden with `.set_prefix()` inside the closure.
+    /// Group with scoped TS namespace and URL prefix (`/{name}`).
+    /// Config does not leak past the closure; override prefix with `set_prefix`.
     ///
     /// # Example
     ///
@@ -437,6 +455,7 @@ where
             current_group: Some(name.to_string()),
             current_prefix: Some(default_prefix),
             scope_public: self.scope_public,
+            scope_protected: self.scope_protected,
             layers: self.layers.clone(),
         };
 
@@ -456,7 +475,7 @@ where
         self
     }
 
-    /// Consume the builder and return the router and collected route metadata.
+    /// Consume the builder, returning router and route metadata.
     pub fn build(self) -> (Router<S>, RouteCollection) {
         let collection =
             RouteCollection::assemble(self.routes, self.collector.into_type_registry());
@@ -486,11 +505,17 @@ where
             ep,
             &self.current_prefix,
             self.scope_public,
+            self.scope_protected,
             &self.current_group,
             false,
             &self.layers,
         );
         EH::apply_meta::<C>(&mut def, &mut self.collector);
+        // Server-derived truth: an auth layer in scope protects every route
+        // registered under it, overriding any public declaration.
+        if self.scope_protected {
+            def.auth = true;
+        }
         RouteBuilder { parent: self, def }
     }
 
@@ -568,16 +593,21 @@ where
             ep,
             &self.current_prefix,
             self.scope_public,
+            self.scope_protected,
             &self.current_group,
             true,
             &self.layers,
         );
         EH::apply_meta::<C>(&mut def, &mut self.collector);
+        // Server-derived truth (same rule as the HTTP registration path).
+        if self.scope_protected {
+            def.auth = true;
+        }
         WsRouteBuilder { parent: self, def }
     }
 }
 
-/// Resolve a route path against an optional prefix (collector-independent helper).
+/// Resolves `path` against an optional prefix.
 fn resolve_prefix(prefix: &Option<String>, path: &str) -> String {
     match prefix {
         Some(prefix) => format!("{}{}", prefix, path),
@@ -605,6 +635,7 @@ fn route_into_def<S, EH, T>(
     ep: EH,
     prefix: &Option<String>,
     public_scope: bool,
+    protected_scope: bool,
     group: &Option<String>,
     websocket: bool,
     layers: &[LayerApplier<S>],
@@ -625,7 +656,8 @@ where
         name,
         method,
         path: full_path,
-        auth: !public_scope,
+        auth: !public_scope || protected_scope,
+        declared_public: public_scope,
         body_type: None,
         response_type: None,
         query_type: None,
@@ -811,7 +843,7 @@ pub trait RouteTable<S> {
         collect_routes(|r| Self::define(r))
     }
 
-    /// Collecting build — returns both the `Router` and collected `RouteCollection`.
+    /// Collecting build returning [`Router`] and [`RouteCollection`].
     #[cfg(feature = "ts-rs")]
     fn build() -> (Router<S>, RouteCollection)
     where

@@ -25,7 +25,20 @@ export type * from "../../../../bindings";
 export class YAuthError extends Error {
   constructor(message: string, public status: number, public body?: unknown) {
     super(message);
-    this.name = "YAuthError";
+
+    // Keep native Error behavior when transpiled to older targets:
+    // name non-enumerable, prototype chain intact, stack trace captured.
+    Object.defineProperty(this, "name", {
+      value: "YAuthError",
+      enumerable: false,
+      configurable: true,
+    });
+    if (Object.setPrototypeOf !== undefined) {
+      Object.setPrototypeOf(this, YAuthError.prototype);
+    }
+    if ((Error as any).captureStackTrace !== undefined) {
+      (Error as any).captureStackTrace(this, this.constructor);
+    }
   }
 }
 
@@ -35,6 +48,14 @@ export interface YAuthClientOptions {
   credentials?: RequestCredentials;
   fetch?: typeof fetch;
   onError?: (error: YAuthError) => void;
+  /**
+   * Default RequestInit merged into every request. Useful for AbortSignals
+   * (cancellation/timeouts), cache policy, keepalive, and priority hints.
+   * Per-request values passed through a route's options take precedence.
+   */
+  requestInit?: Omit<RequestInit, "headers" | "method" | "body"> & {
+    headers?: Record<string, string>;
+  };
   /**
    * Opt-in ONLY for development against a non-loopback http:// target
    * (e.g. an Expo device hitting your LAN IP). Loopback hosts
@@ -51,6 +72,9 @@ type RequestOptions = {
   query?: Record<string, unknown>;
   auth?: boolean;
 };
+
+/** The `request` helper produced by `createRequest`, for the routes factory. */
+type RequestFn = <T>(path: string, opts?: RequestOptions) => Promise<T>;
 
 function assertSecureTransport(
   url: string,
@@ -89,29 +113,44 @@ function assertSecureTransport(
 
 function createRequest(options: YAuthClientOptions) {
   const { baseUrl, credentials = "include" } = options;
+  // Bind fetch to its original receiver: calling an unbound
+  // globalThis.fetch reference throws "Illegal invocation" in several
+  // browser engines.
+  const boundFetch =
+    options.fetch !== undefined ? options.fetch : globalThis.fetch.bind(globalThis);
+
+  async function request<T>(path: string, opts?: RequestOptions): Promise<T>;
+  async function request<T>(
+    path: string,
+    opts: RequestOptions | undefined,
+    rawResponse: true,
+  ): Promise<Response>;
   async function request<T>(
     path: string,
     opts: RequestOptions = {},
-  ): Promise<T> {
+    rawResponse?: boolean,
+  ): Promise<T | Response> {
     const { method = "GET", body, query, auth } = opts;
-    // Resolve fetch at call time (not at client creation) so OTel
-    // instrumentation patches are picked up even when the client
-    // module is imported before telemetry initializes.
-    const fetchFn = options.fetch ?? globalThis.fetch;
-
     let url = `${baseUrl}${path}`;
     if (query) {
       const params = new URLSearchParams();
       for (const [key, value] of Object.entries(query)) {
-        if (value !== undefined && value !== null) {
-          params.set(key, String(value));
+        // Arrays expand to repeated keys (?tag=a&tag=b), the conventional
+        // encoding for list-valued parameters.
+        for (const v of Array.isArray(value) ? value : [value]) {
+          if (v !== undefined && v !== null) {
+            params.append(key, String(v));
+          }
         }
       }
       const qs = params.toString();
       if (qs) url += `?${qs}`;
     }
 
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...(options.requestInit?.headers ?? {}),
+    };
 
     // Credentials are only sent over https, to loopback hosts over http,
     // or when the client was explicitly configured with allowInsecureHttp.
@@ -134,7 +173,8 @@ function createRequest(options: YAuthClientOptions) {
       headers.Authorization = `Bearer ${token}`;
     }
 
-    const response = await fetchFn(url, {
+    const response = await boundFetch(url, {
+      ...options.requestInit,
       method,
       credentials,
       headers,
@@ -156,6 +196,8 @@ function createRequest(options: YAuthClientOptions) {
       if (options.onError) options.onError(error);
       throw error;
     }
+
+    if (rawResponse) return response;
 
     const text = await response.text();
     return (text ? JSON.parse(text) : undefined) as T;
@@ -190,9 +232,26 @@ function createTypedWebSocket<TSend, TReceive>(ws: WebSocket): TypedWebSocket<TS
   };
 }
 
-export function createYAuthClient(options: YAuthClientOptions) {
+// Runtime semantics version — bump when generated helper behavior changes,
+// so consumers can detect stale committed artifacts.
+export const RUNTIME_VERSION = "0.3.0";
+
+export type YAuthClient = ReturnType<typeof createYAuthClientRoutes> & {
+  withOptions(override: Partial<YAuthClientOptions>): YAuthClient;
+};
+
+export function createYAuthClient(options: YAuthClientOptions): YAuthClient {
   const request = createRequest(options);
 
+  /** Derived client with the given options merged over this client's. */
+  const withOptions = (override: Partial<YAuthClientOptions>): YAuthClient =>
+    createYAuthClient({ ...options, ...override });
+
+  const routes = createYAuthClientRoutes(request);
+  return Object.assign(routes, { withOptions });
+}
+
+function createYAuthClientRoutes(request: RequestFn) {
   return {
     getSession: () => request<SessionResponse>("/session", { auth: true }),
     logout: () => request<SuccessResponse>("/logout", { method: "POST", auth: true }),
@@ -258,4 +317,3 @@ export function createYAuthClient(options: YAuthClientOptions) {
   };
 }
 
-export type YAuthClient = ReturnType<typeof createYAuthClient>;
