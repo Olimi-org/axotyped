@@ -92,7 +92,7 @@ function assertSecureTransport(
       `Client produced an unparseable URL (${JSON.stringify(url)}); refusing to send credentials.`,
     );
   }
-  if (parsed.protocol === "https:") return;
+  if (parsed.protocol === "https:" || parsed.protocol === "wss:") return;
   const h = parsed.hostname;
   const isLoopback =
     h === "localhost" ||
@@ -100,8 +100,9 @@ function assertSecureTransport(
     h === "127.0.0.1" ||
     h === "::1" ||
     h === "[::1]";
+  const isInsecureScheme = parsed.protocol === "http:" || parsed.protocol === "ws:";
   const insecureAllowed =
-    parsed.protocol === "http:" && (isLoopback || allowInsecureHttp);
+    isInsecureScheme && (isLoopback || allowInsecureHttp);
   if (!insecureAllowed) {
     throw new Error(
       parsed.protocol === "http:"
@@ -247,11 +248,11 @@ export function createYAuthClient(options: YAuthClientOptions): YAuthClient {
   const withOptions = (override: Partial<YAuthClientOptions>): YAuthClient =>
     createYAuthClient({ ...options, ...override });
 
-  const routes = createYAuthClientRoutes(request);
+  const routes = createYAuthClientRoutes(request, options);
   return Object.assign(routes, { withOptions });
 }
 
-function createYAuthClientRoutes(request: RequestFn) {
+function createYAuthClientRoutes(request: RequestFn, options: YAuthClientOptions) {
   return {
     getSession: () => request<SessionResponse>("/session", { auth: true }),
     logout: () => request<SuccessResponse>("/logout", { method: "POST", auth: true }),

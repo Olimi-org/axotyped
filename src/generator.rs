@@ -131,7 +131,7 @@ impl std::error::Error for CheckError {}
 
 const PRIMITIVES: &[&str] = &[
     "String", "&str", "Uuid", "bool", "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32",
-    "f64", "usize", "isize",
+    "f64", "usize", "isize", "u128", "i128",
 ];
 
 /// Integer types rendered via the configured `large_int_type`.
@@ -362,27 +362,25 @@ fn build_path_template(path: &str) -> String {
 
 /// Escapes text for a double-quoted JS string.
 fn escape_double_quoted(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            _ => out.push(c),
-        }
-    }
-    out
+    escape_js_string(text)
 }
 
 /// Escapes text for a JS template literal (backslash, backtick, `${`).
 fn push_escaped_template_text(out: &mut String, text: &str) {
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        match chars[i] {
             '\\' => out.push_str("\\\\"),
             '`' => out.push_str("\\`"),
-            '$' if chars.peek() == Some(&'{') => out.push_str("$\\{"),
-            _ => out.push(c),
+            '$' if i + 1 < len && chars[i + 1] == '{' => {
+                out.push_str("\\${");
+                i += 1;
+            }
+            c => out.push(c),
         }
+        i += 1;
     }
 }
 
@@ -582,7 +580,7 @@ const REQUEST_HELPER_PRE: &str = r#"function assertSecureTransport(
       `Client produced an unparseable URL (${JSON.stringify(url)}); refusing to send credentials.`,
     );
   }
-  if (parsed.protocol === "https:") return;
+  if (parsed.protocol === "https:" || parsed.protocol === "wss:") return;
   const h = parsed.hostname;
   const isLoopback =
     h === "localhost" ||
@@ -590,8 +588,9 @@ const REQUEST_HELPER_PRE: &str = r#"function assertSecureTransport(
     h === "127.0.0.1" ||
     h === "::1" ||
     h === "[::1]";
+  const isInsecureScheme = parsed.protocol === "http:" || parsed.protocol === "ws:";
   const insecureAllowed =
-    parsed.protocol === "http:" && (isLoopback || allowInsecureHttp);
+    isInsecureScheme && (isLoopback || allowInsecureHttp);
   if (!insecureAllowed) {
     throw new Error(
       parsed.protocol === "http:"
@@ -944,11 +943,14 @@ fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String
     );
     w!(out, "    {factory}({{ ...options, ...override }});");
     w!(out);
-    w!(out, "  const routes = {factory}Routes(request);");
+    w!(out, "  const routes = {factory}Routes(request, options);");
     w!(out, "  return Object.assign(routes, {{ withOptions }});");
     w!(out, "}}");
     w!(out);
-    w!(out, "function {factory}Routes(request: RequestFn) {{");
+    w!(
+        out,
+        "function {factory}Routes(request: RequestFn, options: {opts_name}) {{"
+    );
     w!(out, "  return {{");
 
     if config.enable_groups {

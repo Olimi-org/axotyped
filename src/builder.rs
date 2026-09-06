@@ -649,6 +649,7 @@ where
     let name = default_name_from_handler::<EH::Handler>();
     let handler = ep.into_handler();
     let full_path = resolve_prefix(prefix, path);
+    let path_params = crate::extract_path_params(&full_path);
     let mini = Router::<S>::new().route(&full_path, to_method_router(handler));
     let layered = apply_scope_layers(mini, layers);
     *router = std::mem::take(router).merge(layered);
@@ -661,7 +662,7 @@ where
         body_type: None,
         response_type: None,
         query_type: None,
-        path_params: crate::extract_path_params(path),
+        path_params,
         group: group.clone(),
         redirect: false,
         websocket,
