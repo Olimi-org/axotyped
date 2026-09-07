@@ -1,3 +1,39 @@
+## 0.3.0
+
+### Breaking changes
+
+- deny-by-default: routes require authentication unless declared public (`#[endpoint(public)]`, `[public]`, `group_public`); the `[auth]` flag is gone
+- removed `ApiRouter::auth_all()` / `RouteBuilder::auth()` / `WsRouteBuilder::auth()` — visibility is declared on the handler or scope
+- `GeneratorConfig::default_credentials` defaults to `"same-origin"` (was `"include"`)
+- generated output shape changed (encoded templates, quoted group keys, per-call `opts`, enforced `method`) — regenerate committed clients after upgrading
+
+### Features
+
+- `ApiRouter::layer()` — scope-scoped tower middleware, applied per-route, never leaked to parents/siblings
+- `ApiRouter::auth_layer()` — like `layer()`, plus marks routes authenticated in metadata; contradictions with public declarations surface via `generate_with_warnings()`
+- `RouteDefinition::declared_public` records declaration-site visibility independently of the effective flag
+- `GeneratorConfig::auth_scheme` — `Bearer` (default, `getToken` + `Authorization` header), `Cookie` (session cookies, `"omit"` refusal, native WS cookies, optional CSRF via `csrf_header_name`), `None`
+- `GeneratorConfig::large_int_type` (`number`/`bigint`/`string`) applied to client signatures and `ts_config()`/`export_types_with()` bindings alike
+- `GeneratorConfig::ws_ticket_path` — ticket-handshake WS client for `[ws][auth]` under Bearer
+- `generate_with_warnings()` diagnostics: public-behind-auth-layer contradictions, `None`-scheme auth routes, missing WS credential pathway
+- per-call `opts?: RequestOptions` on every route method (`allowRedirects` opt-out for credentialless public calls)
+- `RouteTable::collect_types()` / `build()` work without the `ts-rs` feature
+
+### Security hardening
+
+- transport guard: credentials (auth or cookies) only ride https/loopback; `allowInsecureHttp` permits the connection but never credentialed non-loopback traffic
+- authenticated requests send `cache: "no-store"` and refuse redirects; only credentialless public calls with `allowRedirects: true` follow them
+- Cookie `[ws][auth]` refuses `credentials: "omit"` before upgrading
+- path literals escaped for their JS string context; group/method names emitted as quoted, escaped keys
+- path params validated (`is_valid_js_identifier`, synthetics `__param_N`), always `encodeURIComponent`'d, extracted from the resolved `full_path`
+- falsy bodies serialized (`body !== undefined ? ...`); `u128`/`i128` treated as primitives (no broken imports)
+
+### Fixes
+
+- routes factory receives client `options` (redirect/WS methods previously referenced it out of scope)
+- `default_credentials` / `csrf_header_name` values escaped in emitted string literals
+- `check()` temp files use `create_new(true)` + monotonic-counter fallback
+
 ## 0.2.0 (2026-06-08)
 
 ### Breaking changes

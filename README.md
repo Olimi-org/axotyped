@@ -362,7 +362,9 @@ CI: `cargo test check_ts_client` fails if the committed file is stale.
 - **`AuthScheme::Cookie`** — session cookies ride automatically. The client
   refuses `"omit"` credentials on authenticated routes, and with
   `csrf_header_name` set it attaches the anti-CSRF proof on POST/PUT/PATCH/DELETE
-  via `ClientOptions.csrfToken`.
+  via `ClientOptions.csrfToken`. Cross-origin `baseUrl` requires
+  `credentials: "include"` (plus compatible CORS and `SameSite=None; Secure`
+  cookies) — `"same-origin"` never sends cookies cross-origin.
 - **`AuthScheme::None`** — no auth machinery is generated. Authenticated
   routes produce diagnostics from `generate_with_warnings()`, since their
   requests will carry no credentials.
