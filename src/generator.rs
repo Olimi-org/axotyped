@@ -551,7 +551,9 @@ type RequestOptions = {
   body?: unknown;
   query?: Record<string, unknown>;
   auth?: boolean;
-  /** Opt out of the sane `redirect: \"error\"` default for legit 3xx flows. */
+  /** Opt out of the sane redirect-error default for legit 3xx flows.
+      Only applies to credentialless public calls (credentials omit); anything
+      carrying auth or cookies still refuses redirects. */
   allowRedirects?: boolean;
 };
 
@@ -624,7 +626,7 @@ function createRequest(options: __OPTS__) {
     opts: RequestOptions = {},
     rawResponse?: boolean,
   ): Promise<T | Response> {
-    const { method = "GET", body, query, auth } = opts;
+    const { method = "GET", body, query, auth = false } = opts;
     let url = `${baseUrl}${path}`;
     if (query) {
       const params = new URLSearchParams();
@@ -701,12 +703,15 @@ const REQUEST_CSRF_BLOCK: &str = r#"
 "#;
 
 const REQUEST_HELPER_POST: &str = r#"
+    // Only credentialless public calls with `{ allowRedirects: true }` follow
+    // redirects; anything carrying auth or cookies refuses, since the guard
+    // sees only the initial URL and a 3xx could bounce to http://.
+    const canFollowRedirects =
+      !auth && credentials === "omit" && opts.allowRedirects === true;
     const response = await boundFetch(url, {
       ...options.requestInit,
       ...(auth ? { cache: "no-store" as const } : {}),
-      // Fail closed on redirects; public routes opt out per-request with `{ allowRedirects: true }`.
-      // Authenticated requests always refuse redirects so a 3xx can't bounce creds.
-      redirect: auth ? "error" : (opts.allowRedirects === true ? "follow" : "error"),
+      redirect: canFollowRedirects ? "follow" : "error",
       method,
       credentials,
       headers,
@@ -1236,6 +1241,23 @@ fn generate_ws_method(
             out,
             "{pad2}url += `${{url.includes(\"?\") ? \"&\" : \"?\"}}ticket=${{encodeURIComponent(__wsTicket)}}`;"
         );
+    }
+
+    // Cookie `[ws][auth]` rides same-origin session cookies natively — the
+    // WebSocket API has no credentials option, so `"omit"` would silently
+    // send the upgrade unauthenticated. Refuse like the fetch path does.
+    if config.auth_scheme == AuthScheme::Cookie && route.auth {
+        w!(
+            out,
+            "{pad2}if ((options.credentials ?? \"{}\") === \"omit\") {{",
+            escape_js_string(&config.default_credentials)
+        );
+        w!(
+            out,
+            "{pad2}  throw new Error(`Route declared [ws][auth] but options.credentials is \"omit\"; refusing to send an unauthenticated upgrade ({})`);",
+            escape_js_string(&route.name)
+        );
+        w!(out, "{pad2}}}");
     }
 
     if has_types {

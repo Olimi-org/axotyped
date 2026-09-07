@@ -265,11 +265,14 @@ fn redirect_defaults_to_error_with_allow_redirects_opt_out() {
     let output = generate(&routes, &yauth_config());
 
     // Sane default: refuse redirects so 3xx can't bounce creds elsewhere.
-    // Authenticated requests always refuse, even with the flag.
+    // Only credentialless public calls may opt out; auth or cookies force error.
     assert!(output.contains("allowRedirects?: boolean"));
-    assert!(output.contains("redirect: auth ? \"error\" : (opts.allowRedirects === true ? \"follow\" : \"error\")"));
-    // Authenticated requests also bypass browser cache by default.
+    assert!(output.contains("const canFollowRedirects ="));
+    assert!(output.contains("!auth && credentials === \"omit\" && opts.allowRedirects === true"));
+    assert!(output.contains("redirect: canFollowRedirects ? \"follow\" : \"error\""));
+    // Authenticated requests also bypass browser cache; auth defaults false.
     assert!(output.contains("cache: \"no-store\""));
+    assert!(output.contains("auth = false"));
     // Cookies count as credentials, not just auth:true.
     assert!(output.contains("credentials !== \"omit\""));
 }
@@ -674,6 +677,12 @@ fn cookie_ws_auth_rides_cookies_without_ticket_handshake() {
     assert!(
         !output.contains("__wsTicket"),
         "cookie WS must not use ticket handshake"
+    );
+    // Fail closed: omit would silently send the upgrade unauthenticated
+    // (WS has no credentials option), so the client must refuse it.
+    assert!(
+        output.contains("options.credentials ??") && output.contains("refusing to send an unauthenticated upgrade"),
+        "cookie [ws][auth] must reject credentials omit before new WebSocket"
     );
 }
 

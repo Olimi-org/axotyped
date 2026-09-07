@@ -71,7 +71,9 @@ type RequestOptions = {
   body?: unknown;
   query?: Record<string, unknown>;
   auth?: boolean;
-  /** Opt out of the sane `redirect: "error"` default for legit 3xx flows. */
+  /** Opt out of the sane redirect-error default for legit 3xx flows.
+      Only applies to credentialless public calls (credentials omit); anything
+      carrying auth or cookies still refuses redirects. */
   allowRedirects?: boolean;
 };
 
@@ -143,7 +145,7 @@ function createRequest(options: YAuthClientOptions) {
     opts: RequestOptions = {},
     rawResponse?: boolean,
   ): Promise<T | Response> {
-    const { method = "GET", body, query, auth } = opts;
+    const { method = "GET", body, query, auth = false } = opts;
     let url = `${baseUrl}${path}`;
     if (query) {
       const params = new URLSearchParams();
@@ -188,12 +190,15 @@ function createRequest(options: YAuthClientOptions) {
       headers.Authorization = `Bearer ${token}`;
     }
 
+    // Only credentialless public calls with `{ allowRedirects: true }` follow
+    // redirects; anything carrying auth or cookies refuses, since the guard
+    // sees only the initial URL and a 3xx could bounce to http://.
+    const canFollowRedirects =
+      !auth && credentials === "omit" && opts.allowRedirects === true;
     const response = await boundFetch(url, {
       ...options.requestInit,
       ...(auth ? { cache: "no-store" as const } : {}),
-      // Fail closed on redirects; public routes opt out per-request with `{ allowRedirects: true }`.
-      // Authenticated requests always refuse redirects so a 3xx can't bounce creds.
-      redirect: auth ? "error" : (opts.allowRedirects === true ? "follow" : "error"),
+      redirect: canFollowRedirects ? "follow" : "error",
       method,
       credentials,
       headers,
