@@ -3,7 +3,7 @@ use std::fmt::Write;
 use std::path::{Component, Path};
 use std::process::Command;
 
-use crate::types::{HttpMethod, RouteCollection, RouteDefinition};
+use crate::types::{RouteCollection, RouteDefinition};
 
 /// Shorthand for `writeln!(...).unwrap()` — writing to `String` is infallible.
 macro_rules! w {

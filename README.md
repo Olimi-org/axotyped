@@ -35,10 +35,10 @@ pub async fn create_project(
 // define_routes! builds both the server router and TypeScript metadata
 define_routes! {
     pub Routes for AppState, |r| {
-        r.group_prefixed("projects", |g| {
-            g.auth_all()
-             .get("/projects", register!(list_projects)).done()
-             .post("/projects", register!(create_project)).done()
+        r.group("projects", |g| {
+            // For a auto-prefixing option consider group_prefixed
+            g.get("/projects", register!(list_projects))
+             .post("/projects", register!(create_project))
         })
     }
 }
@@ -124,8 +124,7 @@ pub async fn delete_project(
 
 ApiRouter::<Arc<AppState>>::new()
     .group_prefixed("admin", |g| {
-        g.auth_all()
-         .post("/project", register!(create_project))
+        g.post("/project", register!(create_project))
              .done()
          .get("/project", register!(list_projects))
              .done()
@@ -163,26 +162,37 @@ ApiRouter::<AppState>::new()
 // Generates api.auth.login() and api.auth.registerUser() targeting /login and /register
 ```
 
-**`.group_prefixed(name, closure)`** — closure-based grouping with scoped URL path prefix (`/{name}`), default auth, and TypeScript namespace. The group's config does not leak to routes registered after the closure.
+**`.group_prefixed(name, closure)`** — closure-based grouping with scoped URL path prefix (`/{name}`) and TypeScript namespace. The group's config does not leak to routes registered after the closure.
+
+### Authentication model: deny-by-default
+
+Every route is treated as requiring authentication unless explicitly declared public. An unannotated route can never generate a credential-less client, so "forgot the auth annotation" failures are structurally impossible.
+
+```rust
+// Private by default — no annotations needed:
+r.group_prefixed("admin", |g| g.post("/reset", register!(reset)).done())
+
+// Opt out per handler:
+#[endpoint(public)]
+async fn health() -> StatusCode { StatusCode::OK }
+
+// Or opt out per scope (e.g. webhooks):
+r.group_public("webhooks", |g| {
+    g.set_prefix("/webhooks").post("/stripe", register!(stripe_hook)).done()
+})
+```
 
 The prefix defaults to `"/{name}"` but can be overridden with `.set_prefix()` inside the closure.
 
 ```rust
 ApiRouter::<Arc<AppState>>::new()
     .group_prefixed("admin", |g| {
-        g.auth_all()
-         .post("/project", register!(create_project))
-             .done()
-         .get("/project", register!(list_projects))
-             .done()
-         .delete("/project/{key}", register!(delete_project))
-             .done()
+        g.post("/project", register!(create_project))
+        .get("/project", register!(list_projects))
+        .delete("/project/{key}", register!(delete_project))
     })
     .get("/health", register!(health))
-        .done()
     .build()
-// admin routes: POST /admin/project, GET /admin/project, DELETE /admin/project/{key}
-// health route: GET /health (no prefix, no auth, no group)
 ```
 
 ### Manual type specification
@@ -193,12 +203,8 @@ You can still specify types explicitly on the builder when needed:
 ApiRouter::<AppState>::new()
     .get("/projects", list_projects)
         .response::<Vec<ProjectResponse>>()
-        .auth()
-        .done()
     .post("/projects", create_project)
         .json::<CreateProjectRequest, ProjectResponse>()
-        .auth()
-        .done()
     .build()
 ```
 
@@ -217,7 +223,7 @@ define_routes! {
     pub Routes for Arc<AppState>, |r| {
         r.get("/health", register!(health))
          .group_prefixed("admin", |g| {
-             g.auth_all().post("/project", register!(create_project))
+             g.post("/project", register!(create_project))
          })
     }
 }
@@ -244,7 +250,7 @@ impl RouteTable<Arc<AppState>> for Routes {
     ) -> ApiRouter<Arc<AppState>, C> {
         r.get("/health", register!(health))
          .group_prefixed("admin", |g| {
-             g.auth_all().post("/project", register!(create_project))
+             g.post("/project", register!(create_project))
          })
     }
 }
@@ -263,7 +269,7 @@ use axotyped::{ApiRouter, Collector, build_routes, collect_routes, register};
 fn routes<S, C: Collector>(r: ApiRouter<S, C>) -> ApiRouter<S, C> {
     r.get("/health", register!(health))
      .group_prefixed("admin", |g| {
-         g.auth_all().post("/project", register!(create_project))
+         g.post("/project", register!(create_project))
      })
 }
 
@@ -339,16 +345,55 @@ CI: `cargo test check_ts_client` fails if the committed file is stale.
 | `enable_groups` | `true` | Nest routes into group objects |
 | `error_class_name` | `"ApiError"` | Name of the generated error class |
 | `options_interface_name` | `"ClientOptions"` | Name of the options interface |
-| `default_credentials` | `"include"` | Default `RequestCredentials` value |
+| `default_credentials` | `"same-origin"` | Default `RequestCredentials` value |
 | `type_import_prefix` | (computed) | Import path from generated file to bindings dir |
 | `format_command` | `None` | Shell command to format after generation |
+| `large_int_type` | `"number"` | TS binding for u64/i64/u128/i128/usize/isize (`"number"`, `"bigint"`, or `"string"`) |
+| `auth_scheme` | `Bearer` | Client authentication model: `Bearer` (token header), `Cookie` (session cookies), or `None` |
+| `csrf_header_name` | `None` | Anti-CSRF header attached to mutating requests under `AuthScheme::Cookie` (e.g. `Some("X-CSRF-Token")`) |
+| `ws_ticket_path` | `None` | Endpoint issuing single-use WS tickets for authenticated WebSocket routes under `AuthScheme::Bearer` |
+
+### Auth schemes
+
+- **`AuthScheme::Bearer`** — authenticated routes resolve a token via
+  `ClientOptions.getToken` and send `Authorization: Bearer ...`. Requests fail
+  closed: no configured source or no token aborts the call instead of sending
+  an unauthenticated request.
+- **`AuthScheme::Cookie`** — session cookies ride automatically. The client
+  refuses `"omit"` credentials on authenticated routes, and with
+  `csrf_header_name` set it attaches the anti-CSRF proof on POST/PUT/PATCH/DELETE
+  via `ClientOptions.csrfToken`.
+- **`AuthScheme::None`** — no auth machinery is generated. Authenticated
+  routes produce diagnostics from `generate_with_warnings()`, since their
+  requests will carry no credentials.
+
+### Server-derived auth metadata
+
+Routes are private by default, but the strongest way to declare authentication
+is to enforce it: `.auth_layer(middleware)` applies auth middleware with the same
+scoping rules as `.layer()` **and** marks every route under it as authenticated
+in the generated client. The client flag is derived from server middleware, so
+the two cannot drift:
+
+```rust,ignore
+r.group_prefixed("admin", |g| {
+    g.auth_layer(axum::middleware::from_fn_with_state(state, require_admin))
+        .get("/course", register!(list_courses)) // client method requires credentials
+})
+```
+
+A route declared public (`group_public`, `#[endpoint(public)]`) that ends up
+behind an `.auth_layer()` stays authenticated in metadata and produces a
+diagnostic — if the middleware isn't user authentication (e.g. webhook
+signature checks), use plain `.layer()` instead.
 
 ## Generated output
 
 The generated client includes:
 - Type imports from `ts-rs` bindings
 - A typed error class (extends `Error` with `status` and `body`)
-- A client options interface (`baseUrl`, `getToken`, `credentials`, `fetch`, `onError`)
+- A client options interface shaped by the auth scheme (`baseUrl`,
+  scheme-specific credential fields, `credentials`, `fetch`, `onError`)
 - A factory function returning typed fetch methods with optional grouping
 - A type alias: `export type ApiClient = ReturnType<typeof createApiClient>`
 

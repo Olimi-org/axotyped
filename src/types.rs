@@ -338,11 +338,14 @@ impl<'a> IntoIterator for &'a RouteCollection {
 /// ASCII identifier check plus reserved-word rejection; rejected names
 /// become synthetic `__param_N` placeholders.
 pub fn is_valid_js_identifier(name: &str) -> bool {
-    // ECMAScript reserved words: strict keywords, future reserved words
-    // (strict mode / modules), and contextual keywords that cannot serve as
-    // plain bindings in generated signatures or module code.
+    // ECMAScript reserved words (rejected unconditionally so output is safe
+    // in strict / module / generator contexts) plus the strict-mode binding
+    // bans `arguments` and `eval`. Contextual names like `async`/`of`/`as`/
+    // `from`/`get`/`set` are legal as plain bindings and stay allowed.
     const RESERVED: &[&str] = &[
-        // Strict keywords (always reserved)
+        // Reserved words (incl. `await`/`yield`/`enum`, reserved only in
+        // module / async / generator / strict contexts — rejected
+        // unconditionally so output is safe in all of them)
         "await",
         "break",
         "case",
@@ -381,7 +384,9 @@ pub fn is_valid_js_identifier(name: &str) -> bool {
         "while",
         "with",
         "yield",
-        // Future reserved words in strict mode / modules
+        // Future reserved words in strict mode / modules (incl. class-side
+        // `static`, `private`, `protected`, `public` — still FutureReservedWord
+        // per spec even though class syntax implements them)
         "implements",
         "interface",
         "let",
@@ -390,11 +395,9 @@ pub fn is_valid_js_identifier(name: &str) -> bool {
         "protected",
         "public",
         "static",
-        // Contextual keywords rejected conservatively
+        // Banned as bindings in strict-mode signatures
         "arguments",
-        "async",
         "eval",
-        "of",
     ];
 
     let mut chars = name.chars();
@@ -530,6 +533,9 @@ mod tests {
         assert!(is_valid_js_identifier("id"));
         assert!(is_valid_js_identifier("_private"));
         assert!(is_valid_js_identifier("$ref"));
+        // Contextual names are legal as plain bindings
+        assert!(is_valid_js_identifier("async"));
+        assert!(is_valid_js_identifier("of"));
         assert!(!is_valid_js_identifier("2fa"));
         assert!(!is_valid_js_identifier("a b"));
         assert!(!is_valid_js_identifier("class")); // reserved word
