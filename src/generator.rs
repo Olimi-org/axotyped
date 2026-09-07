@@ -561,9 +561,9 @@ type RequestFn = <T>(path: string, opts?: RequestOptions) => Promise<T>;
 
 const REQUEST_HELPER_PRE: &str = r#"function assertSecureTransport(
   url: string,
-  allowInsecureHttp: boolean,
-  auth: boolean,
+  opts: { allowInsecureHttp: boolean; auth: boolean; credentials: string },
 ): void {
+  const { allowInsecureHttp, auth, credentials } = opts;
   // Transport guard: credentials must only ride https. Loopback hosts are
   // inherently local and always allowed over http; anything else requires
   // the explicit allowInsecureHttp development opt-in. Fails closed on
@@ -595,10 +595,12 @@ const REQUEST_HELPER_PRE: &str = r#"function assertSecureTransport(
     );
   }
   // allowInsecureHttp permits the HTTP connection itself, but never for
-  // credential-bearing requests to non-loopback hosts.
-  if (isInsecureScheme && !isLoopback && auth) {
+  // credential-bearing requests to non-loopback hosts. Cookies count:
+  // even with auth:false, `credentials: "include"` (or `"same-origin"`
+  // to a same-origin http target) still sends session cookies.
+  if (isInsecureScheme && !isLoopback && (auth || credentials !== "omit")) {
     throw new Error(
-      `Refusing to send credentials over http:// to non-loopback host "${h}". Set allowInsecureHttp for the connection, but credentialed requests (auth: true) still require https:// or a loopback host.`,
+      `Refusing to send credentials over http:// to non-loopback host "${h}". Set allowInsecureHttp for the connection, but credentialed requests (auth: true or credentials !== "omit") still require https:// or a loopback host.`,
     );
   }
 }
@@ -647,8 +649,8 @@ function createRequest(options: __OPTS__) {
     // Credentials are only sent over https, to loopback hosts over http,
     // or when the client was explicitly configured with allowInsecureHttp.
     // allowInsecureHttp permits the HTTP connection itself, but never for
-    // credential-bearing requests to non-loopback hosts.
-    assertSecureTransport(url, options.allowInsecureHttp === true, auth);
+    // credential-bearing requests (auth or cookies) to non-loopback hosts.
+    assertSecureTransport(url, { allowInsecureHttp: options.allowInsecureHttp === true, auth, credentials });
 "#;
 
 /// Auth section of the request helper for [`AuthScheme::Bearer`]: an
@@ -702,8 +704,9 @@ const REQUEST_HELPER_POST: &str = r#"
     const response = await boundFetch(url, {
       ...options.requestInit,
       ...(auth ? { cache: "no-store" as const } : {}),
-      // Fail closed on redirects; opt out per-request with `{ allowRedirects: true }`.
-      redirect: opts.allowRedirects === true ? "follow" : "error",
+      // Fail closed on redirects; public routes opt out per-request with `{ allowRedirects: true }`.
+      // Authenticated requests always refuse redirects so a 3xx can't bounce creds.
+      redirect: auth ? "error" : (opts.allowRedirects === true ? "follow" : "error"),
       method,
       credentials,
       headers,
@@ -1241,8 +1244,9 @@ fn generate_ws_method(
         let recv_ts = rust_type_to_ts_with(route.ws_receive_type.as_ref().unwrap(), large_int);
         w!(
             out,
-            "{pad2}assertSecureTransport(url, options.allowInsecureHttp === true, {});",
-            route.auth
+            "{pad2}assertSecureTransport(url, {{ allowInsecureHttp: options.allowInsecureHttp === true, auth: {}, credentials: options.credentials ?? \"{}\" }});",
+            route.auth,
+            escape_js_string(&config.default_credentials)
         );
         w!(out, "{pad2}const ws = new WebSocket(url);");
         w!(
@@ -1252,8 +1256,9 @@ fn generate_ws_method(
     } else {
         w!(
             out,
-            "{pad2}assertSecureTransport(url, options.allowInsecureHttp === true, {});",
-            route.auth
+            "{pad2}assertSecureTransport(url, {{ allowInsecureHttp: options.allowInsecureHttp === true, auth: {}, credentials: options.credentials ?? \"{}\" }});",
+            route.auth,
+            escape_js_string(&config.default_credentials)
         );
         w!(out, "{pad2}return new WebSocket(url);");
     }

@@ -265,10 +265,26 @@ fn redirect_defaults_to_error_with_allow_redirects_opt_out() {
     let output = generate(&routes, &yauth_config());
 
     // Sane default: refuse redirects so 3xx can't bounce creds elsewhere.
+    // Authenticated requests always refuse, even with the flag.
     assert!(output.contains("allowRedirects?: boolean"));
-    assert!(output.contains("redirect: opts.allowRedirects === true ? \"follow\" : \"error\""));
+    assert!(output.contains("redirect: auth ? \"error\" : (opts.allowRedirects === true ? \"follow\" : \"error\")"));
     // Authenticated requests also bypass browser cache by default.
     assert!(output.contains("cache: \"no-store\""));
+    // Cookies count as credentials, not just auth:true.
+    assert!(output.contains("credentials !== \"omit\""));
+}
+
+#[test]
+fn public_cookie_route_with_insecure_http_requires_omit() {
+    use axotyped::{AuthScheme, api_routes};
+    let routes = api_routes! {
+        health: GET "/health" [public];
+    };
+    let mut config = yauth_config();
+    config.auth_scheme = AuthScheme::Cookie;
+    let output = generate(&routes, &config);
+    // Guard must see the effective credential mode, not just auth.
+    assert!(output.contains("assertSecureTransport(url, { allowInsecureHttp: options.allowInsecureHttp === true, auth, credentials })"));
 }
 
 #[test]
