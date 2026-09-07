@@ -160,9 +160,9 @@ fn generates_ungrouped_routes() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Top-level routes (not in a group)
-    assert!(output.contains("getSession: () => request<SessionResponse>(\"/session\""));
-    assert!(output.contains("logout: () => request<SuccessResponse>(\"/logout\""));
+    // Top-level routes (not in a group) — per-call opts threaded through, method always enforced
+    assert!(output.contains("getSession: (opts?: RequestOptions) => request<SessionResponse>(\"/session\", { ...opts, method: \"GET\", auth: true })"));
+    assert!(output.contains("logout: (opts?: RequestOptions) => request<SuccessResponse>(\"/logout\", { ...opts, method: \"POST\", auth: true })"));
 }
 
 #[test]
@@ -176,9 +176,9 @@ fn generates_grouped_routes() {
     assert!(output.contains("\"admin\": {"));
     assert!(output.contains("\"oauth\": {"));
 
-    // Group methods
-    assert!(output.contains("register: (body: RegisterRequest)"));
-    assert!(output.contains("login: (body: LoginRequest)"));
+    // Group methods — per-call opts last
+    assert!(output.contains("register: (body: RegisterRequest, opts?: RequestOptions)"));
+    assert!(output.contains("login: (body: LoginRequest, opts?: RequestOptions)"));
 }
 
 #[test]
@@ -188,9 +188,11 @@ fn generates_path_params() {
     let output = generate(&routes, &config);
 
     // Path params become function args and encoded template literals
-    assert!(output.contains("getUser: (id: string)"));
+    assert!(output.contains("getUser: (id: string, opts?: RequestOptions)"));
     assert!(output.contains("`/admin/users/${encodeURIComponent(id)}`"));
-    assert!(output.contains("banUser: (id: string, body: BanRequest)"));
+    assert!(output.contains("banUser: (id: string, body: BanRequest, opts?: RequestOptions)"));
+    // Per-call opts spread first so allowRedirects survives, method always enforced
+    assert!(output.contains("{ ...opts, method: \"GET\", auth: true }"));
 }
 
 #[test]
@@ -199,8 +201,8 @@ fn generates_query_params() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Query params
-    assert!(output.contains("listUsers: (query?: ListUsersQuery)"));
+    // Query params + per-call opts
+    assert!(output.contains("listUsers: (query?: ListUsersQuery, opts?: RequestOptions)"));
     assert!(output.contains("query"));
 }
 
@@ -241,7 +243,7 @@ fn generates_void_return_for_no_response() {
     let output = generate(&routes, &config);
 
     // deleteUser has no response type (8 spaces indent: 6 base + 2 continuation)
-    assert!(output.contains("deleteUser: (id: string) =>\n        request<void>"));
+    assert!(output.contains("deleteUser: (id: string, opts?: RequestOptions) =>\n        request<void>"));
 }
 
 #[test]
@@ -255,6 +257,18 @@ fn generates_request_helper() {
     assert!(output.contains("new YAuthError("));
     assert!(output.contains("credentials"));
     assert!(output.contains("getToken"));
+}
+
+#[test]
+fn redirect_defaults_to_error_with_allow_redirects_opt_out() {
+    let routes = sample_routes();
+    let output = generate(&routes, &yauth_config());
+
+    // Sane default: refuse redirects so 3xx can't bounce creds elsewhere.
+    assert!(output.contains("allowRedirects?: boolean"));
+    assert!(output.contains("redirect: opts.allowRedirects === true ? \"follow\" : \"error\""));
+    // Authenticated requests also bypass browser cache by default.
+    assert!(output.contains("cache: \"no-store\""));
 }
 
 #[test]

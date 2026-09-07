@@ -71,6 +71,8 @@ type RequestOptions = {
   body?: unknown;
   query?: Record<string, unknown>;
   auth?: boolean;
+  /** Opt out of the sane `redirect: "error"` default for legit 3xx flows. */
+  allowRedirects?: boolean;
 };
 
 /** The `request` helper produced by `createRequest`, for the routes factory. */
@@ -79,6 +81,7 @@ type RequestFn = <T>(path: string, opts?: RequestOptions) => Promise<T>;
 function assertSecureTransport(
   url: string,
   allowInsecureHttp: boolean,
+  auth: boolean,
 ): void {
   // Transport guard: credentials must only ride https. Loopback hosts are
   // inherently local and always allowed over http; anything else requires
@@ -108,6 +111,13 @@ function assertSecureTransport(
       parsed.protocol === "http:"
         ? `Refusing to send credentials over http:// to non-loopback host "${h}". Use https:// in production; set allowInsecureHttp on the client options for LAN/device development.`
         : `Unsupported protocol ${parsed.protocol} for credential-bearing requests.`,
+    );
+  }
+  // allowInsecureHttp permits the HTTP connection itself, but never for
+  // credential-bearing requests to non-loopback hosts.
+  if (isInsecureScheme && !isLoopback && auth) {
+    throw new Error(
+      `Refusing to send credentials over http:// to non-loopback host "${h}". Set allowInsecureHttp for the connection, but credentialed requests (auth: true) still require https:// or a loopback host.`,
     );
   }
 }
@@ -155,7 +165,9 @@ function createRequest(options: YAuthClientOptions) {
 
     // Credentials are only sent over https, to loopback hosts over http,
     // or when the client was explicitly configured with allowInsecureHttp.
-    assertSecureTransport(url, options.allowInsecureHttp === true);
+    // allowInsecureHttp permits the HTTP connection itself, but never for
+    // credential-bearing requests to non-loopback hosts.
+    assertSecureTransport(url, options.allowInsecureHttp === true, auth);
 
     // An [auth] route requires a token: without one configured or returned,
     // the request is aborted rather than sent unauthenticated.
@@ -176,6 +188,9 @@ function createRequest(options: YAuthClientOptions) {
 
     const response = await boundFetch(url, {
       ...options.requestInit,
+      ...(auth ? { cache: "no-store" as const } : {}),
+      // Fail closed on redirects; opt out per-request with `{ allowRedirects: true }`.
+      redirect: opts.allowRedirects === true ? "follow" : "error",
       method,
       credentials,
       headers,
@@ -254,31 +269,31 @@ export function createYAuthClient(options: YAuthClientOptions): YAuthClient {
 
 function createYAuthClientRoutes(request: RequestFn, options: YAuthClientOptions) {
   return {
-    getSession: () => request<SessionResponse>("/session", { auth: true }),
-    logout: () => request<SuccessResponse>("/logout", { method: "POST", auth: true }),
-    updateProfile: (body: UpdateProfileRequest) =>
-      request<ProfileResponse>("/me", { method: "PATCH", auth: true, body }),
+    getSession: (opts?: RequestOptions) => request<SessionResponse>("/session", { ...opts, method: "GET", auth: true }),
+    logout: (opts?: RequestOptions) => request<SuccessResponse>("/logout", { ...opts, method: "POST", auth: true }),
+    updateProfile: (body: UpdateProfileRequest, opts?: RequestOptions) =>
+      request<ProfileResponse>("/me", { ...opts, method: "PATCH", auth: true, body }),
 
     "admin": {
-      listUsers: (query?: ListUsersQuery) =>
-        request<ListUsersResponse>("/admin/users", { auth: true, query }),
-      getUser: (id: string) =>
-        request<UserResponse>(`/admin/users/${encodeURIComponent(id)}`, { auth: true }),
-      deleteUser: (id: string) =>
-        request<void>(`/admin/users/${encodeURIComponent(id)}`, { method: "DELETE", auth: true }),
-      banUser: (id: string, body: BanRequest) =>
-        request<UserResponse>(`/admin/users/${encodeURIComponent(id)}/ban`, { method: "POST", auth: true, body }),
+      listUsers: (query?: ListUsersQuery, opts?: RequestOptions) =>
+        request<ListUsersResponse>("/admin/users", { ...opts, method: "GET", auth: true, query }),
+      getUser: (id: string, opts?: RequestOptions) =>
+        request<UserResponse>(`/admin/users/${encodeURIComponent(id)}`, { ...opts, method: "GET", auth: true }),
+      deleteUser: (id: string, opts?: RequestOptions) =>
+        request<void>(`/admin/users/${encodeURIComponent(id)}`, { ...opts, method: "DELETE", auth: true }),
+      banUser: (id: string, body: BanRequest, opts?: RequestOptions) =>
+        request<UserResponse>(`/admin/users/${encodeURIComponent(id)}/ban`, { ...opts, method: "POST", auth: true, body }),
     },
 
     "emailPassword": {
-      register: (body: RegisterRequest) =>
-        request<MessageResponse>("/register", { method: "POST", auth: true, body }),
-      login: (body: LoginRequest) =>
-        request<LoginResponse>("/login", { method: "POST", auth: true, body }),
-      verify: (body: VerifyEmailRequest) =>
-        request<MessageResponse>("/verify-email", { method: "POST", auth: true, body }),
-      changePassword: (body: ChangePasswordRequest) =>
-        request<MessageResponse>("/change-password", { method: "POST", auth: true, body }),
+      register: (body: RegisterRequest, opts?: RequestOptions) =>
+        request<MessageResponse>("/register", { ...opts, method: "POST", auth: true, body }),
+      login: (body: LoginRequest, opts?: RequestOptions) =>
+        request<LoginResponse>("/login", { ...opts, method: "POST", auth: true, body }),
+      verify: (body: VerifyEmailRequest, opts?: RequestOptions) =>
+        request<MessageResponse>("/verify-email", { ...opts, method: "POST", auth: true, body }),
+      changePassword: (body: ChangePasswordRequest, opts?: RequestOptions) =>
+        request<MessageResponse>("/change-password", { ...opts, method: "POST", auth: true, body }),
     },
 
     "oauth": {
@@ -294,8 +309,8 @@ function createYAuthClientRoutes(request: RequestFn, options: YAuthClientOptions
         }
         return url;
       },
-      callback: (provider: string, body: CallbackBody) =>
-        request<AuthResponse>(`/oauth/${encodeURIComponent(provider)}/callback`, { method: "POST", auth: true, body }),
+      callback: (provider: string, body: CallbackBody, opts?: RequestOptions) =>
+        request<AuthResponse>(`/oauth/${encodeURIComponent(provider)}/callback`, { ...opts, method: "POST", auth: true, body }),
     },
 
     "realtime": {
@@ -310,7 +325,7 @@ function createYAuthClientRoutes(request: RequestFn, options: YAuthClientOptions
           const qs = params.toString();
           if (qs) url += `?${qs}`;
         }
-        assertSecureTransport(url, options.allowInsecureHttp === true);
+        assertSecureTransport(url, options.allowInsecureHttp === true, true);
         const ws = new WebSocket(url);
         return createTypedWebSocket<ClientEvent, ServerEvent>(ws);
       },

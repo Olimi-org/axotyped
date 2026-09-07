@@ -82,7 +82,7 @@ impl GeneratorConfig {
     /// for use with [`RouteCollection::export_types_with`](crate::RouteCollection::export_types_with).
     #[cfg(feature = "ts-rs")]
     pub fn ts_config(&self) -> crate::ts::Config {
-        crate::ts::Config::default().with_large_int(self.large_int_type.clone())
+        crate::ts::Config::from_env().with_large_int(self.large_int_type.clone())
     }
 }
 
@@ -305,7 +305,7 @@ fn compute_import_prefix(config: &GeneratorConfig) -> String {
 /// e.g. `/admin/users/{id}` -> `` `/admin/users/${encodeURIComponent(id)}` ``.
 fn build_path_template(path: &str) -> String {
     if !path.contains('{') {
-        return format!("\"{}\"", escape_double_quoted(path));
+        return format!("\"{}\"", escape_js_string(path));
     }
 
     let mut template = String::new();
@@ -360,37 +360,30 @@ fn build_path_template(path: &str) -> String {
     format!("`{template}`")
 }
 
-/// Escapes text for a double-quoted JS string.
-fn escape_double_quoted(text: &str) -> String {
-    escape_js_string(text)
-}
-
-/// Escapes text for a JS template literal (backslash, backtick, `${`).
+/// Escapes text for a JS template literal (backslash, backtick, `$`).
+/// Every `$` is escaped: a following `{` may arrive in a later slice when
+/// `build_path_template` splits at `{`, so a peek within this slice is not enough.
 fn push_escaped_template_text(out: &mut String, text: &str) {
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    while i < len {
-        match chars[i] {
+    for c in text.chars() {
+        match c {
             '\\' => out.push_str("\\\\"),
             '`' => out.push_str("\\`"),
-            '$' if i + 1 < len && chars[i + 1] == '{' => {
-                out.push_str("\\${");
-                i += 1;
-            }
+            // Escape every `$`; a following `{` may arrive in a later slice.
+            '$' => out.push_str("\\$"),
             c => out.push(c),
         }
-        i += 1;
     }
 }
 
-/// Escapes text for a double-quoted JS string (control chars, separators).
+/// Escapes text for a double-quoted JS string (control chars, separators,
+/// backticks for safe re-embed in template literals).
 pub(crate) fn escape_js_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
+            '`' => out.push_str("\\`"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -418,7 +411,9 @@ fn emit_method_name(out: &mut String, name: &str) {
     }
 }
 
-/// Generates the parameter list for a route.
+/// Generates the parameter list for a route, plus a trailing per-call
+/// `opts?: RequestOptions` so callers can opt out of sane defaults
+/// (e.g. `{ allowRedirects: true }`) on that one call.
 fn generate_params(route: &RouteDefinition, large_int: &str) -> String {
     let mut params = Vec::new();
     for param in &route.path_params {
@@ -436,15 +431,17 @@ fn generate_params(route: &RouteDefinition, large_int: &str) -> String {
             rust_type_to_ts_with(query_type, large_int)
         ));
     }
+    params.push("opts?: RequestOptions".into());
     params.join(", ")
 }
 
-/// Generates the request options literal for a route.
+/// Generates the request options literal for a route. Caller `opts` spread
+/// first so per-call flags (e.g. `allowRedirects`) survive, while enforced
+/// `method`/`auth`/`body`/`query` win after it. `method` is always enforced
+/// so `opts.method` can never change the route verb.
 fn generate_request_options(route: &RouteDefinition) -> String {
-    let mut opts = Vec::new();
-    if route.method != HttpMethod::Get {
-        opts.push(format!("method: \"{}\"", route.method.as_str()));
-    }
+    let mut opts: Vec<String> = vec!["...opts".into()];
+    opts.push(format!("method: \"{}\"", route.method.as_str()));
     if route.auth {
         opts.push("auth: true".into());
     }
@@ -454,11 +451,7 @@ fn generate_request_options(route: &RouteDefinition) -> String {
     if route.query_type.is_some() {
         opts.push("query".into());
     }
-    if opts.is_empty() {
-        String::new()
-    } else {
-        format!(", {{ {} }}", opts.join(", "))
-    }
+    format!(", {{ {} }}", opts.join(", "))
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +551,8 @@ type RequestOptions = {
   body?: unknown;
   query?: Record<string, unknown>;
   auth?: boolean;
+  /** Opt out of the sane `redirect: \"error\"` default for legit 3xx flows. */
+  allowRedirects?: boolean;
 };
 
 /** The `request` helper produced by `createRequest`, for the routes factory. */
@@ -567,6 +562,7 @@ type RequestFn = <T>(path: string, opts?: RequestOptions) => Promise<T>;
 const REQUEST_HELPER_PRE: &str = r#"function assertSecureTransport(
   url: string,
   allowInsecureHttp: boolean,
+  auth: boolean,
 ): void {
   // Transport guard: credentials must only ride https. Loopback hosts are
   // inherently local and always allowed over http; anything else requires
@@ -596,6 +592,13 @@ const REQUEST_HELPER_PRE: &str = r#"function assertSecureTransport(
       parsed.protocol === "http:"
         ? `Refusing to send credentials over http:// to non-loopback host "${h}". Use https:// in production; set allowInsecureHttp on the client options for LAN/device development.`
         : `Unsupported protocol ${parsed.protocol} for credential-bearing requests.`,
+    );
+  }
+  // allowInsecureHttp permits the HTTP connection itself, but never for
+  // credential-bearing requests to non-loopback hosts.
+  if (isInsecureScheme && !isLoopback && auth) {
+    throw new Error(
+      `Refusing to send credentials over http:// to non-loopback host "${h}". Set allowInsecureHttp for the connection, but credentialed requests (auth: true) still require https:// or a loopback host.`,
     );
   }
 }
@@ -643,7 +646,9 @@ function createRequest(options: __OPTS__) {
 
     // Credentials are only sent over https, to loopback hosts over http,
     // or when the client was explicitly configured with allowInsecureHttp.
-    assertSecureTransport(url, options.allowInsecureHttp === true);
+    // allowInsecureHttp permits the HTTP connection itself, but never for
+    // credential-bearing requests to non-loopback hosts.
+    assertSecureTransport(url, options.allowInsecureHttp === true, auth);
 "#;
 
 /// Auth section of the request helper for [`AuthScheme::Bearer`]: an
@@ -696,6 +701,9 @@ const REQUEST_CSRF_BLOCK: &str = r#"
 const REQUEST_HELPER_POST: &str = r#"
     const response = await boundFetch(url, {
       ...options.requestInit,
+      ...(auth ? { cache: "no-store" as const } : {}),
+      // Fail closed on redirects; opt out per-request with `{ allowRedirects: true }`.
+      redirect: opts.allowRedirects === true ? "follow" : "error",
       method,
       credentials,
       headers,
@@ -876,8 +884,8 @@ fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String
         template
             .replace("__ERROR__", error_name)
             .replace("__OPTS__", opts_name)
-            .replace("__CREDS__", default_creds)
-            .replace("__CSRF_NAME__", csrf_name)
+            .replace("__CREDS__", &escape_js_string(default_creds))
+            .replace("__CSRF_NAME__", &escape_js_string(csrf_name))
     };
 
     out.push_str(&substitute(ERROR_CLASS));
@@ -1032,9 +1040,11 @@ fn generate_route_method(
             .unwrap_or_else(|| "void".into());
         let opts = generate_request_options(route);
 
-        if params.is_empty() {
+        let has_real_params =
+            !route.path_params.is_empty() || route.body_type.is_some() || route.query_type.is_some();
+        if !has_real_params {
             emit_method_name(out, name);
-            write!(out, ": () => request<{return_type}>({path_template}{opts})").unwrap();
+            write!(out, ": (opts?: RequestOptions) => request<{return_type}>({path_template}{opts})").unwrap();
         } else {
             let pad = " ".repeat(indent + 2);
             emit_method_name(out, name);
@@ -1060,6 +1070,7 @@ fn generate_redirect_method(
     let pad = " ".repeat(indent);
     let pad2 = " ".repeat(indent + 2);
     let pad4 = " ".repeat(indent + 4);
+
 
     if let Some(ref query_type) = route.query_type {
         let query_ts = rust_type_to_ts_with(query_type, large_int);
@@ -1189,7 +1200,7 @@ fn generate_ws_method(
         w!(
             out,
             "{pad2}const {{ ticket: __wsTicket }} = await request<{{ ticket: string }}>(\"{}\",",
-            escape_double_quoted(ticket_path)
+            escape_js_string(ticket_path)
         );
         w!(out, "{pad2}  {{ method: \"POST\", auth: true }},");
         w!(out, "{pad2});");
@@ -1230,7 +1241,8 @@ fn generate_ws_method(
         let recv_ts = rust_type_to_ts_with(route.ws_receive_type.as_ref().unwrap(), large_int);
         w!(
             out,
-            "{pad2}assertSecureTransport(url, options.allowInsecureHttp === true);"
+            "{pad2}assertSecureTransport(url, options.allowInsecureHttp === true, {});",
+            route.auth
         );
         w!(out, "{pad2}const ws = new WebSocket(url);");
         w!(
@@ -1240,7 +1252,8 @@ fn generate_ws_method(
     } else {
         w!(
             out,
-            "{pad2}assertSecureTransport(url, options.allowInsecureHttp === true);"
+            "{pad2}assertSecureTransport(url, options.allowInsecureHttp === true, {});",
+            route.auth
         );
         w!(out, "{pad2}return new WebSocket(url);");
     }
@@ -1468,6 +1481,15 @@ mod tests {
         assert!(
             !build_path_template("/x${evil}y").contains("${evil"),
             "dollar-brace sequences in literal text must be escaped"
+        );
+        // Unterminated `${` must not survive as a live substitution across
+        // the slice boundary in `build_path_template` (`$` at end of one
+        // slice, `{evil` in the next). Escaped output contains `\${`, so check
+        // for the exact escaped form (`\${` contains `${` as substring).
+        assert_eq!(
+            build_path_template("/x/${evil"),
+            "`/x/\\${evil`",
+            "unterminated dollar-brace must be escaped"
         );
         // Double-quoted branch escapes quotes/backslashes:
         assert_eq!(build_path_template("/a\"b"), "\"/a\\\"b\"");

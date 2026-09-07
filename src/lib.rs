@@ -36,7 +36,8 @@ mod macros;
 
 // Re-export public API
 pub use generator::{
-    CheckError, GeneratorConfig, check, generate, generate_to_file, generate_with_warnings,
+    AuthScheme, CheckError, GeneratorConfig, check, generate, generate_to_file,
+    generate_with_warnings,
 };
 pub use types::{
     Collector, HttpMethod, NoCollect, PathParam, RouteCollection, RouteDefinition, TypeRegistry,
