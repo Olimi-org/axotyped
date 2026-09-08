@@ -21,30 +21,97 @@
 //! }
 //!
 //! let (router, routes) = ApiRouter::<AppState>::new()
-//!     .group_with("admin", |g| {
-//!         g.auth_all()
-//!          .get("/projects", register!(list_projects))
+//!     .group_prefixed("admin", |g| {
+//!         g.get("/projects", register!(list_projects))
 //!              .done()
 //!     })
 //!     .build();
 //! ```
 
+mod builder;
 mod generator;
 mod types;
-mod builder;
 #[macro_use]
 mod macros;
 
 // Re-export public API
-pub use generator::{CheckError, GeneratorConfig, check, generate, generate_to_file};
+pub use generator::{
+    AuthScheme, CheckError, GeneratorConfig, check, generate, generate_to_file,
+    generate_with_warnings,
+};
 pub use types::{
-    HttpMethod, PathParam, RouteCollection, RouteDefinition, TypeRegistry, extract_path_params,
+    Collector, HttpMethod, NoCollect, PathParam, RouteCollection, RouteDefinition, TypeRegistry,
+    Visibility, extract_path_params, is_valid_js_identifier,
 };
 
-pub use builder::{ApiRouter, MaybeTs, RouteBuilder, WsRouteBuilder};
+pub use builder::{
+    ApiRouter, IntoApiRouter, IntoEndpointHandler, MaybeTs, Registered, RouteBuilder, RouteTable,
+    WsRouteBuilder, build_routes,
+};
+
+#[cfg(feature = "ts-rs")]
+pub use builder::{build_typed, collect_routes};
+
+/// [`ApiRouter`] with [`TypeRegistry`] as the collector — the variant that collects route types
+/// for ts-rs export.
+///
+/// Convenience alias for codegen entry points: `TypedApiRouter::<AppState>::new()` is equivalent
+/// to `ApiRouter::<AppState, TypeRegistry>::new()`, and the collector type `C` can be left to
+/// inference when passing the builder to a generic function.
+#[cfg(feature = "ts-rs")]
+pub type TypedApiRouter<S = ()> = ApiRouter<S, TypeRegistry>;
 
 // Re-export the #[endpoint] attribute macro and register!() call-site macro.
 pub use axotyped_macros::{endpoint, register};
+
+/// Declare a route table as a zero-sized type implementing [`RouteTable`].
+///
+/// Expands to a unit struct implementing [`RouteTable`], providing `.router()`, `.collect_types()`,
+/// and `.build()` methods.
+///
+/// # Example
+/// ```rust,ignore
+/// axotyped::define_routes! {
+///     pub Routes for Arc<AppState>, |r| {
+///         r.get("/health", axotyped::register!(health))
+///             .group_prefixed("admin", |g| g.post("/x", axotyped::register!(create_x))) // private by default
+///     }
+/// }
+///
+/// let router = Routes::router().with_state(state);
+/// let collection = Routes::collect_types(); // from a debug-only codegen entry point
+/// ```
+#[macro_export]
+macro_rules! define_routes {
+    ($vis:vis $name:ident for $state:ty, |$r:ident| $($body:tt)*) => {
+        $vis struct $name;
+
+        impl $crate::RouteTable<$state> for $name {
+            fn define<C: $crate::Collector>(
+                $r: $crate::ApiRouter<$state, C>,
+            ) -> $crate::ApiRouter<$state, C> {
+                $crate::IntoApiRouter::into_api_router($($body)*)
+            }
+        }
+
+        impl $name {
+            /// Build the lean production server router (`NoCollect`).
+            pub fn router() -> ::axum::Router<$state> {
+                <$name as $crate::RouteTable<$state>>::router()
+            }
+
+            /// Collect TypeScript type data for binding generation (`TypeRegistry`).
+            pub fn collect_types() -> $crate::RouteCollection {
+                <$name as $crate::RouteTable<$state>>::collect_types()
+            }
+
+            /// Collecting build — returns both the `Router` and `RouteCollection`.
+            pub fn build() -> (::axum::Router<$state>, $crate::RouteCollection) {
+                <$name as $crate::RouteTable<$state>>::build()
+            }
+        }
+    };
+}
 
 // ts-rs integration: TS trait, derive macro, and all standard type impls.
 // Gated behind the `ts-rs` feature. The derive macro lives in axotyped-macros
@@ -65,14 +132,19 @@ pub use ts::*;
 ///
 /// The proc-macro creates a companion struct (`<fn_name>__EndpointMeta`) that
 /// implements this trait. The builder calls `apply()` when constructing the
-/// route to populate the `RouteDefinition` with the extracted body/response/query types.
+/// route to populate the `RouteDefinition` with the extracted body/response/query types,
+/// pushing each named type through the router's [`Collector`].
+///
+/// `apply` is generic over the collector so the lean (`NoCollect`) and collecting
+/// (`TypeRegistry`) router builds monomorphize separately — keeping the ts-rs export
+/// machinery out of binaries that don't collect types.
 ///
 /// You should not implement this trait manually — use `#[endpoint]` on your
 /// handler functions instead.
 pub trait EndpointMeta: Sized {
-    /// Apply inferred type metadata to a route definition and register types
-    /// for TypeScript export.
-    fn apply(def: &mut RouteDefinition, registry: &mut RouteCollection);
+    /// Apply inferred type metadata to a route definition and register named types
+    /// for TypeScript export through `collector`.
+    fn apply<C: Collector>(def: &mut RouteDefinition, collector: &mut C);
 }
 
 // ---------------------------------------------------------------------------
@@ -81,5 +153,5 @@ pub trait EndpointMeta: Sized {
 
 /// Internal helpers used by generated code. Not part of the public API.
 pub mod __private {
-    pub use crate::builder::{collect_type, set_pending_meta, type_string};
+    pub use crate::builder::type_string;
 }

@@ -14,12 +14,13 @@
 ///         body: LoginRequest -> LoginResponse;
 ///     verify: POST "/verify-email"
 ///         body: VerifyEmailRequest -> MessageResponse;
-///     changePassword: POST "/change-password" [auth]
+///     changePassword: POST "/change-password"
 ///         body: ChangePasswordRequest -> MessageResponse;
-///     listUsers: GET "/admin/users" [auth]
+///     listUsers: GET "/admin/users"
 ///         query: ListUsersQuery -> Vec<UserResponse>;
-///     getUser: GET "/admin/users/{id}" [auth]
+///     getUser: GET "/admin/users/{id}"
 ///         -> UserResponse;
+///     healthCheck: GET "/health" [public]
 ///     authorize: GET "/oauth/{provider}/authorize" [redirect]
 ///         query: AuthorizeQuery;
 /// };
@@ -27,8 +28,10 @@
 ///
 /// # Elements
 ///
+/// Routes require authentication by default; `[public]` opts out.
+///
 /// - `@group <name>` — sets the group for all following routes (generates nested object)
-/// - `[auth]` — marks route as requiring authentication
+/// - `[public]` — marks route as public (no auth in the generated client)
 /// - `[redirect]` — marks route as a browser redirect (URL builder, not fetch)
 /// - `[ws]` — marks route as a WebSocket endpoint (generates typed WS client)
 /// - `send: <Type>` — client-to-server event type for WS routes
@@ -78,12 +81,14 @@ macro_rules! api_routes {
             name: stringify!($name).to_string(),
             method: $crate::api_routes!(@method $method),
             path: $path.to_string(),
-            auth: $crate::api_routes!(@has_flag auth $([$($flag),*])?),
+            visibility: $crate::api_routes!(@visibility $([$($flag),*])?),
+            declared: $crate::api_routes!(@visibility $([$($flag),*])?),
             body_type: None,
             response_type: None,
             query_type: $crate::api_routes!(@opt_type $($qo $(<$qi>)?)?),
             path_params: $crate::extract_path_params($path),
             group: $group.clone(),
+            allow_redirects: $crate::api_routes!(@has_flag allow_redirects $([$($flag),*])?),
             redirect: false,
             websocket: true,
             ws_send_type: $crate::api_routes!(@opt_type $so $(<$si>)?),
@@ -106,12 +111,14 @@ macro_rules! api_routes {
             name: stringify!($name).to_string(),
             method: $crate::api_routes!(@method $method),
             path: $path.to_string(),
-            auth: $crate::api_routes!(@has_flag auth $([$($flag),*])?),
+            visibility: $crate::api_routes!(@visibility $([$($flag),*])?),
+            declared: $crate::api_routes!(@visibility $([$($flag),*])?),
             body_type: $crate::api_routes!(@opt_type $($bo $(<$bi>)?)?),
             response_type: $crate::api_routes!(@opt_type $($ro $(<$ri>)?)?),
             query_type: $crate::api_routes!(@opt_type $($qo $(<$qi>)?)?),
             path_params: $crate::extract_path_params($path),
             group: $group.clone(),
+            allow_redirects: $crate::api_routes!(@has_flag allow_redirects $([$($flag),*])?),
             redirect: $crate::api_routes!(@has_flag redirect $([$($flag),*])?),
             websocket: $crate::api_routes!(@has_ws_flag $([$($flag),*])?),
             ws_send_type: None,
@@ -131,6 +138,19 @@ macro_rules! api_routes {
     (@has_flag $target:ident) => { false };
     (@has_flag $target:ident [$($flag:ident),*]) => {
         $crate::api_routes!(@check_flag $target, $($flag),*)
+    };
+    // Visibility from flags: public dominates permissive; neither is private.
+    // Used for both `visibility` (effective) and `declared` — the macro
+    // context has no layers, so nothing overrides either.
+    (@visibility) => { $crate::Visibility::Private };
+    (@visibility [$($flag:ident),*]) => {
+        if $crate::api_routes!(@has_flag public [$($flag),*]) {
+            $crate::Visibility::Public
+        } else if $crate::api_routes!(@has_flag permissive [$($flag),*]) {
+            $crate::Visibility::Permissive
+        } else {
+            $crate::Visibility::Private
+        }
     };
     (@check_flag $target:ident, ) => { false };
     (@check_flag $target:ident, $target2:ident $(, $rest:ident)*) => {

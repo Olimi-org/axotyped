@@ -1,7 +1,7 @@
 use proc_macro2::Span;
 use syn::{
-    ext::IdentExt, parse::ParseStream, parse_quote, parse_quote_spanned, Error, Expr, Ident, Path,
-    Token, Type,
+    Error, Expr, Ident, Path, Token, Type, ext::IdentExt, parse::ParseStream, parse_quote,
+    parse_quote_spanned,
 };
 
 use crate::ts::attr::FieldAttr;
@@ -52,16 +52,9 @@ pub fn parse_optional(input: ParseStream) -> syn::Result<Optional> {
     Ok(optional)
 }
 
-/// Given a field, return a tuple `(is_optional, type)`.  
-///
-/// `is_optional`:  
-/// An expression evaluating to bool, indicating whether the field should be annotated with `?`.
-///
-/// `type`:  
-/// The transformed type of the field after applying the `#[ts(optional)]` annotation.
-/// This will be either  
-/// - the unmodified type of the field (no optional or `#[ts(optional = nullable)]`) or  
-/// - if the field is an `Option<T>`, its inner type `T´ (`#[ts(optional)]`)
+/// Returns `(is_optional, type)` for a field.
+/// `is_optional` emits `?`; `type` is the field type after applying
+/// `#[ts(optional)]` (`Option<T>` becomes `T`, or `T | null` with `nullable`).
 pub fn apply(
     crate_rename: &Path,
     for_struct: Optional,
@@ -74,23 +67,19 @@ pub fn apply(
         (Optional::NotOptional, Optional::Inherit) | (_, Optional::NotOptional) => {
             (parse_quote!(false), field_ty.clone())
         }
-        // explicit `#[ts(optional)]` on field.
-        // It takes precedence over the struct attribute, and is enforced **AT COMPILE TIME**
+        // Explicit `#[ts(optional)]` on field; takes precedence over struct-level.
         (_, Optional::Optional { nullable }) => (
             parse_quote!(true),
             if nullable {
                 field_ty.clone()
             } else {
-                // expression that evaluates to the the Option's inner type,
-                // but fails to compile if `field_ty` is not an `Option`.
+                // Inner type of `Option`; fails to compile on non-`Option`.
                 parse_quote_spanned! {
                     span => <#field_ty as #crate_rename::IsOption>::Inner
                 }
             },
         ),
-        // Inherited `#[ts(optional)]` from the struct.
-        // Acts like `#[ts(optional)]` on a field, but does not error on non-`Option` fields.
-        // Instead, it is a no-op.
+        // Inherited `#[ts(optional)]` from struct; no-op on non-`Option` fields.
         (Optional::Optional { nullable }, Optional::Inherit) if attr.type_override.is_none() => (
             parse_quote! {
                 <#field_ty as #crate_rename::TS>::IS_OPTION
@@ -106,13 +95,37 @@ pub fn apply(
             // field may be omitted during serialization and has a default value, so the field can be
             // treated as `#[ts(optional = nullable)]`.
             let is_optional = attr.maybe_omitted && attr.has_default;
-            (parse_quote!(#is_optional), field_ty.clone())
+            // With `#[ts(type)]` the field type is unused for rendering,
+            // so skip the `IS_OPTION` probe to avoid requiring `T: TS`.
+            if attr.type_override.is_some() {
+                return (parse_quote!(#is_optional), field_ty.clone());
+            }
+            // `Option` fields accept a missing key as `None`; the type keeps
+            // `| null` for responses that serialize `None`.
+            (
+                parse_quote!((#is_optional) || <#field_ty as #crate_rename::TS>::IS_OPTION),
+                field_ty.clone(),
+            )
         }
     }
 }
 
-/// Unwraps the given option type, turning `Option<T>` into `T`.
-/// otherwise, return the provided type as-is.
+/// Unwraps `Option<T>` to `T`; returns other types as-is.
 fn unwrap_option(crate_rename: &Path, ty: &Type) -> Type {
     parse_quote! {<#ty as #crate_rename::TS>::OptionInnerType}
+}
+
+/// Matches `Option<T>` by final path segment with one generic arg.
+pub(crate) fn is_option_ty(ty: &Type) -> bool {
+    let Type::Path(tp) = ty else { return false };
+    let Some(seg) = tp.path.segments.last() else {
+        return false;
+    };
+    if seg.ident != "Option" {
+        return false;
+    }
+    matches!(
+        &seg.arguments,
+        syn::PathArguments::AngleBracketed(args) if args.args.len() == 1
+    )
 }

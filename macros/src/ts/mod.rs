@@ -5,9 +5,9 @@ use indexmap::IndexSet;
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 use syn::{
-    parse_quote, spanned::Spanned, ConstParam, Expr, GenericParam, Generics, Item, LifetimeParam,
-    Path, QSelf, Result, Type, TypeArray, TypeParam, TypeParen, TypePath, TypeReference, TypeSlice,
-    TypeTuple, WhereClause, WherePredicate,
+    ConstParam, Expr, GenericParam, Generics, Item, LifetimeParam, Path, QSelf, Result, Type,
+    TypeArray, TypeParam, TypeParen, TypePath, TypeReference, TypeSlice, TypeTuple, WhereClause,
+    WherePredicate, parse_quote, spanned::Spanned,
 };
 
 use {attr::Repr, deps::Dependencies, utils::format_generics};

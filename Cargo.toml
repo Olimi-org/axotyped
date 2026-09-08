@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "axotyped"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/TheGB0077/axotyped"
@@ -51,6 +51,7 @@ astrolabe-impl = ["ts-rs", "dep:astrolabe"]
 [dependencies]
 axum = "0.8"
 axotyped-macros = { version = "0.2.0", path = "macros" }
+tower = { version = "0.5", default-features = false }
 
 # ts-rs required deps
 thiserror = { version = "2", optional = true }
@@ -78,3 +79,4 @@ dprint-plugin-typescript = { version = "= 0.95", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }

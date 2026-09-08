@@ -28,6 +28,14 @@ use syn::{FnArg, ItemFn, PathArguments, ReturnType, Type, parse_macro_input};
 /// Generates a companion struct `<fn_name>__EndpointMeta` implementing `EndpointMeta`,
 /// which carries the inferred `body_type`, `response_type`, and `query_type`.
 ///
+/// # Visibility
+///
+/// Routes require authentication unless declared public. Use
+/// `#[endpoint(public)]` to mark an individual handler's route public, or
+/// `#[endpoint(permissive)]` for best-effort credentials that never fail
+/// without them (the scope-wide alternatives are [`ApiRouter::group_public`]
+/// / `group_permissive` on the builder).
+///
 /// # Extracted types
 ///
 /// - **Body type**: inner `T` from `Json<T>` in function parameters
@@ -36,8 +44,41 @@ use syn::{FnArg, ItemFn, PathArguments, ReturnType, Type, parse_macro_input};
 ///
 /// Handlers returning `Result<StatusCode, StatusCode>` (no body) produce no response type.
 #[proc_macro_attribute]
-pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
+
+    // Options: `#[endpoint]`, a visibility (`public` | `permissive`), and/or
+    // the `allow_redirects` route property — e.g. `#[endpoint(public)]` or
+    // `#[endpoint(public, allow_redirects)]`. Anything else is a compile
+    // error so typos can never silently flip visibility.
+    let mut is_public = false;
+    let mut is_permissive = false;
+    let mut allow_redirects = false;
+    let mut expect_ident = true;
+    let mut any_token = false;
+    for tt in attr {
+        any_token = true;
+        match tt {
+            proc_macro::TokenTree::Ident(id) if expect_ident => {
+                match id.to_string().as_str() {
+                    "public" if !is_public && !is_permissive => is_public = true,
+                    "permissive" if !is_public && !is_permissive => is_permissive = true,
+                    "allow_redirects" if !allow_redirects => allow_redirects = true,
+                    _ => return endpoint_attr_error(),
+                }
+                expect_ident = false;
+            }
+            proc_macro::TokenTree::Punct(p)
+                if p.as_char() == ',' && !expect_ident =>
+            {
+                expect_ident = true
+            }
+            _ => return endpoint_attr_error(),
+        }
+    }
+    if expect_ident && any_token {
+        return endpoint_attr_error();
+    }
 
     let fn_name = &item_fn.sig.ident;
     let meta_struct_name = quote::format_ident!("{}__EndpointMeta", fn_name);
@@ -51,8 +92,8 @@ pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let inner = unwrap_container_types(t);
             quote! {
                 __def.body_type = Some(::axotyped::__private::type_string::<#t>());
-                ::axotyped::__private::collect_type::<#t>(__registry);
-                #(::axotyped::__private::collect_type::<#inner>(__registry);)*
+                __c.register::<#t>();
+                #(__c.register::<#inner>();)*
             }
         }
         None => quote! {},
@@ -63,8 +104,8 @@ pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let inner = unwrap_container_types(t);
             quote! {
                 __def.query_type = Some(::axotyped::__private::type_string::<#t>());
-                ::axotyped::__private::collect_type::<#t>(__registry);
-                #(::axotyped::__private::collect_type::<#inner>(__registry);)*
+                __c.register::<#t>();
+                #(__c.register::<#inner>();)*
             }
         }
         None => quote! {},
@@ -75,11 +116,34 @@ pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let inner = unwrap_container_types(t);
             quote! {
                 __def.response_type = Some(::axotyped::__private::type_string::<#t>());
-                ::axotyped::__private::collect_type::<#t>(__registry);
-                #(::axotyped::__private::collect_type::<#inner>(__registry);)*
+                __c.register::<#t>();
+                #(__c.register::<#inner>();)*
             }
         }
         None => quote! {},
+    };
+
+    // Visibility declarations record both the declared and (for now)
+    // effective state; an auth layer in scope later forces effective back to
+    // `Private` (server enforcement is the ground truth). Redirect-following
+    // is likewise declared here, never caller-supplied.
+    let visibility_stmt = if is_public {
+        quote! {
+            __def.declared = ::axotyped::Visibility::Public;
+            __def.visibility = ::axotyped::Visibility::Public;
+        }
+    } else if is_permissive {
+        quote! {
+            __def.declared = ::axotyped::Visibility::Permissive;
+            __def.visibility = ::axotyped::Visibility::Permissive;
+        }
+    } else {
+        quote! {}
+    };
+    let redirects_stmt = if allow_redirects {
+        quote! { __def.allow_redirects = true; }
+    } else {
+        quote! {}
     };
 
     let expanded = quote! {
@@ -91,10 +155,12 @@ pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
         pub struct #meta_struct_name;
 
         impl ::axotyped::EndpointMeta for #meta_struct_name {
-            fn apply(__def: &mut ::axotyped::RouteDefinition, __registry: &mut ::axotyped::RouteCollection) {
+            fn apply<C: ::axotyped::Collector>(__def: &mut ::axotyped::RouteDefinition, __c: &mut C) {
                 #body_register
                 #query_register
                 #response_register
+                #visibility_stmt
+                #redirects_stmt
             }
         }
     };
@@ -102,15 +168,25 @@ pub fn endpoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+fn endpoint_attr_error() -> TokenStream {
+    quote! {
+        compile_error!(
+            "axotyped: #[endpoint] accepts at most a visibility (`public` | `permissive`) \
+             and `allow_redirects` — e.g. #[endpoint(public, allow_redirects)]"
+        );
+    }
+    .into()
+}
+
 // ---------------------------------------------------------------------------
 // register!() — call-site macro that registers a handler with its metadata
 // ---------------------------------------------------------------------------
 
-/// Register a handler with its auto-inferred metadata.
+/// Wrap a handler with its auto-inferred `#[endpoint]` metadata.
 ///
-/// Sets the metadata sideband and evaluates to the raw handler, so the builder's
-/// `.post()`, `.get()`, etc. methods can apply the inferred types transparently.
-/// The builder reads and clears the sideband — no separate method needed.
+/// Expands to a [`Registered`](axotyped::Registered) value carrying the handler and its
+/// `EndpointMeta` at the type level. Pass it to `.post()`, `.get()`, etc.; the builder applies
+/// the inferred body/response/query types through its collector.
 ///
 /// Requires the handler function to be annotated with `#[endpoint]`.
 ///
@@ -134,10 +210,7 @@ pub fn register(input: TokenStream) -> TokenStream {
     }
 
     let expanded = quote! {
-        {
-            ::axotyped::__private::set_pending_meta(<#meta_path as ::axotyped::EndpointMeta>::apply);
-            #path
-        }
+        ::axotyped::Registered::<_, #meta_path>::new(#path)
     };
 
     TokenStream::from(expanded)

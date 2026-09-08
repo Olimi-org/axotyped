@@ -1,15 +1,14 @@
 use std::collections::HashMap;
 
+pub use r#enum::*;
 pub use field::*;
 use proc_macro2::TokenTree;
 use quote::quote;
-pub use r#enum::*;
 pub use r#struct::*;
 use syn::{
-    parenthesized,
+    Error, Expr, Ident, Lit, Path, Result, Token, WherePredicate, parenthesized,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
-    Error, Expr, Ident, Lit, Path, Result, Token, WherePredicate,
 };
 pub use variant::*;
 mod r#enum;

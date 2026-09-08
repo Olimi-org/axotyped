@@ -32,6 +32,23 @@ pub struct PathParam {
     pub name: String,
 }
 
+/// What a route declares — and effectively is — regarding authentication.
+///
+/// Matched on directly so each state carries its own meaning instead of
+/// combining booleans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Visibility {
+    /// Requires authentication. The generated client attaches credentials
+    /// and refuses to send without them.
+    #[default]
+    Private,
+    /// Open. The generated client sends no credentials for the call.
+    Public,
+    /// Best-effort credentials: attached when available, never required.
+    /// Anonymous calls go out as-is; the endpoint is expected to serve both.
+    Permissive,
+}
+
 /// Definition of a single API route.
 #[derive(Debug, Clone)]
 pub struct RouteDefinition {
@@ -41,8 +58,16 @@ pub struct RouteDefinition {
     pub method: HttpMethod,
     /// Route path (e.g., `/register`, `/admin/users/{id}`).
     pub path: String,
-    /// Whether the route requires authentication.
-    pub auth: bool,
+    /// Effective visibility after scopes and layers. Drives codegen:
+    /// `Private` requires credentials, `Permissive` attaches them
+    /// best-effort, `Public` sends none.
+    pub visibility: Visibility,
+    /// Declaration-site visibility (`#[endpoint(public|permissive)]`,
+    /// `[public|permissive]`, or a `group_public`/`group_permissive` scope).
+    /// Differs from `visibility` when an `auth_layer` in scope forces a
+    /// declared-public route back to `Private` (reported by
+    /// `generate_with_warnings`).
+    pub declared: Visibility,
     /// Rust type name of the request body (stringified via `stringify!()`).
     pub body_type: Option<String>,
     /// Rust type name of the response body (stringified via `stringify!()`).
@@ -53,6 +78,11 @@ pub struct RouteDefinition {
     pub path_params: Vec<PathParam>,
     /// Group name for nested object structure (e.g., `emailPassword`).
     pub group: Option<String>,
+    /// Whether this route may follow redirects (`[allow_redirects]`).
+    /// A route property decided server-side at generation time — never
+    /// caller-suppliable. Only takes effect for credentialless calls;
+    /// anything carrying auth or cookies still refuses.
+    pub allow_redirects: bool,
     /// Whether this route is a browser redirect (not a fetch call).
     pub redirect: bool,
     /// Whether this route is a WebSocket endpoint (generates WS connection, not fetch).
@@ -61,6 +91,19 @@ pub struct RouteDefinition {
     pub ws_send_type: Option<String>,
     /// Rust type name for server-to-client events (receive direction).
     pub ws_receive_type: Option<String>,
+}
+
+impl RouteDefinition {
+    /// Whether calls carry credentials (`Private` or `Permissive` effective
+    /// visibility): transport guard, cache bypass, and redirect refusal apply.
+    pub fn is_credentialed(&self) -> bool {
+        !matches!(self.visibility, Visibility::Public)
+    }
+
+    /// Whether credentials are best-effort rather than required.
+    pub fn is_permissive(&self) -> bool {
+        matches!(self.visibility, Visibility::Permissive)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -72,11 +115,33 @@ pub struct RouteDefinition {
 #[cfg(feature = "ts-rs")]
 type ExportFn = fn(&crate::ts::Config) -> Result<(), crate::ts::ExportError>;
 
-/// Collects types encountered during route building so their TypeScript
-/// declarations can be exported via ts-rs's `export_all()` mechanism.
-/// Deduplicates by `TypeId` to handle generic instantiations correctly
-/// (e.g., `ContentResponse<VocabItem>` and `ContentResponse<Dialog>` share
-/// the same generic `TS` impl and produce the same declaration).
+/// Called when a route names type `T` for TypeScript export.
+///
+/// [`NoCollect`] ignores registrations; [`TypeRegistry`] collects them
+/// for binding generation.
+pub trait Collector: Default {
+    /// Register `T`. The default is a no-op; collecting collectors override this.
+    fn register<T: crate::MaybeTs + 'static>(&mut self) {}
+
+    /// Merge another collector of the same kind into this one (used by `merge` / `group_with`).
+    fn merge_collection(&mut self, _other: Self) {}
+
+    /// Consume the collector into the [`TypeRegistry`] it accumulated.
+    fn into_type_registry(self) -> TypeRegistry;
+}
+
+/// Lean collector that registers nothing. The default for [`crate::ApiRouter`].
+#[derive(Debug, Clone, Default)]
+pub struct NoCollect;
+
+impl Collector for NoCollect {
+    fn into_type_registry(self) -> TypeRegistry {
+        TypeRegistry::default()
+    }
+}
+
+/// Collects route types for ts-rs export via `export_all()`.
+/// Deduplicates by `TypeId` so shared generic impls emit one declaration.
 #[cfg(feature = "ts-rs")]
 #[derive(Debug, Clone, Default)]
 pub struct TypeRegistry {
@@ -85,9 +150,7 @@ pub struct TypeRegistry {
     seen: std::collections::BTreeSet<std::any::TypeId>,
 }
 
-/// Check if a type name is a stdlib container wrapper that shouldn't be
-/// exported as a standalone ts-rs type (e.g., `alloc::vec::Vec<MyType>`).
-/// The TS generator handles these inline (`T[]`, `T | null`).
+/// Returns true for stdlib wrappers handled inline (`Vec` as `T[]`, `Option` as `T | null`).
 #[cfg(feature = "ts-rs")]
 fn is_container_wrapper(type_name: &str) -> bool {
     type_name.contains("::vec::Vec<") || type_name.contains("::option::Option<")
@@ -97,22 +160,6 @@ fn is_container_wrapper(type_name: &str) -> bool {
 impl TypeRegistry {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Register a type's export function. Deduplicates by `TypeId`.
-    ///
-    /// Skips container wrappers (`Vec<T>`, `Option<T>`) since they can't be
-    /// exported as standalone ts-rs types. The inner `T` is registered
-    /// separately through its own route registration.
-    pub fn register<T: crate::ts::TS + 'static>(&mut self) {
-        let type_name = std::any::type_name::<T>();
-        if is_container_wrapper(type_name) {
-            return;
-        }
-        let type_id = std::any::TypeId::of::<T>();
-        if self.seen.insert(type_id) {
-            self.slots.push((type_id, T::export_all));
-        }
     }
 
     /// Whether a type has already been registered.
@@ -140,6 +187,28 @@ impl TypeRegistry {
                 self.slots.push((type_id, export_fn));
             }
         }
+    }
+}
+
+#[cfg(feature = "ts-rs")]
+impl Collector for TypeRegistry {
+    fn register<T: crate::MaybeTs + 'static>(&mut self) {
+        let type_name = std::any::type_name::<T>();
+        if is_container_wrapper(type_name) {
+            return;
+        }
+        let type_id = std::any::TypeId::of::<T>();
+        if self.seen.insert(type_id) {
+            self.slots.push((type_id, T::export_all));
+        }
+    }
+
+    fn merge_collection(&mut self, other: Self) {
+        self.extend(other);
+    }
+
+    fn into_type_registry(self) -> TypeRegistry {
+        self
     }
 }
 
@@ -177,6 +246,12 @@ impl RouteCollection {
         Self::default()
     }
 
+    /// Builds a `RouteCollection` from routes and a type registry.
+    /// Used by [`crate::ApiRouter::build`].
+    pub(crate) fn assemble(routes: Vec<RouteDefinition>, types: TypeRegistry) -> Self {
+        Self { routes, types }
+    }
+
     pub fn push(&mut self, route: RouteDefinition) {
         self.routes.push(route);
     }
@@ -194,23 +269,23 @@ impl RouteCollection {
         &self.types
     }
 
-    /// Register a type for TypeScript export. Deduplicates by TypeId.
-    #[cfg(feature = "ts-rs")]
-    pub fn register_type<T: crate::ts::TS + 'static>(&mut self) {
-        self.types.register::<T>();
-    }
-
-    /// Export all collected types (and their transitive dependencies) to the
-    /// given directory using ts-rs's `export_all()` mechanism.
-    ///
-    /// Call this before `generate_to_file()` — the generated client will
-    /// import types from this directory.
-    ///
-    /// This replaces manual `T::export_all(&cfg)` calls for each type.
-    /// Types are auto-discovered from the builder's `.response::<T>()`,
-    /// `.body::<T>()`, `.query::<T>()`, and `.events::<A, B>()` calls.
+    /// Exports collected types and dependencies to `dir` via `export_all()`.
+    /// Call before `generate_to_file()`; replaces manual per-type exports.
+    /// Types come from `.response::<T>()`, `.body::<T>()`, `.query::<T>()`, `.events::<A, B>()`.
     #[cfg(feature = "ts-rs")]
     pub fn export_types(&self, dir: &std::path::Path) -> Result<(), std::io::Error> {
+        self.export_types_with(dir, crate::ts::Config::from_env())
+    }
+
+    /// Exports types with an explicit ts-rs [`Config`](crate::ts::Config).
+    /// Use [`GeneratorConfig::ts_config`](crate::GeneratorConfig::ts_config) to keep
+    /// binding and client integer rendering aligned.
+    #[cfg(feature = "ts-rs")]
+    pub fn export_types_with(
+        &self,
+        dir: &std::path::Path,
+        cfg: crate::ts::Config,
+    ) -> Result<(), std::io::Error> {
         use std::fs;
 
         if self.types.is_empty() {
@@ -218,7 +293,7 @@ impl RouteCollection {
         }
 
         fs::create_dir_all(dir)?;
-        let cfg = crate::ts::Config::new().with_out_dir(dir.to_path_buf());
+        let cfg = cfg.with_out_dir(dir.to_path_buf());
 
         for (_, export_fn) in self.types.slots() {
             if let Err(e) = export_fn(&cfg) {
@@ -295,19 +370,150 @@ impl<'a> IntoIterator for &'a RouteCollection {
     }
 }
 
-/// Extract path parameters from a route path string.
-///
-/// For example, `/admin/users/{id}` returns `[PathParam { name: "id" }]`.
+/// Returns true if `name` can be emitted as-is in generated code.
+/// ASCII identifier check plus reserved-word rejection; rejected names
+/// become synthetic `__param_N` placeholders.
+pub fn is_valid_js_identifier(name: &str) -> bool {
+    // ECMAScript reserved words (rejected unconditionally so output is safe
+    // in strict / module / generator contexts) plus the strict-mode binding
+    // bans `arguments` and `eval`. Contextual names like `async`/`of`/`as`/
+    // `from`/`get`/`set` are legal as plain bindings and stay allowed.
+    const RESERVED: &[&str] = &[
+        // Reserved words (incl. `await`/`yield`/`enum`, reserved only in
+        // module / async / generator / strict contexts — rejected
+        // unconditionally so output is safe in all of them)
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "import",
+        "in",
+        "instanceof",
+        "new",
+        "null",
+        "return",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+        // Future reserved words in strict mode / modules (incl. class-side
+        // `static`, `private`, `protected`, `public` — still FutureReservedWord
+        // per spec even though class syntax implements them)
+        "implements",
+        "interface",
+        "let",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "static",
+        // Banned as bindings in strict-mode signatures
+        "arguments",
+        "eval",
+    ];
+
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') && !RESERVED.contains(&name)
+}
+
+/// Extracts `{...}` params from a path (e.g. `/users/{id}` -> `[id]`).
+/// Repeats collapse to first occurrence; non-identifiers become `__param_N`,
+/// matching path-template generation.
 pub fn extract_path_params(path: &str) -> Vec<PathParam> {
-    path.split('/')
-        .filter_map(|seg| {
-            seg.strip_prefix('{')
-                .and_then(|s| s.strip_suffix('}'))
-                .map(|name| PathParam {
-                    name: name.to_string(),
-                })
+    let raws = scan_raw_path_params(path);
+
+    // Names claimed by valid raw identifiers; synthetics must avoid these.
+    let taken: std::collections::BTreeSet<String> = raws
+        .iter()
+        .filter(|raw| is_valid_js_identifier(raw))
+        .map(|raw| (*raw).to_string())
+        .collect();
+
+    let mut next_synthetic = 0usize;
+    raws.into_iter()
+        .enumerate()
+        .map(|(index, raw)| PathParam {
+            name: sanitize_param_name_with(&taken, &mut next_synthetic, raw, index),
         })
         .collect()
+}
+
+/// Returns raw `{...}` contents in first-occurrence order.
+/// An unterminated `{` ends the scan; the remainder is literal text.
+fn scan_raw_path_params(path: &str) -> Vec<&str> {
+    let mut raws: Vec<&str> = Vec::new();
+    let mut rest = path;
+    while let Some(open) = rest.find('{') {
+        match rest[open..].find('}') {
+            Some(close_rel) => {
+                let raw = &rest[open + 1..open + close_rel];
+                if !raws.contains(&raw) {
+                    raws.push(raw);
+                }
+                rest = &rest[open + close_rel + 1..];
+            }
+            None => break,
+        }
+    }
+    raws
+}
+
+/// Raw names in `path` that are valid identifiers.
+pub(crate) fn scan_taken_param_names(path: &str) -> std::collections::BTreeSet<String> {
+    scan_raw_path_params(path)
+        .into_iter()
+        .filter(|raw| is_valid_js_identifier(raw))
+        .map(String::from)
+        .collect()
+}
+
+/// Maps a raw param name to its emitted name, allocating `__param_N`
+/// for invalid identifiers. Shared by param extraction and template generation.
+pub(crate) fn sanitize_param_name_with(
+    taken: &std::collections::BTreeSet<String>,
+    next_synthetic: &mut usize,
+    raw: &str,
+    _index: usize,
+) -> String {
+    if is_valid_js_identifier(raw) {
+        return raw.to_string();
+    }
+    loop {
+        let candidate = format!("__param_{next_synthetic}");
+        *next_synthetic += 1;
+        // Skip names already taken or equal to the raw input.
+        if !taken.contains(&candidate) && candidate != raw {
+            return candidate;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -336,18 +542,58 @@ mod tests {
     }
 
     #[test]
+    fn extract_inline_capture_with_suffix() {
+        // axum accepts `{id}suffix`; the param must not vanish from the signature
+        let params = extract_path_params("/u/{id}v2");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "id");
+    }
+
+    #[test]
+    fn non_identifier_param_contents_become_synthetic_names() {
+        let params = extract_path_params("/u/{x`; alert(document.cookie); y}");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "__param_0");
+    }
+
+    #[test]
+    fn duplicate_params_collapse_to_first_occurrence() {
+        let params = extract_path_params("/{a}/{b}/{a}");
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "a");
+        assert_eq!(params[1].name, "b");
+    }
+
+    #[test]
+    fn js_identifier_validation() {
+        assert!(is_valid_js_identifier("id"));
+        assert!(is_valid_js_identifier("_private"));
+        assert!(is_valid_js_identifier("$ref"));
+        // Contextual names are legal as plain bindings
+        assert!(is_valid_js_identifier("async"));
+        assert!(is_valid_js_identifier("of"));
+        assert!(!is_valid_js_identifier("2fa"));
+        assert!(!is_valid_js_identifier("a b"));
+        assert!(!is_valid_js_identifier("class")); // reserved word
+        assert!(!is_valid_js_identifier(""));
+        assert!(!is_valid_js_identifier("a;evil()"));
+    }
+
+    #[test]
     fn route_collection_extend() {
         let mut a = RouteCollection::new();
         a.push(RouteDefinition {
             name: "foo".into(),
             method: HttpMethod::Get,
             path: "/foo".into(),
-            auth: false,
+            visibility: Visibility::Public,
+            declared: Visibility::Public,
             body_type: None,
             response_type: None,
             query_type: None,
             path_params: vec![],
             group: None,
+            allow_redirects: false,
             redirect: false,
             websocket: false,
             ws_send_type: None,
@@ -359,12 +605,14 @@ mod tests {
             name: "bar".into(),
             method: HttpMethod::Post,
             path: "/bar".into(),
-            auth: true,
+            visibility: Visibility::Private,
+            declared: Visibility::Private,
             body_type: Some("BarRequest".into()),
             response_type: Some("BarResponse".into()),
             query_type: None,
             path_params: vec![],
             group: Some("baz".into()),
+            allow_redirects: false,
             redirect: false,
             websocket: false,
             ws_send_type: None,

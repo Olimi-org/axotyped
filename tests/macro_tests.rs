@@ -3,7 +3,7 @@ use axotyped::{HttpMethod, api_routes};
 #[test]
 fn simple_get_route() {
     let routes = api_routes! {
-        getSession: GET "/session" [auth]
+        getSession: GET "/session"
             -> SessionResponse;
     };
     assert_eq!(routes.len(), 1);
@@ -11,7 +11,7 @@ fn simple_get_route() {
     assert_eq!(r.name, "getSession");
     assert_eq!(r.method, HttpMethod::Get);
     assert_eq!(r.path, "/session");
-    assert!(r.auth);
+    assert!(r.is_credentialed());
     assert_eq!(r.response_type.as_deref(), Some("SessionResponse"));
     assert!(r.body_type.is_none());
     assert!(r.query_type.is_none());
@@ -29,7 +29,7 @@ fn post_with_body_and_response() {
     let r = &routes.routes()[0];
     assert_eq!(r.name, "register");
     assert_eq!(r.method, HttpMethod::Post);
-    assert!(!r.auth);
+    assert!(r.is_credentialed(), "deny-by-default");
     assert_eq!(r.body_type.as_deref(), Some("RegisterRequest"));
     assert_eq!(r.response_type.as_deref(), Some("MessageResponse"));
 }
@@ -52,7 +52,7 @@ fn route_with_group() {
 #[test]
 fn route_with_path_params() {
     let routes = api_routes! {
-        getUser: GET "/admin/users/{id}" [auth]
+        getUser: GET "/admin/users/{id}"
             -> UserResponse;
     };
     let r = &routes.routes()[0];
@@ -63,13 +63,13 @@ fn route_with_path_params() {
 #[test]
 fn route_with_query_params() {
     let routes = api_routes! {
-        listUsers: GET "/admin/users" [auth]
+        listUsers: GET "/admin/users"
             query: ListUsersQuery -> ListUsersResponse;
     };
     let r = &routes.routes()[0];
     assert_eq!(r.query_type.as_deref(), Some("ListUsersQuery"));
     assert_eq!(r.response_type.as_deref(), Some("ListUsersResponse"));
-    assert!(r.auth);
+    assert!(r.is_credentialed());
 }
 
 #[test]
@@ -80,7 +80,7 @@ fn redirect_route() {
     };
     let r = &routes.routes()[0];
     assert!(r.redirect);
-    assert!(!r.auth);
+    assert!(r.is_credentialed(), "deny-by-default");
     assert_eq!(r.path_params.len(), 1);
     assert_eq!(r.path_params[0].name, "provider");
     assert_eq!(r.query_type.as_deref(), Some("AuthorizeQuery"));
@@ -97,7 +97,7 @@ fn websocket_route() {
     let r = &routes.routes()[0];
     assert!(r.websocket);
     assert!(!r.redirect);
-    assert!(!r.auth);
+    assert!(r.is_credentialed(), "deny-by-default");
     assert_eq!(r.query_type.as_deref(), Some("WsParams"));
     assert_eq!(r.ws_send_type.as_deref(), Some("ClientEvent"));
     assert_eq!(r.ws_receive_type.as_deref(), Some("ServerEvent"));
@@ -107,13 +107,13 @@ fn websocket_route() {
 #[test]
 fn websocket_with_auth() {
     let routes = api_routes! {
-        wsConnect: GET "/ws/{sessionId}" [auth, ws]
+        wsConnect: GET "/ws/{sessionId}" [ws]
             send: ClientEvent, receive: ServerEvent
             query: WsParams;
     };
     let r = &routes.routes()[0];
     assert!(r.websocket);
-    assert!(r.auth);
+    assert!(r.is_credentialed());
     assert_eq!(r.path_params[0].name, "sessionId");
     assert_eq!(r.ws_send_type.as_deref(), Some("ClientEvent"));
     assert_eq!(r.ws_receive_type.as_deref(), Some("ServerEvent"));
@@ -122,11 +122,11 @@ fn websocket_with_auth() {
 #[test]
 fn multiple_flags() {
     let routes = api_routes! {
-        protectedRedirect: GET "/oauth/{provider}/link" [auth, redirect]
+        protectedRedirect: GET "/oauth/{provider}/link" [redirect]
             -> LinkResponse;
     };
     let r = &routes.routes()[0];
-    assert!(r.auth);
+    assert!(r.is_credentialed());
     assert!(r.redirect);
 }
 
@@ -166,7 +166,7 @@ fn multiple_groups() {
 #[test]
 fn delete_method() {
     let routes = api_routes! {
-        deletePasskey: DELETE "/passkeys/{id}" [auth]
+        deletePasskey: DELETE "/passkeys/{id}"
             -> MessageResponse;
     };
     let r = &routes.routes()[0];
@@ -176,7 +176,7 @@ fn delete_method() {
 #[test]
 fn put_method() {
     let routes = api_routes! {
-        updateUser: PUT "/admin/users/{id}" [auth]
+        updateUser: PUT "/admin/users/{id}"
             body: UpdateUserRequest -> UserResponse;
     };
     let r = &routes.routes()[0];
@@ -186,7 +186,7 @@ fn put_method() {
 #[test]
 fn patch_method() {
     let routes = api_routes! {
-        updateProfile: PATCH "/me" [auth]
+        updateProfile: PATCH "/me"
             body: UpdateProfileRequest -> ProfileResponse;
     };
     let r = &routes.routes()[0];
@@ -196,7 +196,7 @@ fn patch_method() {
 #[test]
 fn no_response_type() {
     let routes = api_routes! {
-        deleteItem: DELETE "/items/{id}" [auth];
+        deleteItem: DELETE "/items/{id}";
     };
     let r = &routes.routes()[0];
     assert!(r.response_type.is_none());
@@ -217,7 +217,7 @@ fn body_only_no_response() {
 #[test]
 fn vec_response_type() {
     let routes = api_routes! {
-        listUsers: GET "/admin/users" [auth]
+        listUsers: GET "/admin/users"
             -> Vec<UserResponse>;
     };
     let r = &routes.routes()[0];
@@ -227,7 +227,7 @@ fn vec_response_type() {
 #[test]
 fn option_response_type() {
     let routes = api_routes! {
-        getUser: GET "/users/{id}" [auth]
+        getUser: GET "/users/{id}"
             -> Option<UserResponse>;
     };
     let r = &routes.routes()[0];
@@ -248,7 +248,7 @@ fn vec_body_type() {
 #[test]
 fn vec_query_type() {
     let routes = api_routes! {
-        listRuns: GET "/api/runs" [auth]
+        listRuns: GET "/api/runs"
             query: RunListQuery -> Vec<RunResponse>;
     };
     let r = &routes.routes()[0];
@@ -259,7 +259,7 @@ fn vec_query_type() {
 #[test]
 fn collection_extend() {
     let mut core = api_routes! {
-        getSession: GET "/session" [auth]
+        getSession: GET "/session"
             -> SessionResponse;
     };
 
@@ -273,4 +273,81 @@ fn collection_extend() {
     assert_eq!(core.len(), 2);
     assert!(core.routes()[0].group.is_none());
     assert_eq!(core.routes()[1].group.as_deref(), Some("emailPassword"));
+}
+
+// ===========================================================================
+// Deny-by-default & public declarations
+// ===========================================================================
+
+#[test]
+fn public_flag_opts_out_of_auth() {
+    let routes = api_routes! {
+        healthCheck: GET "/health" [public];
+        deleteItem: DELETE "/items/{id}";
+    };
+    assert!(!routes.routes()[0].is_credentialed(), "[public] must clear auth");
+    assert!(routes.routes()[1].is_credentialed(), "unflagged routes stay private");
+}
+
+mod endpoint_visibility {
+    use axotyped::{ApiRouter, IntoApiRouter, Visibility, endpoint};
+
+    #[endpoint]
+    pub async fn admin_thing() -> &'static str {
+        "secret"
+    }
+
+    #[endpoint(public)]
+    pub async fn public_health() -> &'static str {
+        "ok"
+    }
+
+    #[endpoint(permissive)]
+    pub async fn feed() -> &'static str {
+        "items"
+    }
+
+    fn build(routes_def: impl FnOnce(ApiRouter<()>) -> ApiRouter<()>) -> Vec<Visibility> {
+        let (_router, routes) = routes_def(ApiRouter::<()>::new()).into_api_router().build();
+        routes.routes().iter().map(|r| r.visibility).collect()
+    }
+
+    #[test]
+    fn endpoint_without_public_is_private_by_default() {
+        let flags = build(|r| {
+            r.get("/thing", axotyped::register!(admin_thing))
+                .as_("thing")
+        });
+        assert_eq!(
+            flags,
+            vec![Visibility::Private],
+            "#[endpoint] without `public` stays private"
+        );
+    }
+
+    #[test]
+    fn endpoint_public_makes_route_public() {
+        let flags = build(|r| {
+            r.get("/health", axotyped::register!(public_health))
+                .as_("health")
+        });
+        assert_eq!(
+            flags,
+            vec![Visibility::Public],
+            "#[endpoint(public)] must open the route"
+        );
+    }
+
+    #[test]
+    fn endpoint_permissive_marks_route_permissive_but_credentialed() {
+        let (_router, routes) = ApiRouter::<()>::new()
+            .get("/feed", axotyped::register!(feed))
+            .as_("feed")
+            .into_api_router()
+            .build();
+        let r = &routes.routes()[0];
+        assert_eq!(r.visibility, Visibility::Permissive);
+        assert_eq!(r.declared, Visibility::Permissive);
+        assert!(r.is_credentialed(), "permissive stays credentialed for guard/cache");
+    }
 }

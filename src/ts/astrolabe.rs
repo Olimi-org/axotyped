@@ -1,9 +1,5 @@
-use astrolabe::{
-    Date, DateTime, Time
-};
+use astrolabe::{Date, DateTime, Time};
 
-use super::{impl_primitives, TS};
+use super::{TS, impl_primitives};
 
 impl_primitives!(Date, DateTime, Time => "string");
-
-

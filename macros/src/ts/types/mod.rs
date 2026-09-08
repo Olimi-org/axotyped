@@ -1,8 +1,8 @@
-use syn::{ext::IdentExt, Expr, Fields, ItemStruct, Result};
+use syn::{Expr, Fields, ItemStruct, Result, ext::IdentExt};
 
 use crate::ts::{
-    attr::{Attr, StructAttr},
     DerivedTS,
+    attr::{Attr, StructAttr},
 };
 
 mod r#enum;
