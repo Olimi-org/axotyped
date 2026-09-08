@@ -1118,6 +1118,24 @@ where
         self.done().group_prefixed(name, routes)
     }
 
+    /// Scoped closure-based permissive group, auto-finalizing the current route in the chain.
+    pub fn group_permissive<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    where
+        F: FnOnce(ApiRouter<S, C>) -> R,
+        R: IntoApiRouter<S, C>,
+    {
+        self.done().group_permissive(name, routes)
+    }
+
+    /// Scoped closure-based public group, auto-finalizing the current route in the chain.
+    pub fn group_public<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    where
+        F: FnOnce(ApiRouter<S, C>) -> R,
+        R: IntoApiRouter<S, C>,
+    {
+        self.done().group_public(name, routes)
+    }
+
     /// Set a URL prefix on the parent router, auto-finalizing the current route in the chain.
     pub fn set_prefix(self, prefix: &str) -> ApiRouter<S, C> {
         self.done().set_prefix(prefix)
@@ -1269,6 +1287,24 @@ where
         R: IntoApiRouter<S, C>,
     {
         self.done().group_prefixed(name, routes)
+    }
+
+    /// Scoped closure-based permissive group, auto-finalizing the current WS route in the chain.
+    pub fn group_permissive<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    where
+        F: FnOnce(ApiRouter<S, C>) -> R,
+        R: IntoApiRouter<S, C>,
+    {
+        self.done().group_permissive(name, routes)
+    }
+
+    /// Scoped closure-based public group, auto-finalizing the current WS route in the chain.
+    pub fn group_public<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    where
+        F: FnOnce(ApiRouter<S, C>) -> R,
+        R: IntoApiRouter<S, C>,
+    {
+        self.done().group_public(name, routes)
     }
 
     /// Set a URL prefix on the parent router, auto-finalizing the current WS route in the chain.

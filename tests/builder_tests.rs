@@ -547,6 +547,36 @@ fn group_permissive_marks_routes_permissive_and_does_not_leak() {
 }
 
 #[test]
+fn group_permissive_forwards_from_mid_chain_builders() {
+    async fn hook(State(_s): State<AppState>) {}
+
+    // RouteBuilder forward: chain starting with an HTTP route.
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .get("/health", hook)
+        .group_permissive("feed", |g| g.get("/feed", hook))
+        .build();
+    assert_eq!(routes.routes()[1].visibility, Visibility::Permissive);
+
+    // WsRouteBuilder forward: chain starting with a WebSocket route.
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .ws("/events", hook)
+        .group_permissive("feed", |g| g.get("/feed", hook))
+        .build();
+    assert_eq!(routes.routes()[1].visibility, Visibility::Permissive);
+}
+
+#[test]
+fn group_public_forwards_from_mid_chain_builders() {
+    async fn hook(State(_s): State<AppState>) {}
+
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .get("/health", hook)
+        .group_public("webhooks", |g| g.post("/stripe", hook))
+        .build();
+    assert_eq!(routes.routes()[1].visibility, Visibility::Public);
+}
+
+#[test]
 fn nested_group_inside_group_public_inherits_publicity() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_public("pub", |g| {
