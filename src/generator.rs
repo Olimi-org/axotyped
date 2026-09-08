@@ -3,7 +3,7 @@ use std::fmt::Write;
 use std::path::{Component, Path};
 use std::process::Command;
 
-use crate::types::{RouteCollection, RouteDefinition};
+use crate::types::{RouteCollection, RouteDefinition, Visibility};
 
 /// Shorthand for `writeln!(...).unwrap()` — writing to `String` is infallible.
 macro_rules! w {
@@ -376,7 +376,9 @@ fn push_escaped_template_text(out: &mut String, text: &str) {
 }
 
 /// Escapes text for a double-quoted JS string (control chars, separators,
-/// backticks for safe re-embed in template literals).
+/// backticks). `$` is escaped too even though `"\\$"` equals `"$"`: callers
+/// strip the quotes and re-embed the text in template literals, where a raw
+/// `$` before `{` would become a live substitution.
 pub(crate) fn escape_js_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -384,6 +386,9 @@ pub(crate) fn escape_js_string(text: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '`' => out.push_str("\\`"),
+            // Re-embed safety: this text may end up inside a template
+            // literal, so `$` must never survive unescaped.
+            '$' => out.push_str("\\$"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -411,9 +416,9 @@ fn emit_method_name(out: &mut String, name: &str) {
     }
 }
 
-/// Generates the parameter list for a route, plus a trailing per-call
-/// `opts?: RequestOptions` so callers can opt out of sane defaults
-/// (e.g. `{ allowRedirects: true }`) on that one call.
+/// Generates the parameter list for a route from its path params, body,
+/// and query types. Redirect behavior is a server-side route property, so
+/// callers take no options.
 fn generate_params(route: &RouteDefinition, large_int: &str) -> String {
     let mut params = Vec::new();
     for param in &route.path_params {
@@ -431,20 +436,31 @@ fn generate_params(route: &RouteDefinition, large_int: &str) -> String {
             rust_type_to_ts_with(query_type, large_int)
         ));
     }
-    params.push("opts?: RequestOptions".into());
     params.join(", ")
 }
 
-/// Generates the request options literal for a route. Caller `opts` spread
-/// first so per-call flags (e.g. `allowRedirects`) survive, while enforced
-/// `method`/`auth`/`body`/`query` win after it. `method` is always enforced
-/// so `opts.method` can never change the route verb.
+/// Generates the request options literal for a route. Fully
+/// generator-controlled: `method` is always emitted so no caller can change
+/// the verb, `permissive` is always pinned so a caller cannot soften a
+/// `Private` route into best-effort, and `allowRedirects` reflects the
+/// server-side `[allow_redirects]` route property.
 fn generate_request_options(route: &RouteDefinition) -> String {
-    let mut opts: Vec<String> = vec!["...opts".into()];
+    let mut opts: Vec<String> = Vec::new();
     opts.push(format!("method: \"{}\"", route.method.as_str()));
-    if route.auth {
-        opts.push("auth: true".into());
+    match route.visibility {
+        Visibility::Private => {
+            opts.push("auth: true".into());
+            opts.push("permissive: false".into());
+        }
+        Visibility::Permissive => {
+            opts.push("auth: true".into());
+            opts.push("permissive: true".into());
+        }
+        Visibility::Public => {
+            opts.push("permissive: false".into());
+        }
     }
+    opts.push(format!("allowRedirects: {}", route.allow_redirects));
     if route.body_type.is_some() {
         opts.push("body".into());
     }
@@ -546,17 +562,19 @@ fn options_interface(config: &GeneratorConfig) -> String {
 }
 
 const REQUEST_OPTIONS_TYPE: &str = "\
+/** Route call options. Fully generator-pinned per route — route methods take
+    no caller options, so these fields are never user-supplied. */
 type RequestOptions = {
   method?: string;
   body?: unknown;
   query?: Record<string, unknown>;
   auth?: boolean;
-  /** Opt out of the sane redirect-error default for legit 3xx flows.
-      Only applies to credentialless public calls (credentials omit); anything
-      carrying auth or cookies still refuses redirects. */
+  /** Attach credentials when available, never require them. */
+  permissive?: boolean;
+  /** Follow redirects only for credentialless calls to declaring routes. */
   allowRedirects?: boolean;
 };
-
+\
 /** The `request` helper produced by `createRequest`, for the routes factory. */
 type RequestFn = <T>(path: string, opts?: RequestOptions) => Promise<T>;
 ";
@@ -626,7 +644,7 @@ function createRequest(options: __OPTS__) {
     opts: RequestOptions = {},
     rawResponse?: boolean,
   ): Promise<T | Response> {
-    const { method = "GET", body, query, auth = false } = opts;
+    const { method = "GET", body, query, auth = false, permissive = false } = opts;
     let url = `${baseUrl}${path}`;
     if (query) {
       const params = new URLSearchParams();
@@ -655,36 +673,46 @@ function createRequest(options: __OPTS__) {
     assertSecureTransport(url, { allowInsecureHttp: options.allowInsecureHttp === true, auth, credentials });
 "#;
 
-/// Auth section of the request helper for [`AuthScheme::Bearer`]: an
-/// authenticated route aborts unless a token source is configured **and**
-/// resolves — an unauthenticated request is never sent.
+/// Auth section of the request helper for [`AuthScheme::Bearer`]: a `Private`
+/// route aborts unless a token source is configured **and** resolves — an
+/// unauthenticated request is never sent. A `Permissive` route attaches the
+/// token when one resolves and otherwise sends anonymously.
 const REQUEST_AUTH_BEARER: &str = r#"
-    // An [auth] route requires a token: without one configured or returned,
-    // the request is aborted rather than sent unauthenticated.
+    // A [permissive] route attaches credentials when available but never
+    // fails for want of them; any other [auth] route requires a token.
     if (auth) {
-      if (!options.getToken) {
-        throw new Error(
-          `Route declared [auth] but options.getToken was not configured (${method} ${path})`,
-        );
+      if (permissive) {
+        if (options.getToken) {
+          const token = await options.getToken();
+          if (token) headers.Authorization = `Bearer ${token}`;
+        }
+      } else {
+        if (!options.getToken) {
+          throw new Error(
+            `Route declared [auth] but options.getToken was not configured (${method} ${path})`,
+          );
+        }
+        const token = await options.getToken();
+        if (!token) {
+          throw new Error(
+            `options.getToken() returned no token for an [auth] route (${method} ${path})`,
+          );
+        }
+        headers.Authorization = `Bearer ${token}`;
       }
-      const token = await options.getToken();
-      if (!token) {
-        throw new Error(
-          `options.getToken() returned no token for an [auth] route (${method} ${path})`,
-        );
-      }
-      headers.Authorization = `Bearer ${token}`;
     }
 "#;
 
 /// Auth section of the request helper for [`AuthScheme::Cookie`]: browsers
 /// attach session cookies automatically, so the only way an authenticated
 /// route can go out unauthenticated is a consumer explicitly stripping them.
+/// `Permissive` routes skip the refusal — anonymous (`omit`) is a valid
+/// outcome for them.
 const REQUEST_AUTH_COOKIE: &str = r#"
     // An [auth] route rides the browser's session cookies; refuse consumer
     // configurations that would strip them instead of sending the request
     // unauthenticated.
-    if (auth && (options.credentials ?? "__CREDS__") === "omit") {
+    if (auth && !permissive && (options.credentials ?? "__CREDS__") === "omit") {
       throw new Error(
         `Route declared [auth] but options.credentials is "omit"; refusing to send an unauthenticated request (${method} ${path})`,
       );
@@ -703,9 +731,9 @@ const REQUEST_CSRF_BLOCK: &str = r#"
 "#;
 
 const REQUEST_HELPER_POST: &str = r#"
-    // Only credentialless public calls with `{ allowRedirects: true }` follow
-    // redirects; anything carrying auth or cookies refuses, since the guard
-    // sees only the initial URL and a 3xx could bounce to http://.
+    // Only credentialless calls to routes declaring `[allow_redirects]`
+    // follow redirects; anything carrying auth or cookies refuses, since the
+    // guard sees only the initial URL and a 3xx could bounce to http://.
     const canFollowRedirects =
       !auth && credentials === "omit" && opts.allowRedirects === true;
     const response = await boundFetch(url, {
@@ -801,21 +829,28 @@ pub fn generate(routes: &RouteCollection, config: &GeneratorConfig) -> String {
 
 /// Generates client source plus diagnostics for routes whose metadata
 /// the client cannot honor: public-declared behind an auth layer,
-/// authenticated routes with `AuthScheme::None`, or `[ws][auth]` Bearer
-/// routes without `ws_ticket_path`. No diagnostic for Cookie WS routes.
+/// `Private` routes with `AuthScheme::None`, or `Private` `[ws][auth]` Bearer
+/// routes without `ws_ticket_path`. `Permissive` routes degrade gracefully
+/// (anonymous is a valid outcome) and never warn. No diagnostic for Cookie
+/// WS routes.
 pub fn generate_with_warnings(
     routes: &RouteCollection,
     config: &GeneratorConfig,
 ) -> (String, Vec<String>) {
     let mut warnings = Vec::new();
-    for route in routes.iter().filter(|r| r.auth) {
-        if route.declared_public {
+    for route in routes.iter().filter(|r| r.is_credentialed()) {
+        if route.declared == Visibility::Public {
             warnings.push(format!(
                 "route '{}': declared public but sits behind an auth layer; the generated \
                  client requires credentials for it. If the middleware is not user \
                  authentication, register it with `.layer()` instead of `.auth_layer()`.",
                 route.name
             ));
+            continue;
+        }
+        // Permissive routes work anonymously, so nothing to report — except
+        // the WS credential pathway below, which they share with public.
+        if route.is_permissive() {
             continue;
         }
         match config.auth_scheme {
@@ -878,8 +913,8 @@ fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String
     }
 
     // Re-export all types from the bindings barrel so consumers can
-    // import any generated type (including transitive deps like DialogLine)
-    // directly from "@tutor-api".
+    // import any generated type (including transitive deps) directly from
+    // the generated package. Requires TypeScript 5.0+ (`export type *`).
     w!(out, "export type * from \"{import_prefix}\";");
 
     // Static blocks via template substitution
@@ -1048,11 +1083,9 @@ fn generate_route_method(
             .unwrap_or_else(|| "void".into());
         let opts = generate_request_options(route);
 
-        let has_real_params =
-            !route.path_params.is_empty() || route.body_type.is_some() || route.query_type.is_some();
-        if !has_real_params {
+        if params.is_empty() {
             emit_method_name(out, name);
-            write!(out, ": (opts?: RequestOptions) => request<{return_type}>({path_template}{opts})").unwrap();
+            write!(out, ": () => request<{return_type}>({path_template}{opts})").unwrap();
         } else {
             let pad = " ".repeat(indent + 2);
             emit_method_name(out, name);
@@ -1142,10 +1175,12 @@ fn generate_ws_method(
     let pad2 = " ".repeat(indent + 2);
     let pad4 = " ".repeat(indent + 4);
 
-    // Ticket-handshake mode applies to [auth] routes under the Bearer scheme
-    // when configured. Under Cookie, browsers attach session cookies to
-    // same-origin WS upgrades natively — no handshake needed.
-    let ticket_mode = if route.auth && config.auth_scheme == AuthScheme::Bearer {
+    // Ticket-handshake mode applies to `Private` routes under the Bearer
+    // scheme when configured. `Permissive` routes skip it (anonymous must
+    // work). Under Cookie, browsers attach session cookies to same-origin
+    // WS upgrades natively — no handshake needed.
+    let ticket_mode =
+        if route.visibility == Visibility::Private && config.auth_scheme == AuthScheme::Bearer {
         config.ws_ticket_path.as_ref()
     } else {
         None
@@ -1243,10 +1278,11 @@ fn generate_ws_method(
         );
     }
 
-    // Cookie `[ws][auth]` rides same-origin session cookies natively — the
+    // Cookie `Private` routes ride same-origin session cookies natively — the
     // WebSocket API has no credentials option, so `"omit"` would silently
     // send the upgrade unauthenticated. Refuse like the fetch path does.
-    if config.auth_scheme == AuthScheme::Cookie && route.auth {
+    // `Permissive` routes allow anonymous upgrades.
+    if config.auth_scheme == AuthScheme::Cookie && route.visibility == Visibility::Private {
         w!(
             out,
             "{pad2}if ((options.credentials ?? \"{}\") === \"omit\") {{",
@@ -1267,7 +1303,7 @@ fn generate_ws_method(
         w!(
             out,
             "{pad2}assertSecureTransport(url, {{ allowInsecureHttp: options.allowInsecureHttp === true, auth: {}, credentials: options.credentials ?? \"{}\" }});",
-            route.auth,
+            route.is_credentialed(),
             escape_js_string(&config.default_credentials)
         );
         w!(out, "{pad2}const ws = new WebSocket(url);");
@@ -1279,7 +1315,7 @@ fn generate_ws_method(
         w!(
             out,
             "{pad2}assertSecureTransport(url, {{ allowInsecureHttp: options.allowInsecureHttp === true, auth: {}, credentials: options.credentials ?? \"{}\" }});",
-            route.auth,
+            route.is_credentialed(),
             escape_js_string(&config.default_credentials)
         );
         w!(out, "{pad2}return new WebSocket(url);");
@@ -1520,6 +1556,15 @@ mod tests {
         );
         // Double-quoted branch escapes quotes/backslashes:
         assert_eq!(build_path_template("/a\"b"), "\"/a\\\"b\"");
+    }
+
+    #[test]
+    fn test_build_path_template_escapes_dollar_without_params() {
+        // Brace-free paths take the double-quoted branch, whose output is
+        // re-embedded in template literals after stripping the quotes — so
+        // `$` must be escaped even with no `{` in sight (`"\$"` equals `"$"`).
+        assert_eq!(build_path_template("/x$evil"), "\"/x\\$evil\"");
+        assert_eq!(build_path_template("/price$"), "\"/price\\$\"");
     }
 
     #[test]

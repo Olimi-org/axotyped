@@ -1,6 +1,6 @@
 use axotyped::{
-    AuthScheme, GeneratorConfig, HttpMethod, RouteCollection, RouteDefinition, api_routes,
-    generate, generate_with_warnings,
+    AuthScheme, GeneratorConfig, HttpMethod, RouteCollection, RouteDefinition, Visibility,
+    api_routes, generate, generate_with_warnings,
 };
 
 fn yauth_config() -> GeneratorConfig {
@@ -34,11 +34,11 @@ fn sample_routes() -> axotyped::RouteCollection {
     let ep = api_routes! {
         @group emailPassword
 
-        register: POST "/register"
+        register: POST "/register" [public]
             body: RegisterRequest -> MessageResponse;
-        login: POST "/login"
+        login: POST "/login" [public]
             body: LoginRequest -> LoginResponse;
-        verify: POST "/verify-email"
+        verify: POST "/verify-email" [public]
             body: VerifyEmailRequest -> MessageResponse;
         changePassword: POST "/change-password" [auth]
             body: ChangePasswordRequest -> MessageResponse;
@@ -63,7 +63,7 @@ fn sample_routes() -> axotyped::RouteCollection {
 
         authorize: GET "/oauth/{provider}/authorize" [redirect]
             query: AuthorizeQuery;
-        callback: POST "/oauth/{provider}/callback"
+        callback: POST "/oauth/{provider}/callback" [public]
             body: CallbackBody -> AuthResponse;
     };
     routes.extend(oauth);
@@ -160,9 +160,9 @@ fn generates_ungrouped_routes() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Top-level routes (not in a group) — per-call opts threaded through, method always enforced
-    assert!(output.contains("getSession: (opts?: RequestOptions) => request<SessionResponse>(\"/session\", { ...opts, method: \"GET\", auth: true })"));
-    assert!(output.contains("logout: (opts?: RequestOptions) => request<SuccessResponse>(\"/logout\", { ...opts, method: \"POST\", auth: true })"));
+    // Top-level routes — fully generator-controlled options, method always enforced
+    assert!(output.contains("getSession: () => request<SessionResponse>(\"/session\", { method: \"GET\", auth: true, permissive: false, allowRedirects: false })"));
+    assert!(output.contains("logout: () => request<SuccessResponse>(\"/logout\", { method: \"POST\", auth: true, permissive: false, allowRedirects: false })"));
 }
 
 #[test]
@@ -176,9 +176,9 @@ fn generates_grouped_routes() {
     assert!(output.contains("\"admin\": {"));
     assert!(output.contains("\"oauth\": {"));
 
-    // Group methods — per-call opts last
-    assert!(output.contains("register: (body: RegisterRequest, opts?: RequestOptions)"));
-    assert!(output.contains("login: (body: LoginRequest, opts?: RequestOptions)"));
+    // Group methods take only their declared params
+    assert!(output.contains("register: (body: RegisterRequest)"));
+    assert!(output.contains("login: (body: LoginRequest)"));
 }
 
 #[test]
@@ -188,11 +188,11 @@ fn generates_path_params() {
     let output = generate(&routes, &config);
 
     // Path params become function args and encoded template literals
-    assert!(output.contains("getUser: (id: string, opts?: RequestOptions)"));
+    assert!(output.contains("getUser: (id: string)"));
     assert!(output.contains("`/admin/users/${encodeURIComponent(id)}`"));
-    assert!(output.contains("banUser: (id: string, body: BanRequest, opts?: RequestOptions)"));
-    // Per-call opts spread first so allowRedirects survives, method always enforced
-    assert!(output.contains("{ ...opts, method: \"GET\", auth: true }"));
+    assert!(output.contains("banUser: (id: string, body: BanRequest)"));
+    // Options pinned by the generator, no caller spread
+    assert!(output.contains("{ method: \"GET\", auth: true, permissive: false, allowRedirects: false }"));
 }
 
 #[test]
@@ -201,8 +201,8 @@ fn generates_query_params() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Query params + per-call opts
-    assert!(output.contains("listUsers: (query?: ListUsersQuery, opts?: RequestOptions)"));
+    // Query params only
+    assert!(output.contains("listUsers: (query?: ListUsersQuery)"));
     assert!(output.contains("query"));
 }
 
@@ -243,7 +243,7 @@ fn generates_void_return_for_no_response() {
     let output = generate(&routes, &config);
 
     // deleteUser has no response type (8 spaces indent: 6 base + 2 continuation)
-    assert!(output.contains("deleteUser: (id: string, opts?: RequestOptions) =>\n        request<void>"));
+    assert!(output.contains("deleteUser: (id: string) =>\n        request<void>"));
 }
 
 #[test]
@@ -260,21 +260,52 @@ fn generates_request_helper() {
 }
 
 #[test]
-fn redirect_defaults_to_error_with_allow_redirects_opt_out() {
+fn redirect_defaults_to_error_with_server_side_opt_in() {
     let routes = sample_routes();
     let output = generate(&routes, &yauth_config());
 
     // Sane default: refuse redirects so 3xx can't bounce creds elsewhere.
-    // Only credentialless public calls may opt out; auth or cookies force error.
-    assert!(output.contains("allowRedirects?: boolean"));
+    // Only credentialless calls to routes declaring `[allow_redirects]` follow.
     assert!(output.contains("const canFollowRedirects ="));
     assert!(output.contains("!auth && credentials === \"omit\" && opts.allowRedirects === true"));
     assert!(output.contains("redirect: canFollowRedirects ? \"follow\" : \"error\""));
+    // Default routes pin the flag off.
+    assert!(output.contains("allowRedirects: false"));
     // Authenticated requests also bypass browser cache; auth defaults false.
     assert!(output.contains("cache: \"no-store\""));
     assert!(output.contains("auth = false"));
     // Cookies count as credentials, not just auth:true.
     assert!(output.contains("credentials !== \"omit\""));
+}
+
+#[test]
+fn allow_redirects_flag_is_server_declared() {
+    let routes = api_routes! {
+        hook: POST "/hook" [public, allow_redirects] body: HookBody -> SuccessResponse;
+        plain: GET "/plain" [public];
+    };
+    assert!(routes.routes()[0].allow_redirects, "flag must set the route property");
+    assert!(!routes.routes()[1].allow_redirects, "default must refuse");
+
+    let output = generate(&routes, &yauth_config());
+    let lines: Vec<&str> = output.lines().collect();
+    let hook_idx = lines
+        .iter()
+        .position(|l| l.contains("hook:"))
+        .expect("hook method should be emitted");
+    let hook_call = format!("{}\n{}", lines[hook_idx], lines[hook_idx + 1]);
+    assert!(
+        hook_call.contains("allowRedirects: true"),
+        "declared route must bake follow in: {hook_call:?}"
+    );
+    let plain_line = output
+        .lines()
+        .find(|l| l.contains("plain:"))
+        .expect("plain method should be emitted");
+    assert!(
+        plain_line.contains("allowRedirects: false"),
+        "default route must refuse: {plain_line:?}"
+    );
 }
 
 #[test]
@@ -288,6 +319,98 @@ fn public_cookie_route_with_insecure_http_requires_omit() {
     let output = generate(&routes, &config);
     // Guard must see the effective credential mode, not just auth.
     assert!(output.contains("assertSecureTransport(url, { allowInsecureHttp: options.allowInsecureHttp === true, auth, credentials })"));
+}
+
+#[test]
+fn route_options_carry_no_caller_spread() {
+    let routes = sample_routes();
+    let output = generate(&routes, &yauth_config());
+
+    // Route calls are fully generator-controlled: no `...opts` spread, so
+    // neither `permissive` nor `allowRedirects` is runtime-flippable…
+    for line in output.lines().filter(|l| l.contains("request<")) {
+        assert!(
+            !line.contains("...opts"),
+            "route call must not spread caller opts: {line:?}"
+        );
+    }
+    // …route methods take no options argument at all (helper overloads
+    // excluded: only `=>` route definitions are caller-reachable)…
+    for line in output
+        .lines()
+        .filter(|l| l.contains("request<") && l.contains("=>"))
+    {
+        assert!(
+            !line.contains("opts?:"),
+            "route method must not accept caller opts: {line:?}"
+        );
+    }
+    // …and the single option type documents the fields as generator-pinned.
+    assert!(
+        output.contains("never user-supplied"),
+        "option type must document generator pinning"
+    );
+    assert!(
+        !output.contains("InternalRequestOptions"),
+        "no split internal type should remain"
+    );
+}
+
+#[test]
+fn permissive_flag_marks_route_best_effort_but_credentialed() {
+    let routes = api_routes! {
+        feed: GET "/feed" [permissive] -> FeedResponse;
+        open: GET "/health" [public];
+    };
+    let feed = &routes.routes()[0];
+    assert_eq!(feed.visibility, Visibility::Permissive);
+    assert_eq!(feed.declared, Visibility::Permissive);
+    assert!(feed.is_credentialed(), "permissive stays credentialed for guard/cache");
+
+    let output = generate(&routes, &yauth_config());
+    // Per-route opts carry both flags; auth keeps guard/cache/redirect treatment.
+    assert!(output.contains("permissive: true"));
+    assert!(output.contains("feed: () =>"));
+    // Bearer best-effort branch attaches when available, never throws.
+    assert!(output.contains("if (permissive)"));
+    // Public routes carry no auth flag but still pin permissive:false.
+    let open_line = output
+        .lines()
+        .find(|l| l.contains("open:"))
+        .expect("open method should be emitted");
+    assert!(
+        !open_line.contains("auth: true") && open_line.contains("permissive: false"),
+        "public route must pin permissive:false without auth: {open_line:?}"
+    );
+}
+
+#[test]
+fn permissive_cookie_route_skips_omit_refusal() {
+    let routes = api_routes! {
+        feed: GET "/feed" [permissive] -> FeedResponse;
+    };
+    let mut config = yauth_config();
+    config.auth_scheme = AuthScheme::Cookie;
+    let output = generate(&routes, &config);
+    // Anonymous (`omit`) is a valid outcome for permissive: the refusal is
+    // gated on `!permissive`.
+    assert!(
+        output.contains("if (auth && !permissive"),
+        "omit refusal must skip permissive routes, got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn permissive_route_produces_no_warnings() {
+    let routes = api_routes! {
+        feed: GET "/feed" [permissive] -> FeedResponse;
+    };
+    // Under None the route degrades to anonymous — functional, nothing to report.
+    let mut none = yauth_config();
+    none.auth_scheme = AuthScheme::None;
+    let (_, warnings) = generate_with_warnings(&routes, &none);
+    assert!(warnings.is_empty(), "permissive must not warn: {warnings:?}");
 }
 
 #[test]
@@ -714,18 +837,24 @@ fn none_scheme_generates_no_auth_machinery_and_warns_on_auth_routes() {
 // Server-derived auth metadata (declared-public contradiction)
 // ===========================================================================
 
-fn manual_route(name: &str, path: &str, auth: bool, declared_public: bool) -> RouteDefinition {
+fn manual_route(
+    name: &str,
+    path: &str,
+    visibility: axotyped::Visibility,
+    declared: axotyped::Visibility,
+) -> RouteDefinition {
     RouteDefinition {
         name: name.into(),
         method: HttpMethod::Get,
         path: path.into(),
-        auth,
-        declared_public,
+        visibility,
+        declared,
         body_type: None,
         response_type: None,
         query_type: None,
         path_params: axotyped::extract_path_params(path),
         group: None,
+        allow_redirects: false,
         redirect: false,
         websocket: false,
         ws_send_type: None,
@@ -736,8 +865,18 @@ fn manual_route(name: &str, path: &str, auth: bool, declared_public: bool) -> Ro
 #[test]
 fn public_declared_but_protected_route_produces_contradiction_warning() {
     let mut routes = RouteCollection::new();
-    routes.push(manual_route("hook", "/webhooks/hook", true, true));
-    routes.push(manual_route("admin", "/admin/users", true, false));
+    routes.push(manual_route(
+        "hook",
+        "/webhooks/hook",
+        axotyped::Visibility::Private,
+        axotyped::Visibility::Public,
+    ));
+    routes.push(manual_route(
+        "admin",
+        "/admin/users",
+        axotyped::Visibility::Private,
+        axotyped::Visibility::Private,
+    ));
 
     let (_, warnings) = generate_with_warnings(&routes, &yauth_config());
 
@@ -756,8 +895,18 @@ fn public_declared_but_protected_route_produces_contradiction_warning() {
 #[test]
 fn consistently_public_or_protected_routes_never_warn_about_layering() {
     let mut routes = RouteCollection::new();
-    routes.push(manual_route("open", "/health", false, true));
-    routes.push(manual_route("gated", "/me", true, false));
+    routes.push(manual_route(
+        "open",
+        "/health",
+        axotyped::Visibility::Public,
+        axotyped::Visibility::Public,
+    ));
+    routes.push(manual_route(
+        "gated",
+        "/me",
+        axotyped::Visibility::Private,
+        axotyped::Visibility::Private,
+    ));
 
     let (_, warnings) = generate_with_warnings(&routes, &yauth_config());
     assert!(

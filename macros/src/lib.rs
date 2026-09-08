@@ -31,9 +31,10 @@ use syn::{FnArg, ItemFn, PathArguments, ReturnType, Type, parse_macro_input};
 /// # Visibility
 ///
 /// Routes require authentication unless declared public. Use
-/// `#[endpoint(public)]` to mark an individual handler's route public (the
-/// scope-wide alternative is [`ApiRouter::group_public`] / `group_public` on
-/// the builder).
+/// `#[endpoint(public)]` to mark an individual handler's route public, or
+/// `#[endpoint(permissive)]` for best-effort credentials that never fail
+/// without them (the scope-wide alternatives are [`ApiRouter::group_public`]
+/// / `group_permissive` on the builder).
 ///
 /// # Extracted types
 ///
@@ -46,22 +47,37 @@ use syn::{FnArg, ItemFn, PathArguments, ReturnType, Type, parse_macro_input};
 pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
 
-    // Options: `#[endpoint]` or `#[endpoint(public)]` — anything else is a
-    // compile error so typos can never silently flip visibility.
+    // Options: `#[endpoint]`, a visibility (`public` | `permissive`), and/or
+    // the `allow_redirects` route property — e.g. `#[endpoint(public)]` or
+    // `#[endpoint(public, allow_redirects)]`. Anything else is a compile
+    // error so typos can never silently flip visibility.
     let mut is_public = false;
-    let attr_tts: Vec<proc_macro::TokenTree> = attr.into_iter().collect();
-    match attr_tts.as_slice() {
-        [] => {}
-        [proc_macro::TokenTree::Ident(id)] if id.to_string() == "public" => is_public = true,
-        _ => {
-            return quote! {
-                compile_error!(
-                    "axotyped: #[endpoint] accepts no arguments or exactly `public` \
-                     — e.g. #[endpoint(public)]"
-                );
+    let mut is_permissive = false;
+    let mut allow_redirects = false;
+    let mut expect_ident = true;
+    let mut any_token = false;
+    for tt in attr {
+        any_token = true;
+        match tt {
+            proc_macro::TokenTree::Ident(id) if expect_ident => {
+                match id.to_string().as_str() {
+                    "public" if !is_public && !is_permissive => is_public = true,
+                    "permissive" if !is_public && !is_permissive => is_permissive = true,
+                    "allow_redirects" if !allow_redirects => allow_redirects = true,
+                    _ => return endpoint_attr_error(),
+                }
+                expect_ident = false;
             }
-            .into();
+            proc_macro::TokenTree::Punct(p)
+                if p.as_char() == ',' && !expect_ident =>
+            {
+                expect_ident = true
+            }
+            _ => return endpoint_attr_error(),
         }
+    }
+    if expect_ident && any_token {
+        return endpoint_attr_error();
     }
 
     let fn_name = &item_fn.sig.ident;
@@ -107,11 +123,25 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! {},
     };
 
-    // Only `#[endpoint(public)]` opens a route. The declaration is recorded
-    // separately from the effective `auth` flag so an auth layer in scope can
-    // override it back on (server enforcement is the ground truth).
+    // Visibility declarations record both the declared and (for now)
+    // effective state; an auth layer in scope later forces effective back to
+    // `Private` (server enforcement is the ground truth). Redirect-following
+    // is likewise declared here, never caller-supplied.
     let visibility_stmt = if is_public {
-        quote! { __def.declared_public = true; __def.auth = false; }
+        quote! {
+            __def.declared = ::axotyped::Visibility::Public;
+            __def.visibility = ::axotyped::Visibility::Public;
+        }
+    } else if is_permissive {
+        quote! {
+            __def.declared = ::axotyped::Visibility::Permissive;
+            __def.visibility = ::axotyped::Visibility::Permissive;
+        }
+    } else {
+        quote! {}
+    };
+    let redirects_stmt = if allow_redirects {
+        quote! { __def.allow_redirects = true; }
     } else {
         quote! {}
     };
@@ -130,11 +160,22 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #query_register
                 #response_register
                 #visibility_stmt
+                #redirects_stmt
             }
         }
     };
 
     TokenStream::from(expanded)
+}
+
+fn endpoint_attr_error() -> TokenStream {
+    quote! {
+        compile_error!(
+            "axotyped: #[endpoint] accepts at most a visibility (`public` | `permissive`) \
+             and `allow_redirects` — e.g. #[endpoint(public, allow_redirects)]"
+        );
+    }
+    .into()
 }
 
 // ---------------------------------------------------------------------------

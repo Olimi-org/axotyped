@@ -1,4 +1,4 @@
-use axotyped::{ApiRouter, HttpMethod, IntoApiRouter};
+use axotyped::{ApiRouter, HttpMethod, IntoApiRouter, Visibility};
 use axum::extract::{Json, Path, State};
 use serde::Deserialize;
 
@@ -96,7 +96,7 @@ fn json_shorthand() {
     let r = &routes.routes()[0];
     assert_eq!(r.name, "createUser");
     assert_eq!(r.method, HttpMethod::Post);
-    assert!(r.auth);
+    assert!(r.is_credentialed());
     assert!(r.body_type.as_ref().unwrap().contains("CreateUserRequest"));
     assert!(r.response_type.as_ref().unwrap().contains("UserResponse"));
 }
@@ -228,7 +228,7 @@ fn builder_redirect() {
     let r = &routes.routes()[0];
     assert!(r.redirect);
     // deny-by-default: redirect routes are private too (open-redirect hardening)
-    assert!(r.auth);
+    assert!(r.is_credentialed());
     assert_eq!(r.path_params[0].name, "provider");
     assert_eq!(r.name, "authorize");
 }
@@ -269,7 +269,7 @@ fn builder_websocket_typed() {
     assert!(r.websocket);
     assert!(!r.redirect);
     // deny-by-default: WS routes are private by default
-    assert!(r.auth);
+    assert!(r.is_credentialed());
     assert!(r.query_type.as_ref().unwrap().contains("WsParams"));
     assert!(r.ws_send_type.as_ref().unwrap().contains("ClientEvent"));
     assert!(r.ws_receive_type.as_ref().unwrap().contains("ServerEvent"));
@@ -328,7 +328,7 @@ fn builder_websocket_with_auth() {
 
     let r = &routes.routes()[0];
     assert!(r.websocket);
-    assert!(r.auth);
+    assert!(r.is_credentialed());
 }
 
 #[test]
@@ -426,11 +426,11 @@ fn group_prefixed_private_by_default() {
         .build();
 
     assert!(
-        routes.routes()[0].auth,
+        routes.routes()[0].is_credentialed(),
         "deny-by-default: GET routes are private without any annotation"
     );
     assert!(
-        routes.routes()[1].auth,
+        routes.routes()[1].is_credentialed(),
         "deny-by-default: POST routes are private without any annotation"
     );
 }
@@ -461,13 +461,13 @@ fn group_prefixed_does_not_leak_state() {
     let admin_route = &routes.routes()[0];
     assert_eq!(admin_route.path, "/admin/users/{id}");
     assert_eq!(admin_route.group.as_deref(), Some("admin"));
-    assert!(admin_route.auth);
+    assert!(admin_route.is_credentialed());
 
     let health_route = &routes.routes()[1];
     assert_eq!(health_route.path, "/health");
     assert_eq!(health_route.group, None);
     // deny-by-default: no scope means private, same as inside the group
-    assert!(health_route.auth);
+    assert!(health_route.is_credentialed());
 }
 
 // ---------------------------------------------------------------------------
@@ -488,7 +488,7 @@ fn routes_are_private_by_default() {
         .build();
 
     for r in routes.routes() {
-        assert!(r.auth, "route '{}' must be private by default", r.name);
+        assert!(r.is_credentialed(), "route '{}' must be private by default", r.name);
     }
 }
 
@@ -506,11 +506,11 @@ fn group_public_marks_routes_public_and_does_not_leak() {
         .build();
 
     assert!(
-        !routes.routes()[0].auth,
+        !routes.routes()[0].is_credentialed(),
         "group_public route must be public"
     );
     assert!(
-        !routes.routes()[1].auth,
+        !routes.routes()[1].is_credentialed(),
         "group_public route must be public"
     );
     assert_eq!(routes.routes()[0].path, "/webhooks/stripe");
@@ -518,8 +518,31 @@ fn group_public_marks_routes_public_and_does_not_leak() {
 
     // public scope must not leak into sibling scopes
     assert!(
-        routes.routes()[2].auth,
+        routes.routes()[2].is_credentialed(),
         "routes after a group_public are private again"
+    );
+}
+
+#[test]
+fn group_permissive_marks_routes_permissive_and_does_not_leak() {
+    async fn hook(State(_s): State<AppState>) {}
+
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .group_permissive("feed", |g| {
+            g.get("/feed", hook).get("/trending", hook)
+        })
+        .delete("/users/{id}", delete_user)
+        .build();
+
+    for r in &routes.routes()[..2] {
+        assert_eq!(r.visibility, Visibility::Permissive);
+        assert_eq!(r.declared, Visibility::Permissive);
+        assert!(r.is_credentialed(), "permissive stays credentialed");
+    }
+    assert_eq!(
+        routes.routes()[2].visibility,
+        Visibility::Private,
+        "routes after a group_permissive are private again"
     );
 }
 
@@ -535,7 +558,7 @@ fn nested_group_inside_group_public_inherits_publicity() {
     assert_eq!(r.path, "/deep/res");
     // group names overwrite (not nest), consistent with `group`/`group_prefixed`
     assert_eq!(r.group.as_deref(), Some("deep"));
-    assert!(!r.auth, "nested groups inherit the public scope");
+    assert!(!r.is_credentialed(), "nested groups inherit the public scope");
 }
 
 #[test]
@@ -552,7 +575,7 @@ fn group_prefixed_multiple_methods() {
 
     assert_eq!(routes.len(), 3);
     for r in routes.routes() {
-        assert!(r.auth, "all routes should have auth");
+        assert!(r.is_credentialed(), "all routes should have auth");
         assert!(
             r.path.starts_with("/admin/"),
             "path should have prefix: got {}",
@@ -598,7 +621,7 @@ fn set_prefix_without_group_with() {
 
     let r = &routes.routes()[0];
     assert_eq!(r.path, "/api/v1/users");
-    assert!(r.auth);
+    assert!(r.is_credentialed());
 }
 
 #[test]
@@ -643,17 +666,17 @@ fn auth_layer_derives_auth_metadata_inside_public_scope() {
 
     let open = routes.routes().iter().find(|r| r.path == "/open").unwrap();
     let gated = routes.routes().iter().find(|r| r.path == "/gated").unwrap();
-    assert!(!open.auth, "route before the auth layer stays public");
+    assert!(!open.is_credentialed(), "route before the auth layer stays public");
     assert!(
-        open.declared_public,
+        open.declared == Visibility::Public,
         "public-scope membership is itself the declaration"
     );
     assert!(
-        gated.auth,
+        gated.is_credentialed(),
         "auth layer derives authenticated metadata for subsequent routes"
     );
     assert!(
-        gated.declared_public,
+        gated.declared == Visibility::Public,
         "the scope's public declaration is preserved so generation can flag the contradiction"
     );
 }
@@ -669,11 +692,11 @@ fn auth_layer_overrides_public_declarations_and_records_contradiction() {
 
     let r = &routes.routes()[0];
     assert!(
-        r.auth,
+        r.is_credentialed(),
         "server enforcement wins: protected route is authenticated"
     );
     assert!(
-        r.declared_public,
+        r.declared == Visibility::Public,
         "the public declaration is preserved so generation can flag it"
     );
 }
@@ -700,8 +723,8 @@ fn auth_layer_does_not_leak_to_sibling_scopes() {
         .iter()
         .find(|r| r.path == "/other/sibling")
         .unwrap();
-    assert!(inner.auth);
-    assert!(!sibling.auth, "protection must not leak to sibling scopes");
+    assert!(inner.is_credentialed());
+    assert!(!sibling.is_credentialed(), "protection must not leak to sibling scopes");
 }
 
 #[test]
@@ -715,7 +738,7 @@ fn auth_layer_inherits_into_nested_groups() {
 
     let r = &routes.routes()[0];
     assert_eq!(r.path, "/v1/admin/users");
-    assert!(r.auth, "nested groups inherit the protected scope");
+    assert!(r.is_credentialed(), "nested groups inherit the protected scope");
 }
 
 #[test]
@@ -729,11 +752,11 @@ fn plain_layer_leaves_auth_metadata_untouched() {
 
     let r = &routes.routes()[0];
     assert!(
-        !r.auth,
+        !r.is_credentialed(),
         ".layer() is a transport concern, not authentication"
     );
     assert!(
-        r.declared_public,
+        r.declared == Visibility::Public,
         "public-scope membership is preserved regardless of plain layering"
     );
 }

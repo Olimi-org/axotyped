@@ -2,7 +2,8 @@
 //! allocation, reserved-word rejection, and method-name emission.
 
 use axotyped::{
-    GeneratorConfig, HttpMethod, RouteCollection, RouteDefinition, extract_path_params, generate,
+    GeneratorConfig, HttpMethod, RouteCollection, RouteDefinition, Visibility, extract_path_params,
+    generate,
 };
 
 fn route(name: &str, path: &str) -> RouteDefinition {
@@ -10,13 +11,14 @@ fn route(name: &str, path: &str) -> RouteDefinition {
         name: name.into(),
         method: HttpMethod::Get,
         path: path.into(),
-        auth: false,
-        declared_public: false,
+        visibility: Visibility::Public,
+        declared: Visibility::Public,
         body_type: None,
         response_type: None,
         query_type: None,
         path_params: extract_path_params(path),
         group: None,
+        allow_redirects: false,
         redirect: false,
         websocket: false,
         ws_send_type: None,
@@ -100,7 +102,7 @@ fn non_identifier_method_names_are_emitted_as_quoted_keys() {
     );
     assert!(
         line.trim_end()
-            .ends_with("\": (opts?: RequestOptions) => request<void>(\"/ok\", { ...opts, method: \"GET\" }),"),
+            .ends_with("\": () => request<void>(\"/ok\", { method: \"GET\", permissive: false, allowRedirects: false }),"),
         "the emitted key must terminate exactly at its own closing quote"
     );
 }
@@ -112,5 +114,5 @@ fn identifier_method_names_stay_bare() {
     let mut routes = RouteCollection::new();
     routes.push(route("listUsers", "/users"));
     let out = generate(&routes, &GeneratorConfig::default());
-    assert!(out.contains("listUsers: (opts?: RequestOptions) =>"));
+    assert!(out.contains("listUsers: () =>"));
 }

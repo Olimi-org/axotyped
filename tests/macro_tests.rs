@@ -11,7 +11,7 @@ fn simple_get_route() {
     assert_eq!(r.name, "getSession");
     assert_eq!(r.method, HttpMethod::Get);
     assert_eq!(r.path, "/session");
-    assert!(r.auth);
+    assert!(r.is_credentialed());
     assert_eq!(r.response_type.as_deref(), Some("SessionResponse"));
     assert!(r.body_type.is_none());
     assert!(r.query_type.is_none());
@@ -29,7 +29,7 @@ fn post_with_body_and_response() {
     let r = &routes.routes()[0];
     assert_eq!(r.name, "register");
     assert_eq!(r.method, HttpMethod::Post);
-    assert!(r.auth, "deny-by-default");
+    assert!(r.is_credentialed(), "deny-by-default");
     assert_eq!(r.body_type.as_deref(), Some("RegisterRequest"));
     assert_eq!(r.response_type.as_deref(), Some("MessageResponse"));
 }
@@ -69,7 +69,7 @@ fn route_with_query_params() {
     let r = &routes.routes()[0];
     assert_eq!(r.query_type.as_deref(), Some("ListUsersQuery"));
     assert_eq!(r.response_type.as_deref(), Some("ListUsersResponse"));
-    assert!(r.auth);
+    assert!(r.is_credentialed());
 }
 
 #[test]
@@ -80,7 +80,7 @@ fn redirect_route() {
     };
     let r = &routes.routes()[0];
     assert!(r.redirect);
-    assert!(r.auth, "deny-by-default");
+    assert!(r.is_credentialed(), "deny-by-default");
     assert_eq!(r.path_params.len(), 1);
     assert_eq!(r.path_params[0].name, "provider");
     assert_eq!(r.query_type.as_deref(), Some("AuthorizeQuery"));
@@ -97,7 +97,7 @@ fn websocket_route() {
     let r = &routes.routes()[0];
     assert!(r.websocket);
     assert!(!r.redirect);
-    assert!(r.auth, "deny-by-default");
+    assert!(r.is_credentialed(), "deny-by-default");
     assert_eq!(r.query_type.as_deref(), Some("WsParams"));
     assert_eq!(r.ws_send_type.as_deref(), Some("ClientEvent"));
     assert_eq!(r.ws_receive_type.as_deref(), Some("ServerEvent"));
@@ -113,7 +113,7 @@ fn websocket_with_auth() {
     };
     let r = &routes.routes()[0];
     assert!(r.websocket);
-    assert!(r.auth);
+    assert!(r.is_credentialed());
     assert_eq!(r.path_params[0].name, "sessionId");
     assert_eq!(r.ws_send_type.as_deref(), Some("ClientEvent"));
     assert_eq!(r.ws_receive_type.as_deref(), Some("ServerEvent"));
@@ -126,7 +126,7 @@ fn multiple_flags() {
             -> LinkResponse;
     };
     let r = &routes.routes()[0];
-    assert!(r.auth);
+    assert!(r.is_credentialed());
     assert!(r.redirect);
 }
 
@@ -285,12 +285,12 @@ fn public_flag_opts_out_of_auth() {
         healthCheck: GET "/health" [public];
         deleteItem: DELETE "/items/{id}";
     };
-    assert!(!routes.routes()[0].auth, "[public] must clear auth");
-    assert!(routes.routes()[1].auth, "unflagged routes stay private");
+    assert!(!routes.routes()[0].is_credentialed(), "[public] must clear auth");
+    assert!(routes.routes()[1].is_credentialed(), "unflagged routes stay private");
 }
 
 mod endpoint_visibility {
-    use axotyped::{ApiRouter, IntoApiRouter, endpoint};
+    use axotyped::{ApiRouter, IntoApiRouter, Visibility, endpoint};
 
     #[endpoint]
     pub async fn admin_thing() -> &'static str {
@@ -302,9 +302,14 @@ mod endpoint_visibility {
         "ok"
     }
 
-    fn build(routes_def: impl FnOnce(ApiRouter<()>) -> ApiRouter<()>) -> Vec<bool> {
+    #[endpoint(permissive)]
+    pub async fn feed() -> &'static str {
+        "items"
+    }
+
+    fn build(routes_def: impl FnOnce(ApiRouter<()>) -> ApiRouter<()>) -> Vec<Visibility> {
         let (_router, routes) = routes_def(ApiRouter::<()>::new()).into_api_router().build();
-        routes.routes().iter().map(|r| r.auth).collect()
+        routes.routes().iter().map(|r| r.visibility).collect()
     }
 
     #[test]
@@ -315,7 +320,7 @@ mod endpoint_visibility {
         });
         assert_eq!(
             flags,
-            vec![true],
+            vec![Visibility::Private],
             "#[endpoint] without `public` stays private"
         );
     }
@@ -328,8 +333,21 @@ mod endpoint_visibility {
         });
         assert_eq!(
             flags,
-            vec![false],
+            vec![Visibility::Public],
             "#[endpoint(public)] must open the route"
         );
+    }
+
+    #[test]
+    fn endpoint_permissive_marks_route_permissive_but_credentialed() {
+        let (_router, routes) = ApiRouter::<()>::new()
+            .get("/feed", axotyped::register!(feed))
+            .as_("feed")
+            .into_api_router()
+            .build();
+        let r = &routes.routes()[0];
+        assert_eq!(r.visibility, Visibility::Permissive);
+        assert_eq!(r.declared, Visibility::Permissive);
+        assert!(r.is_credentialed(), "permissive stays credentialed for guard/cache");
     }
 }

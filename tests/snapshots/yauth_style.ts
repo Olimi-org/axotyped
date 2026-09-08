@@ -66,17 +66,18 @@ export interface YAuthClientOptions {
   allowInsecureHttp?: boolean;
 }
 
+/** Route call options. Fully generator-pinned per route — route methods take
+    no caller options, so these fields are never user-supplied. */
 type RequestOptions = {
   method?: string;
   body?: unknown;
   query?: Record<string, unknown>;
   auth?: boolean;
-  /** Opt out of the sane redirect-error default for legit 3xx flows.
-      Only applies to credentialless public calls (credentials omit); anything
-      carrying auth or cookies still refuses redirects. */
+  /** Attach credentials when available, never require them. */
+  permissive?: boolean;
+  /** Follow redirects only for credentialless calls to declaring routes. */
   allowRedirects?: boolean;
 };
-
 /** The `request` helper produced by `createRequest`, for the routes factory. */
 type RequestFn = <T>(path: string, opts?: RequestOptions) => Promise<T>;
 
@@ -145,7 +146,7 @@ function createRequest(options: YAuthClientOptions) {
     opts: RequestOptions = {},
     rawResponse?: boolean,
   ): Promise<T | Response> {
-    const { method = "GET", body, query, auth = false } = opts;
+    const { method = "GET", body, query, auth = false, permissive = false } = opts;
     let url = `${baseUrl}${path}`;
     if (query) {
       const params = new URLSearchParams();
@@ -173,26 +174,33 @@ function createRequest(options: YAuthClientOptions) {
     // credential-bearing requests (auth or cookies) to non-loopback hosts.
     assertSecureTransport(url, { allowInsecureHttp: options.allowInsecureHttp === true, auth, credentials });
 
-    // An [auth] route requires a token: without one configured or returned,
-    // the request is aborted rather than sent unauthenticated.
+    // A [permissive] route attaches credentials when available but never
+    // fails for want of them; any other [auth] route requires a token.
     if (auth) {
-      if (!options.getToken) {
-        throw new Error(
-          `Route declared [auth] but options.getToken was not configured (${method} ${path})`,
-        );
+      if (permissive) {
+        if (options.getToken) {
+          const token = await options.getToken();
+          if (token) headers.Authorization = `Bearer ${token}`;
+        }
+      } else {
+        if (!options.getToken) {
+          throw new Error(
+            `Route declared [auth] but options.getToken was not configured (${method} ${path})`,
+          );
+        }
+        const token = await options.getToken();
+        if (!token) {
+          throw new Error(
+            `options.getToken() returned no token for an [auth] route (${method} ${path})`,
+          );
+        }
+        headers.Authorization = `Bearer ${token}`;
       }
-      const token = await options.getToken();
-      if (!token) {
-        throw new Error(
-          `options.getToken() returned no token for an [auth] route (${method} ${path})`,
-        );
-      }
-      headers.Authorization = `Bearer ${token}`;
     }
 
-    // Only credentialless public calls with `{ allowRedirects: true }` follow
-    // redirects; anything carrying auth or cookies refuses, since the guard
-    // sees only the initial URL and a 3xx could bounce to http://.
+    // Only credentialless calls to routes declaring `[allow_redirects]`
+    // follow redirects; anything carrying auth or cookies refuses, since the
+    // guard sees only the initial URL and a 3xx could bounce to http://.
     const canFollowRedirects =
       !auth && credentials === "omit" && opts.allowRedirects === true;
     const response = await boundFetch(url, {
@@ -277,31 +285,31 @@ export function createYAuthClient(options: YAuthClientOptions): YAuthClient {
 
 function createYAuthClientRoutes(request: RequestFn, options: YAuthClientOptions) {
   return {
-    getSession: (opts?: RequestOptions) => request<SessionResponse>("/session", { ...opts, method: "GET", auth: true }),
-    logout: (opts?: RequestOptions) => request<SuccessResponse>("/logout", { ...opts, method: "POST", auth: true }),
-    updateProfile: (body: UpdateProfileRequest, opts?: RequestOptions) =>
-      request<ProfileResponse>("/me", { ...opts, method: "PATCH", auth: true, body }),
+    getSession: () => request<SessionResponse>("/session", { method: "GET", auth: true, permissive: false, allowRedirects: false }),
+    logout: () => request<SuccessResponse>("/logout", { method: "POST", auth: true, permissive: false, allowRedirects: false }),
+    updateProfile: (body: UpdateProfileRequest) =>
+      request<ProfileResponse>("/me", { method: "PATCH", auth: true, permissive: false, allowRedirects: false, body }),
 
     "admin": {
-      listUsers: (query?: ListUsersQuery, opts?: RequestOptions) =>
-        request<ListUsersResponse>("/admin/users", { ...opts, method: "GET", auth: true, query }),
-      getUser: (id: string, opts?: RequestOptions) =>
-        request<UserResponse>(`/admin/users/${encodeURIComponent(id)}`, { ...opts, method: "GET", auth: true }),
-      deleteUser: (id: string, opts?: RequestOptions) =>
-        request<void>(`/admin/users/${encodeURIComponent(id)}`, { ...opts, method: "DELETE", auth: true }),
-      banUser: (id: string, body: BanRequest, opts?: RequestOptions) =>
-        request<UserResponse>(`/admin/users/${encodeURIComponent(id)}/ban`, { ...opts, method: "POST", auth: true, body }),
+      listUsers: (query?: ListUsersQuery) =>
+        request<ListUsersResponse>("/admin/users", { method: "GET", auth: true, permissive: false, allowRedirects: false, query }),
+      getUser: (id: string) =>
+        request<UserResponse>(`/admin/users/${encodeURIComponent(id)}`, { method: "GET", auth: true, permissive: false, allowRedirects: false }),
+      deleteUser: (id: string) =>
+        request<void>(`/admin/users/${encodeURIComponent(id)}`, { method: "DELETE", auth: true, permissive: false, allowRedirects: false }),
+      banUser: (id: string, body: BanRequest) =>
+        request<UserResponse>(`/admin/users/${encodeURIComponent(id)}/ban`, { method: "POST", auth: true, permissive: false, allowRedirects: false, body }),
     },
 
     "emailPassword": {
-      register: (body: RegisterRequest, opts?: RequestOptions) =>
-        request<MessageResponse>("/register", { ...opts, method: "POST", auth: true, body }),
-      login: (body: LoginRequest, opts?: RequestOptions) =>
-        request<LoginResponse>("/login", { ...opts, method: "POST", auth: true, body }),
-      verify: (body: VerifyEmailRequest, opts?: RequestOptions) =>
-        request<MessageResponse>("/verify-email", { ...opts, method: "POST", auth: true, body }),
-      changePassword: (body: ChangePasswordRequest, opts?: RequestOptions) =>
-        request<MessageResponse>("/change-password", { ...opts, method: "POST", auth: true, body }),
+      register: (body: RegisterRequest) =>
+        request<MessageResponse>("/register", { method: "POST", permissive: false, allowRedirects: false, body }),
+      login: (body: LoginRequest) =>
+        request<LoginResponse>("/login", { method: "POST", permissive: false, allowRedirects: false, body }),
+      verify: (body: VerifyEmailRequest) =>
+        request<MessageResponse>("/verify-email", { method: "POST", permissive: false, allowRedirects: false, body }),
+      changePassword: (body: ChangePasswordRequest) =>
+        request<MessageResponse>("/change-password", { method: "POST", auth: true, permissive: false, allowRedirects: false, body }),
     },
 
     "oauth": {
@@ -317,8 +325,8 @@ function createYAuthClientRoutes(request: RequestFn, options: YAuthClientOptions
         }
         return url;
       },
-      callback: (provider: string, body: CallbackBody, opts?: RequestOptions) =>
-        request<AuthResponse>(`/oauth/${encodeURIComponent(provider)}/callback`, { ...opts, method: "POST", auth: true, body }),
+      callback: (provider: string, body: CallbackBody) =>
+        request<AuthResponse>(`/oauth/${encodeURIComponent(provider)}/callback`, { method: "POST", permissive: false, allowRedirects: false, body }),
     },
 
     "realtime": {

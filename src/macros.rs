@@ -81,13 +81,14 @@ macro_rules! api_routes {
             name: stringify!($name).to_string(),
             method: $crate::api_routes!(@method $method),
             path: $path.to_string(),
-            auth: !$crate::api_routes!(@has_flag public $([$($flag),*])?),
-            declared_public: $crate::api_routes!(@has_flag public $([$($flag),*])?),
+            visibility: $crate::api_routes!(@visibility $([$($flag),*])?),
+            declared: $crate::api_routes!(@visibility $([$($flag),*])?),
             body_type: None,
             response_type: None,
             query_type: $crate::api_routes!(@opt_type $($qo $(<$qi>)?)?),
             path_params: $crate::extract_path_params($path),
             group: $group.clone(),
+            allow_redirects: $crate::api_routes!(@has_flag allow_redirects $([$($flag),*])?),
             redirect: false,
             websocket: true,
             ws_send_type: $crate::api_routes!(@opt_type $so $(<$si>)?),
@@ -110,13 +111,14 @@ macro_rules! api_routes {
             name: stringify!($name).to_string(),
             method: $crate::api_routes!(@method $method),
             path: $path.to_string(),
-            auth: !$crate::api_routes!(@has_flag public $([$($flag),*])?),
-            declared_public: $crate::api_routes!(@has_flag public $([$($flag),*])?),
+            visibility: $crate::api_routes!(@visibility $([$($flag),*])?),
+            declared: $crate::api_routes!(@visibility $([$($flag),*])?),
             body_type: $crate::api_routes!(@opt_type $($bo $(<$bi>)?)?),
             response_type: $crate::api_routes!(@opt_type $($ro $(<$ri>)?)?),
             query_type: $crate::api_routes!(@opt_type $($qo $(<$qi>)?)?),
             path_params: $crate::extract_path_params($path),
             group: $group.clone(),
+            allow_redirects: $crate::api_routes!(@has_flag allow_redirects $([$($flag),*])?),
             redirect: $crate::api_routes!(@has_flag redirect $([$($flag),*])?),
             websocket: $crate::api_routes!(@has_ws_flag $([$($flag),*])?),
             ws_send_type: None,
@@ -136,6 +138,19 @@ macro_rules! api_routes {
     (@has_flag $target:ident) => { false };
     (@has_flag $target:ident [$($flag:ident),*]) => {
         $crate::api_routes!(@check_flag $target, $($flag),*)
+    };
+    // Visibility from flags: public dominates permissive; neither is private.
+    // Used for both `visibility` (effective) and `declared` — the macro
+    // context has no layers, so nothing overrides either.
+    (@visibility) => { $crate::Visibility::Private };
+    (@visibility [$($flag:ident),*]) => {
+        if $crate::api_routes!(@has_flag public [$($flag),*]) {
+            $crate::Visibility::Public
+        } else if $crate::api_routes!(@has_flag permissive [$($flag),*]) {
+            $crate::Visibility::Permissive
+        } else {
+            $crate::Visibility::Private
+        }
     };
     (@check_flag $target:ident, ) => { false };
     (@check_flag $target:ident, $target2:ident $(, $rest:ident)*) => {

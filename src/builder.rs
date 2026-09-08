@@ -10,7 +10,8 @@
 //! use axotyped::ApiRouter;
 //!
 //! // Manual type specification (still supported):
-//! // Routes are PRIVATE by default; use group_public or #[endpoint(public)] to open them.
+//! // Routes are PRIVATE by default; use group_public/group_permissive or
+//! // #[endpoint(public|permissive)] to open or soften them.
 //! let (router, routes) = ApiRouter::<AppState>::new()
 //!     .get("/users", list_users)
 //!         .response::<Vec<UserResponse>>()
@@ -32,7 +33,7 @@ use axum::routing::{self, MethodRouter};
 
 #[cfg(feature = "ts-rs")]
 use crate::types::TypeRegistry;
-use crate::types::{Collector, HttpMethod, NoCollect, RouteCollection, RouteDefinition};
+use crate::types::{Collector, HttpMethod, NoCollect, RouteCollection, RouteDefinition, Visibility};
 
 // ---------------------------------------------------------------------------
 // Layer support
@@ -227,19 +228,44 @@ fn default_name_from_handler<H: 'static>() -> String {
 // ---------------------------------------------------------------------------
 
 /// Builder producing both an [`axum::Router`] and a [`RouteCollection`].
+///
 /// Generic over state `S` and [`Collector`] `C` (`NoCollect` by default;
 /// `TypeRegistry` to collect types for binding generation).
+///
+/// Scope-level visibility state, threaded through group closures.
+///
+/// A single value instead of one bool per scope kind, so a new visibility
+/// only touches [`Scope::resolve`] and the group constructor that sets it.
+#[derive(Debug, Clone, Copy, Default)]
+struct Scope {
+    /// Declared visibility for routes registered in this scope.
+    visibility: Visibility,
+    /// Whether an `auth_layer` is active in this scope.
+    protected: bool,
+}
+
+impl Scope {
+    /// Resolve to `(declared, effective)` visibility: protection forces
+    /// effective `Private` while the declaration is preserved for
+    /// diagnostics.
+    fn resolve(self) -> (Visibility, Visibility) {
+        let declared = self.visibility;
+        let effective = if self.protected {
+            Visibility::Private
+        } else {
+            declared
+        };
+        (declared, effective)
+    }
+}
 pub struct ApiRouter<S = (), C: Collector = NoCollect> {
     router: Router<S>,
     routes: Vec<RouteDefinition>,
     collector: C,
     current_group: Option<String>,
     current_prefix: Option<String>,
-    /// Whether routes in this scope are public (`auth: false`).
-    scope_public: bool,
-    /// Whether an auth layer is active; forces `auth: true` even for
-    /// public-declared routes. See [`auth_layer`](Self::auth_layer).
-    scope_protected: bool,
+    /// Visibility state for routes registered in this scope.
+    scope: Scope,
     /// Layers applied to routes registered after they are added.
     layers: Vec<LayerApplier<S>>,
 }
@@ -257,8 +283,7 @@ where
             collector: C::default(),
             current_group: None,
             current_prefix: None,
-            scope_public: false,
-            scope_protected: false,
+            scope: Scope::default(),
             layers: Vec::new(),
         }
     }
@@ -312,8 +337,10 @@ where
             collector: C::default(),
             current_group: Some(name.to_string()),
             current_prefix: self.current_prefix.clone(),
-            scope_public: true,
-            scope_protected: self.scope_protected,
+            scope: Scope {
+                visibility: Visibility::Public,
+                ..self.scope
+            },
             layers: self.layers.clone(),
         };
 
@@ -325,8 +352,52 @@ where
         self
     }
 
-    /// Closure-based group: scoped TS client namespace without modifying route path prefixes.
-    /// call within the current scope.
+    /// Closure-based group containing routes with best-effort credentials.
+    ///
+    /// Every route inside attaches credentials when available but never fails
+    /// for want of them — the scope-wide form of `#[endpoint(permissive)]` /
+    /// `[permissive]`. Inherits the surrounding prefix, layers, and any
+    /// `auth_layer` protection (which still forces effective `Private`).
+    ///
+    /// The permissive scope does not leak: routes registered after the closure
+    /// fall back to whatever the parent scope had.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// r.group_permissive("feed", |g| {
+    ///     g.get("/feed", register!(get_feed))   // best-effort creds
+    /// })
+    /// .post("/course", register!(create_course)) // requires auth
+    /// ```
+    pub fn group_permissive<R, F>(mut self, name: &str, routes: F) -> Self
+    where
+        F: FnOnce(ApiRouter<S, C>) -> R,
+        R: IntoApiRouter<S, C>,
+    {
+        let inner = ApiRouter {
+            router: Router::new(),
+            routes: Vec::new(),
+            collector: C::default(),
+            current_group: Some(name.to_string()),
+            current_prefix: self.current_prefix.clone(),
+            scope: Scope {
+                visibility: Visibility::Permissive,
+                ..self.scope
+            },
+            layers: self.layers.clone(),
+        };
+
+        let inner = routes(inner).into_api_router();
+
+        self.router = self.router.merge(inner.router);
+        self.routes.extend(inner.routes);
+        self.collector.merge_collection(inner.collector);
+        self
+    }
+
+    /// Register a tower layer for routes added after this call within the
+    /// current scope.
     ///
     /// Scope semantics (mirroring the other scope knobs):
     /// - applies to routes registered after it in the current router/group
@@ -369,9 +440,10 @@ where
         self
     }
 
-    /// Like [`layer`](Self::layer), but marks scoped routes authenticated
-    /// (`auth: true`), overriding public declarations. Contradictions are
-    /// reported by [`generate_with_warnings`](crate::generate_with_warnings).
+    /// Like [`layer`](Self::layer), but marks scoped routes `Private`
+    /// (effective visibility), overriding public/permissive declarations.
+    /// Contradictions against public declarations are reported by
+    /// [`generate_with_warnings`](crate::generate_with_warnings).
     /// Use `layer` for non-auth middleware.
     ///
     /// # Example
@@ -395,7 +467,7 @@ where
             axum::response::IntoResponse,
         <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
     {
-        self.scope_protected = true;
+        self.scope.protected = true;
         self.layer(layer)
     }
 
@@ -412,8 +484,7 @@ where
             collector: C::default(),
             current_group: Some(name.to_string()),
             current_prefix: self.current_prefix.clone(),
-            scope_public: self.scope_public,
-            scope_protected: self.scope_protected,
+            scope: self.scope,
             layers: self.layers.clone(),
         };
 
@@ -454,8 +525,7 @@ where
             collector: C::default(),
             current_group: Some(name.to_string()),
             current_prefix: Some(default_prefix),
-            scope_public: self.scope_public,
-            scope_protected: self.scope_protected,
+            scope: self.scope,
             layers: self.layers.clone(),
         };
 
@@ -504,17 +574,17 @@ where
             to_method_router,
             ep,
             &self.current_prefix,
-            self.scope_public,
-            self.scope_protected,
+            self.scope,
             &self.current_group,
             false,
             &self.layers,
         );
         EH::apply_meta::<C>(&mut def, &mut self.collector);
-        // Server-derived truth: an auth layer in scope protects every route
-        // registered under it, overriding any public declaration.
-        if self.scope_protected {
-            def.auth = true;
+        // Server-derived truth: an auth layer in scope forces effective
+        // visibility back to `Private`, overriding any public/permissive
+        // declaration (the declaration itself is preserved for diagnostics).
+        if self.scope.protected {
+            def.visibility = Visibility::Private;
         }
         RouteBuilder { parent: self, def }
     }
@@ -577,7 +647,7 @@ where
     /// Add a WebSocket route.
     ///
     /// Returns a [`WsRouteBuilder`] that only exposes WS-relevant methods
-    /// (`.query()`, `.events()`, `.auth()`, `.done()`). Internally uses
+    /// (`.query()`, `.events()`, `.done()`). Internally uses
     /// `routing::get()` since WebSocket upgrades start as HTTP GET requests.
     pub fn ws<EH, T>(mut self, path: &str, ep: EH) -> WsRouteBuilder<S, C>
     where
@@ -592,16 +662,15 @@ where
             routing::get,
             ep,
             &self.current_prefix,
-            self.scope_public,
-            self.scope_protected,
+            self.scope,
             &self.current_group,
             true,
             &self.layers,
         );
         EH::apply_meta::<C>(&mut def, &mut self.collector);
         // Server-derived truth (same rule as the HTTP registration path).
-        if self.scope_protected {
-            def.auth = true;
+        if self.scope.protected {
+            def.visibility = Visibility::Private;
         }
         WsRouteBuilder { parent: self, def }
     }
@@ -634,8 +703,7 @@ fn route_into_def<S, EH, T>(
     to_method_router: fn(EH::Handler) -> MethodRouter<S>,
     ep: EH,
     prefix: &Option<String>,
-    public_scope: bool,
-    protected_scope: bool,
+    scope: Scope,
     group: &Option<String>,
     websocket: bool,
     layers: &[LayerApplier<S>],
@@ -653,17 +721,21 @@ where
     let mini = Router::<S>::new().route(&full_path, to_method_router(handler));
     let layered = apply_scope_layers(mini, layers);
     *router = std::mem::take(router).merge(layered);
+    // Scope resolution is a single call now: public dominates permissive
+    // when scopes nest; protection forces effective `Private`.
+    let (declared, visibility) = scope.resolve();
     RouteDefinition {
         name,
         method,
         path: full_path,
-        auth: !public_scope || protected_scope,
-        declared_public: public_scope,
+        visibility,
+        declared,
         body_type: None,
         response_type: None,
         query_type: None,
         path_params,
         group: group.clone(),
+        allow_redirects: false,
         redirect: false,
         websocket,
         ws_send_type: None,
@@ -804,11 +876,9 @@ where
 /// pub struct AppRoutes;
 ///
 /// impl RouteTable<Arc<AppState>> for AppRoutes {
-///     fn define<C: Collector, R: IntoApiRouter<Arc<AppState>, C>>(
-///         r: ApiRouter<Arc<AppState>, C>,
-///     ) -> R {
+///     fn define<C: Collector>(r: ApiRouter<Arc<AppState>, C>) -> ApiRouter<Arc<AppState>, C> {
 ///         r.get("/health", register!(health))
-///          r.group_prefixed("admin", |g| g.post("/x", register!(create_x))) // private by default
+///             .group_prefixed("admin", |g| g.post("/x", register!(create_x))) // private by default
 ///     }
 /// }
 ///
@@ -942,6 +1012,15 @@ where
     /// Mark this route as a browser redirect (URL builder, not fetch).
     pub fn redirect(mut self) -> Self {
         self.def.redirect = true;
+        self
+    }
+
+    /// Allow this route to follow redirects (`[allow_redirects]` equivalent).
+    /// A route property decided server-side — never caller-suppliable. Only
+    /// takes effect for credentialless calls; anything carrying auth or
+    /// cookies still refuses.
+    pub fn allow_redirects(mut self) -> Self {
+        self.def.allow_redirects = true;
         self
     }
 
@@ -1097,8 +1176,9 @@ where
 
     /// Internal helper: finalize the route into parent ApiRouter.
     ///
-    /// Public visibility for WebSocket routes comes from `group_public` or
-    /// `#[endpoint(public)]`, like every other route.
+    /// Visibility for WebSocket routes comes from `group_public` /
+    /// `group_permissive` or `#[endpoint(public|permissive)]`, like every
+    /// other route.
     fn done(mut self) -> ApiRouter<S, C> {
         self.parent.routes.push(self.def);
         self.parent

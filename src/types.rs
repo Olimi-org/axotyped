@@ -32,6 +32,23 @@ pub struct PathParam {
     pub name: String,
 }
 
+/// What a route declares — and effectively is — regarding authentication.
+///
+/// Matched on directly so each state carries its own meaning instead of
+/// combining booleans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Visibility {
+    /// Requires authentication. The generated client attaches credentials
+    /// and refuses to send without them.
+    #[default]
+    Private,
+    /// Open. The generated client sends no credentials for the call.
+    Public,
+    /// Best-effort credentials: attached when available, never required.
+    /// Anonymous calls go out as-is; the endpoint is expected to serve both.
+    Permissive,
+}
+
 /// Definition of a single API route.
 #[derive(Debug, Clone)]
 pub struct RouteDefinition {
@@ -41,15 +58,16 @@ pub struct RouteDefinition {
     pub method: HttpMethod,
     /// Route path (e.g., `/register`, `/admin/users/{id}`).
     pub path: String,
-    /// Whether the route requires authentication.
-    ///
-    /// Defaults to `true`; `auth_layer` in scope forces `true`
-    /// even for public-declared routes.
-    pub auth: bool,
-    /// Whether the route was declared public (`#[endpoint(public)]`,
-    /// `[public]`, or a `group_public` scope). With `auth == true`,
-    /// indicates an auth-layer override reported by `generate_with_warnings`.
-    pub declared_public: bool,
+    /// Effective visibility after scopes and layers. Drives codegen:
+    /// `Private` requires credentials, `Permissive` attaches them
+    /// best-effort, `Public` sends none.
+    pub visibility: Visibility,
+    /// Declaration-site visibility (`#[endpoint(public|permissive)]`,
+    /// `[public|permissive]`, or a `group_public`/`group_permissive` scope).
+    /// Differs from `visibility` when an `auth_layer` in scope forces a
+    /// declared-public route back to `Private` (reported by
+    /// `generate_with_warnings`).
+    pub declared: Visibility,
     /// Rust type name of the request body (stringified via `stringify!()`).
     pub body_type: Option<String>,
     /// Rust type name of the response body (stringified via `stringify!()`).
@@ -60,6 +78,11 @@ pub struct RouteDefinition {
     pub path_params: Vec<PathParam>,
     /// Group name for nested object structure (e.g., `emailPassword`).
     pub group: Option<String>,
+    /// Whether this route may follow redirects (`[allow_redirects]`).
+    /// A route property decided server-side at generation time — never
+    /// caller-suppliable. Only takes effect for credentialless calls;
+    /// anything carrying auth or cookies still refuses.
+    pub allow_redirects: bool,
     /// Whether this route is a browser redirect (not a fetch call).
     pub redirect: bool,
     /// Whether this route is a WebSocket endpoint (generates WS connection, not fetch).
@@ -68,6 +91,19 @@ pub struct RouteDefinition {
     pub ws_send_type: Option<String>,
     /// Rust type name for server-to-client events (receive direction).
     pub ws_receive_type: Option<String>,
+}
+
+impl RouteDefinition {
+    /// Whether calls carry credentials (`Private` or `Permissive` effective
+    /// visibility): transport guard, cache bypass, and redirect refusal apply.
+    pub fn is_credentialed(&self) -> bool {
+        !matches!(self.visibility, Visibility::Public)
+    }
+
+    /// Whether credentials are best-effort rather than required.
+    pub fn is_permissive(&self) -> bool {
+        matches!(self.visibility, Visibility::Permissive)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -550,13 +586,14 @@ mod tests {
             name: "foo".into(),
             method: HttpMethod::Get,
             path: "/foo".into(),
-            auth: false,
-            declared_public: false,
+            visibility: Visibility::Public,
+            declared: Visibility::Public,
             body_type: None,
             response_type: None,
             query_type: None,
             path_params: vec![],
             group: None,
+            allow_redirects: false,
             redirect: false,
             websocket: false,
             ws_send_type: None,
@@ -568,13 +605,14 @@ mod tests {
             name: "bar".into(),
             method: HttpMethod::Post,
             path: "/bar".into(),
-            auth: true,
-            declared_public: false,
+            visibility: Visibility::Private,
+            declared: Visibility::Private,
             body_type: Some("BarRequest".into()),
             response_type: Some("BarResponse".into()),
             query_type: None,
             path_params: vec![],
             group: Some("baz".into()),
+            allow_redirects: false,
             redirect: false,
             websocket: false,
             ws_send_type: None,

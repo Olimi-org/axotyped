@@ -127,7 +127,7 @@ async fn layers_compose_and_outermost_runs_first() {
 fn collect_routes(collection: RouteCollection) -> Vec<String> {
     collection
         .into_iter()
-        .map(|def| format!("{} {} auth={}", def.method.as_str(), def.path, def.auth))
+        .map(|def| format!("{} {} {:?}", def.method.as_str(), def.path, def.visibility))
         .collect()
 }
 
