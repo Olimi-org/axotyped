@@ -4,6 +4,9 @@ version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Proc-macros for axotyped route type inference"
+repository = "https://github.com/Olimi-org/axotyped"
+homepage = "https://github.com/Olimi-org/axotyped"
+documentation = "https://docs.rs/axotyped-macros"
 
 [lib]
 proc-macro = true

@@ -8,6 +8,8 @@ version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Olimi-org/axotyped"
+homepage = "https://github.com/Olimi-org/axotyped"
+documentation = "https://docs.rs/axotyped"
 description = "Auto-generate typed TypeScript API clients from Axum route metadata"
 keywords = ["axum", "typescript", "codegen", "api-client"]
 categories = ["development-tools", "web-programming"]
@@ -50,7 +52,7 @@ astrolabe-impl = ["ts-rs", "dep:astrolabe"]
 
 [dependencies]
 axum = "0.8"
-axotyped-macros = { version = "0.2.0", path = "macros" }
+axotyped-macros = "0.2.0"
 tower = { version = "0.5", default-features = false }
 
 # ts-rs required deps
