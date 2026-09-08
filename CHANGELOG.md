@@ -2,27 +2,28 @@
 
 ### Breaking changes
 
-- deny-by-default: routes require authentication unless declared public (`#[endpoint(public)]`, `[public]`, `group_public`); the `[auth]` flag is gone
+- deny-by-default: routes require authentication unless declared public (`#[endpoint(public)]`, `[public]`, `group_public`); visibility is a three-state enum (`Private`/`Public`/`Permissive`), matched on directly instead of combining bools; the `[auth]` flag is gone
 - removed `ApiRouter::auth_all()` / `RouteBuilder::auth()` / `WsRouteBuilder::auth()` — visibility is declared on the handler or scope
 - `GeneratorConfig::default_credentials` defaults to `"same-origin"` (was `"include"`)
-- generated output shape changed (encoded templates, quoted group keys, per-call `opts`, enforced `method`) — regenerate committed clients after upgrading
+- generated output shape changed (encoded templates, quoted group keys, fully generator-controlled request options) — regenerate committed clients after upgrading
 
 ### Features
 
 - `ApiRouter::layer()` — scope-scoped tower middleware, applied per-route, never leaked to parents/siblings
 - `ApiRouter::auth_layer()` — like `layer()`, plus marks routes authenticated in metadata; contradictions with public declarations surface via `generate_with_warnings()`
-- `RouteDefinition::declared_public` records declaration-site visibility independently of the effective flag
+- `RouteDefinition::declared` records declaration-site visibility independently of the effective flag
+- new `Permissive` visibility (`#[endpoint(permissive)]`, `[permissive]`, `group_permissive`): credentials attached when available but never required — Bearer sends anonymously without a token, Cookie allows `omit`; stays credentialed for guard/cache/redirect purposes; the flag is generator-pinned per route (not caller-suppliable)
 - `GeneratorConfig::auth_scheme` — `Bearer` (default, `getToken` + `Authorization` header), `Cookie` (session cookies, `"omit"` refusal, native WS cookies, optional CSRF via `csrf_header_name`), `None`
 - `GeneratorConfig::large_int_type` (`number`/`bigint`/`string`) applied to client signatures and `ts_config()`/`export_types_with()` bindings alike
 - `GeneratorConfig::ws_ticket_path` — ticket-handshake WS client for `[ws][auth]` under Bearer
 - `generate_with_warnings()` diagnostics: public-behind-auth-layer contradictions, `None`-scheme auth routes, missing WS credential pathway
-- per-call `opts?: RequestOptions` on every route method (`allowRedirects` opt-out for credentialless public calls)
+- `allow_redirects` route property (`#[endpoint(public, allow_redirects)]`, `.allow_redirects()`): lets credentialless calls follow redirects; route methods take no caller options — redirect and auth-softening behavior is generator-pinned, never runtime-flippable
 - `RouteTable::collect_types()` / `build()` work without the `ts-rs` feature
 
 ### Security hardening
 
 - transport guard: credentials (auth or cookies) only ride https/loopback; `allowInsecureHttp` permits the connection but never credentialed non-loopback traffic
-- authenticated requests send `cache: "no-store"` and refuse redirects; only credentialless public calls with `allowRedirects: true` follow them
+- authenticated requests send `cache: "no-store"` and refuse redirects; only credentialless calls to `[allow_redirects]` routes follow them
 - Cookie `[ws][auth]` refuses `credentials: "omit"` before upgrading
 - path literals escaped for their JS string context; group/method names emitted as quoted, escaped keys
 - path params validated (`is_valid_js_identifier`, synthetics `__param_N`), always `encodeURIComponent`'d, extracted from the resolved `full_path`

@@ -166,7 +166,7 @@ ApiRouter::<AppState>::new()
 
 ### Authentication model: deny-by-default
 
-Every route is treated as requiring authentication unless explicitly declared public. An unannotated route can never generate a credential-less client, so "forgot the auth annotation" failures are structurally impossible.
+Every route is treated as requiring authentication unless explicitly declared public. An unannotated route can never generate a credential-less client, so "forgot the auth annotation" failures are structurally impossible. Visibility is a three-state enum (`Private` / `Public` / `Permissive`), matched on directly.
 
 ```rust
 // Private by default — no annotations needed:
@@ -180,7 +180,16 @@ async fn health() -> StatusCode { StatusCode::OK }
 r.group_public("webhooks", |g| {
     g.set_prefix("/webhooks").post("/stripe", register!(stripe_hook)).done()
 })
+
+// Best-effort credentials — personalizes when logged in, works anonymously:
+r.group_permissive("feed", |g| {
+    g.get("/feed", register!(get_feed)).done()
+})
 ```
+
+`Permissive` routes attach credentials when available but never fail for want of them (Bearer: token attached only when one resolves; Cookie: `omit` allowed). They stay credentialed for guard/cache/redirect purposes, and degrade to anonymous under `AuthScheme::None` without diagnostics.
+
+Redirect-following is a server-side route property (`#[endpoint(public, allow_redirects)]`, `.allow_redirects()`), never a caller option: only credentialless calls to declaring routes follow redirects, everything else refuses. Route methods therefore take no options argument — what you see in the signature is the whole call.
 
 The prefix defaults to `"/{name}"` but can be overridden with `.set_prefix()` inside the closure.
 
@@ -358,7 +367,8 @@ CI: `cargo test check_ts_client` fails if the committed file is stale.
 - **`AuthScheme::Bearer`** — authenticated routes resolve a token via
   `ClientOptions.getToken` and send `Authorization: Bearer ...`. Requests fail
   closed: no configured source or no token aborts the call instead of sending
-  an unauthenticated request.
+  an unauthenticated request. `Permissive` routes attach the token when one
+  resolves and otherwise send anonymously.
 - **`AuthScheme::Cookie`** — session cookies ride automatically. The client
   refuses `"omit"` credentials on authenticated routes, and with
   `csrf_header_name` set it attaches the anti-CSRF proof on POST/PUT/PATCH/DELETE
