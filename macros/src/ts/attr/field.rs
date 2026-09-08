@@ -96,7 +96,7 @@ impl Attr for FieldAttr {
         if let (Some(ov), field_ty) = (&self.type_override, &field.ty) {
             if !self.maybe_omitted
                 && crate::ts::optional::is_option_ty(field_ty)
-                && !ov.contains("null")
+                && !contains_null_type(ov)
             {
                 syn_err_spanned!(
                     field;
@@ -274,5 +274,91 @@ fn replace_underscore_in_angle_bracketed(args: &mut AngleBracketedGenericArgumen
             }
             _ => (),
         }
+    }
+}
+
+/// Whether a `#[ts(type = "...")]` override mentions `null` as a standalone
+/// TypeScript token. A raw substring test accepts `nullable`, `nullish`, or
+/// `MyNullBox`, none of which is the `null` type — so tokenize. Quoted text
+/// (`"null"`, `{ "null": string }`) and comments are stripped first: `null`
+/// there is prose or a string literal, never the type.
+fn contains_null_type(override_str: &str) -> bool {
+    // Single pass: drop string literals and comments, keep type code. A
+    // naive `//` split would mistake `//` inside a string for a comment, so
+    // both are handled in one scan.
+    let mut code = String::with_capacity(override_str.len());
+    let mut chars = override_str.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // String literal (', ", `): skip to the unescaped closer.
+            // `${...}` interpolations go with it — a `null` there is code
+            // the override doesn't structurally depend on, and demanding
+            // `| null` for it is harmless friction, not unsoundness.
+            q @ ('\'' | '"' | '`') => {
+                let mut escaped = false;
+                for next in chars.by_ref() {
+                    if escaped {
+                        escaped = false;
+                    } else if next == '\\' {
+                        escaped = true;
+                    } else if next == q {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        code.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev_star = false;
+                for next in chars.by_ref() {
+                    if prev_star && next == '/' {
+                        break;
+                    }
+                    prev_star = next == '*';
+                }
+            }
+            c => code.push(c),
+        }
+    }
+    code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .any(|token| token == "null")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_null_type;
+
+    #[test]
+    fn null_detection_requires_standalone_token() {
+        // Genuine `null` members pass…
+        assert!(contains_null_type("string | null"));
+        assert!(contains_null_type("null"));
+        assert!(contains_null_type("Array<null>"));
+        assert!(contains_null_type("(string | null)[]"));
+        // …substrings of other identifiers do not.
+        assert!(!contains_null_type("string"));
+        assert!(!contains_null_type("nullable"));
+        assert!(!contains_null_type("string | nullish"));
+        assert!(!contains_null_type("MyNullBox"));
+        assert!(!contains_null_type("annulled"));
+        // …nor does `null` hidden in comments.
+        assert!(!contains_null_type("string // null"));
+        assert!(!contains_null_type("string /* null */"));
+        // …nor `null` as quoted text rather than the type.
+        assert!(!contains_null_type("\"null\""));
+        assert!(!contains_null_type("{ \"null\": string }"));
+        assert!(!contains_null_type("'null'"));
+        assert!(!contains_null_type("`null`"));
+        assert!(!contains_null_type("\"a\\\"null\""));
+        // `//` inside a string is not a comment: the literal is dropped
+        // whole, so a real `null` beside it still counts.
+        assert!(contains_null_type("\"http://x\" | null"));
     }
 }
