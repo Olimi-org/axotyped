@@ -8,7 +8,7 @@ extra_changelog_sections = [
 ]
 
 [github]
-owner = "TheGB0077"
+owner = "Olimi-org"
 repo = "axotyped"
 
 [[workflows]]
