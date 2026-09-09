@@ -86,7 +86,7 @@ version = "0.3.0"
 dependencies = [
  "arrayvec",
  "astrolabe",
- "axotyped-macros",
+ "axotyped-macros 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "axum",
  "bigdecimal",
  "bson",
@@ -111,6 +111,19 @@ dependencies = [
 [[package]]
 name = "axotyped-macros"
 version = "0.2.0"
+dependencies = [
+ "indexmap",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+ "termcolor",
+]
+
+[[package]]
+name = "axotyped-macros"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91bd56977906822841432f25fac0fc7ec920673202c2346090fdc02165b52bfd"
 dependencies = [
  "indexmap",
  "proc-macro2",
