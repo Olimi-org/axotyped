@@ -77,6 +77,8 @@ type RequestOptions = {
   permissive?: boolean;
   /** Follow redirects only for credentialless calls to declaring routes. */
   allowRedirects?: boolean;
+  /** @internal — lifecycle replay guard, set only by the 401 retry path. */
+  retried?: boolean;
 };
 /** The `request` helper produced by `createRequest`, for the routes factory. */
 type RequestFn = <T>(path: string, opts?: RequestOptions) => Promise<T>;
@@ -134,6 +136,8 @@ function createRequest(options: YAuthClientOptions) {
   // browser engines.
   const boundFetch =
     options.fetch !== undefined ? options.fetch : globalThis.fetch.bind(globalThis);
+  const getToken = options.getToken;
+
 
   async function request<T>(path: string, opts?: RequestOptions): Promise<T>;
   async function request<T>(
@@ -178,20 +182,20 @@ function createRequest(options: YAuthClientOptions) {
     // fails for want of them; any other [auth] route requires a token.
     if (auth) {
       if (permissive) {
-        if (options.getToken) {
-          const token = await options.getToken();
+        if (getToken) {
+          const token = await getToken();
           if (token) headers.Authorization = `Bearer ${token}`;
         }
       } else {
-        if (!options.getToken) {
+        if (!getToken) {
           throw new Error(
-            `Route declared [auth] but options.getToken was not configured (${method} ${path})`,
+            `Route declared [auth] but no token source was configured (getToken / auth.store) (${method} ${path})`,
           );
         }
-        const token = await options.getToken();
+        const token = await getToken();
         if (!token) {
           throw new Error(
-            `options.getToken() returned no token for an [auth] route (${method} ${path})`,
+            `The configured token source returned no token for an [auth] route (${method} ${path})`,
           );
         }
         headers.Authorization = `Bearer ${token}`;
@@ -214,6 +218,7 @@ function createRequest(options: YAuthClientOptions) {
     });
 
     if (!response.ok) {
+
       const text = await response.text();
       let message: string;
       let errorBody: unknown;
@@ -266,7 +271,7 @@ function createTypedWebSocket<TSend, TReceive>(ws: WebSocket): TypedWebSocket<TS
 
 // Runtime semantics version — bump when generated helper behavior changes,
 // so consumers can detect stale committed artifacts.
-export const RUNTIME_VERSION = "0.3.0";
+export const RUNTIME_VERSION = "0.4.0";
 
 export type YAuthClient = ReturnType<typeof createYAuthClientRoutes> & {
   withOptions(override: Partial<YAuthClientOptions>): YAuthClient;

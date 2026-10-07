@@ -3,13 +3,11 @@
 //! - `#[endpoint]` — attribute on handler functions; extracts `Json<T>`, `Query<T>` from
 //!   the signature and generates a companion `__EndpointMeta` struct
 //! - `register!()` — call-site macro that wraps a handler path with its metadata
-//! - `#[derive(TS)]` — (behind `ts-rs` feature) generate TypeScript bindings from Rust types
+//! - `#[derive(TS)]` — generate TypeScript bindings from Rust types
 
-#[cfg(feature = "ts-rs")]
 mod ts;
 
 // TS derive macro — must reside in the crate root.
-#[cfg(feature = "ts-rs")]
 #[proc_macro_derive(TS, attributes(ts))]
 pub fn ts_derive(input: TokenStream) -> TokenStream {
     ts::typescript(input)
@@ -32,9 +30,10 @@ use syn::{FnArg, ItemFn, PathArguments, ReturnType, Type, parse_macro_input};
 ///
 /// Routes require authentication unless declared public. Use
 /// `#[endpoint(public)]` to mark an individual handler's route public, or
-/// `#[endpoint(permissive)]` for best-effort credentials that never fail
-/// without them (the scope-wide alternatives are [`ApiRouter::group_public`]
+/// `#[endpoint(permissive)]` for routes whose handler runs with or without
+/// credentials (the scope-wide alternatives are [`ApiRouter::group_public`]
 /// / `group_permissive` on the builder).
+///
 ///
 /// # Extracted types
 ///
@@ -86,6 +85,67 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
     let body_type = extract_body_type(&item_fn);
     let query_type = extract_query_type(&item_fn);
     let response_type = extract_response_type(&item_fn);
+    let param_types = extract_param_types(&item_fn);
+
+    // Credential classification. Every parameter must implement
+    // `EndpointParam` (the assert fn gives the actionable error for a
+    // missing impl); the constants then decide, at the type level, whether
+    // this handler may register on a private-by-default chain.
+    let custom_params: Vec<&Type> = param_types
+        .iter()
+        .filter(|t| {
+            let name = last_segment_ident(t);
+            !KNOWN_AMBIENT_EXTRACTORS.contains(&name.as_str())
+        })
+        .collect();
+    let assert_fn_name = quote::format_ident!("{}__param_assertions", fn_name);
+    let param_assertions = quote! {
+        #[doc(hidden)]
+        #[allow(dead_code, non_snake_case)]
+        fn #assert_fn_name() {
+            fn __param<T: ::axotyped::EndpointParam>() {}
+            #(__param::<#param_types>();)*
+        }
+    };
+
+    // Type-level authorization fold. Starts `Enforced` when the endpoint
+    // declared itself public/permissive (its declaration IS the compile-time
+    // authorization), then ORs every parameter's credential flag. Ends up on
+    // `EndpointMeta::Authorization`; the private-by-default chain bounds
+    // registration on it projecting to `Allowed`.
+    let mut authz = if is_public || is_permissive {
+        quote! { ::axotyped::Credential }
+    } else {
+        quote! { ::axotyped::OptionalCredential }
+    };
+    // Params-only fold — the coherence input before the declaration folds in.
+    let mut param_fold = quote! { ::axotyped::OptionalCredential };
+    for p in &custom_params {
+        let prev = param_fold;
+        param_fold = quote! {
+            <#prev as ::axotyped::AuthOr<<#p as ::axotyped::EndpointParam>::Auth>>::Out
+        };
+        let prev = authz;
+        authz = quote! {
+            <#prev as ::axotyped::AuthOr<<#p as ::axotyped::EndpointParam>::Auth>>::Out
+        };
+    }
+
+    // Definition-site coherence: declaring a credentialless visibility
+    // (public/permissive) while some parameter extractor requires a
+    // credential is a contradiction — the extractor rejects the anonymous
+    // callers the declaration promises to serve. Fails to compile at THIS
+    // endpoint, with the trait names carrying the explanation.
+    let non_private = is_public || is_permissive;
+    let coherence_impl = quote! {
+        #[doc(hidden)]
+        impl ::axotyped::EndpointVisibilityCoherence for #meta_struct_name where
+            ::axotyped::AssertCredentiallessDeclaration<{
+                !#non_private
+                    || !<#param_fold as ::axotyped::FlagConst>::IS_CREDENTIAL
+            }>: ::axotyped::IsCoherentWithParams,
+        {}
+    };
 
     let body_register = match &body_type {
         Some(t) => {
@@ -154,7 +214,13 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(non_camel_case_types)]
         pub struct #meta_struct_name;
 
+        #param_assertions
+        #coherence_impl
+
         impl ::axotyped::EndpointMeta for #meta_struct_name {
+            type Authorization = #authz;
+            type ParamCredentials = #param_fold;
+
             fn apply<C: ::axotyped::Collector>(__def: &mut ::axotyped::RouteDefinition, __c: &mut C) {
                 #body_register
                 #query_register
@@ -174,6 +240,48 @@ fn endpoint_attr_error() -> TokenStream {
             "axotyped: #[endpoint] accepts at most a visibility (`public` | `permissive`) \
              and `allow_redirects` — e.g. #[endpoint(public, allow_redirects)]"
         );
+    }
+    .into()
+}
+
+// ---------------------------------------------------------------------------
+// #[enforced] / #[ambient] — extractor credential classification
+// ---------------------------------------------------------------------------
+
+/// Mark an extractor as requiring authentication: a request without valid
+/// credentials cannot reach the handler body through it (extraction fails
+/// or rejects). Replaces the manual
+/// `impl EndpointParam { type Auth = Credential }` boilerplate; the claim
+/// sits on the type that performs the check.
+///
+/// ```rust,ignore
+/// #[axotyped::credential]
+/// pub struct AuthUser(pub UserIdentity);
+/// ```
+#[proc_macro_attribute]
+pub fn credential(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    credential_marker(item, quote! { ::axotyped::Credential })
+}
+
+/// Mark an extractor as allowing anonymous requests: extraction succeeds
+/// without credentials and yields no identity (e.g. `OptionalAuthUser`
+/// returning `None`). Explicit form of the default classification for
+/// custom extractors.
+#[proc_macro_attribute]
+pub fn optional_credential(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    credential_marker(item, quote! { ::axotyped::OptionalCredential })
+}
+
+fn credential_marker(item: TokenStream, flag: proc_macro2::TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as syn::DeriveInput);
+    let name = &input.ident;
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    quote! {
+        #input
+
+        impl #impl_generics ::axotyped::EndpointParam for #name #ty_generics #where_clause {
+            type Auth = #flag;
+        }
     }
     .into()
 }
@@ -226,6 +334,20 @@ pub fn register(input: TokenStream) -> TokenStream {
 /// `::<T>()` turbofish syntax, so we must exclude them from metadata generation.
 fn is_type_inferable(ty: &Type) -> bool {
     !matches!(ty, Type::ImplTrait(_))
+}
+
+/// Last path segment identifier of a type ("State" for `axum::extract::State<T>`);
+/// empty for non-path types.
+fn last_segment_ident(ty: &Type) -> String {
+    let Type::Path(type_path) = ty else {
+        return String::new();
+    };
+    type_path
+        .path
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default()
 }
 
 /// Extract the inner `T` from `Json<T>` in function parameters.
@@ -282,6 +404,11 @@ fn extract_response_type(item_fn: &ItemFn) -> Option<Type> {
         if is_status_code(ok_type) {
             return None;
         }
+        // Result<Response, _> — redirect/plain response (cookie + redirect
+        // callbacks, files): no JSON response type for the client.
+        if last_segment_ident(ok_type) == "Response" {
+            return None;
+        }
         return Some(ok_type.clone());
     }
 
@@ -326,6 +453,35 @@ fn extract_generic_from_type<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a Type
         syn::GenericArgument::Type(inner) => Some(inner),
         _ => None,
     }
+}
+
+
+/// Extractor names with `EndpointParam` blanket impls in axotyped — skipped
+/// by the authorization fold (their flag is `Ambient` by construction).
+/// Must stay in sync with `src/params.rs`. Skipping matters for privacy:
+/// the fold lands in the public `EndpointMeta::Authorization` associated
+/// type, which must not mention private DTOs riding inside `Json<T>` and
+/// friends; only custom (necessarily public) extractors fold.
+const KNOWN_AMBIENT_EXTRACTORS: &[&str] = &[
+    "State", "Json", "Query", "Path", "Extension", "HeaderMap", "Request",
+    "RawQuery", "MatchedPath", "OriginalUri", "ConnectInfo", "WebSocketUpgrade",
+    "Option",
+];
+
+/// All typed parameter types of the handler — every extractor in an
+/// `#[endpoint]` signature must implement `EndpointParam` (blanket impls
+/// cover axum's built-ins; custom extractors declare whether they enforce
+/// authentication).
+fn extract_param_types(item_fn: &ItemFn) -> Vec<Type> {
+    item_fn
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            FnArg::Typed(pat_type) => Some(pat_type.ty.as_ref().clone()),
+            FnArg::Receiver(_) => None,
+        })
+        .collect()
 }
 
 /// Recursively unwrap `Vec<T>` and `Option<T>` wrappers, returning the

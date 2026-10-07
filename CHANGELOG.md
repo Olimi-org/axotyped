@@ -1,3 +1,37 @@
+## 0.4.0 (2026-10-06)
+
+### Breaking changes
+
+- the `ts-rs` feature is gone. Type export is now built in.
+  - Migration: drop `"ts-rs"` from your feature list. Every type named in a route contract must implement `TS` (or mark the route `opaque()`).
+  - The `*-impl` type-integration features stay optional and unchanged. `NoCollect` + monomorphization still keeps export code out of release binaries.
+- every route goes through `register!()` + `#[endpoint]` (raw handlers no longer register).
+  - Manual `.body()`/`.response()`/`.query()` overrides still work on registered routes.
+- every extractor parameter of an `#[endpoint]` handler must declare whether it enforces authentication.
+  - Axum's built-ins (`State`, `Json`, …) are covered by blanket impls.
+  - Your own extractors get `#[axotyped::credential]` (rejects anonymous callers) or `#[axotyped::optional_credential]` (yields nothing for them). Custom extractors must be `pub`.
+- private routes are now checked at compile time. Registering a handler that doesn't authenticate — and didn't declare `public`/`permissive` — fails at the registration call site.
+  - `ApiRouter` carries its scope as a type parameter: `PrivateScope` by default, `PublicScope`/`PermissiveScope` inside groups, `LayeredAuthScope` after `auth_layer` (how you claim middleware coverage).
+  - The reverse also fails: a `public`/`permissive` endpoint taking a credential-requiring extractor doesn't compile.
+- `IntoApiRouter` is replaced by `IntoApiRouterAny`/`RouterParts`, and `ApiRouter::from_parts` is public. Group closures may now end in any scope.
+- regenerate committed clients after upgrading. Declared flows add lifecycle machinery, an `AUTH_FLOW` constant, and an `auth` namespace; even flow-less output differs slightly (token-source preamble, reworded no-token errors).
+
+### Features
+
+- `auth_scheme!` declares your API's credential lifecycle: `kind: oauth2 | exchange | static_bearer`, `exchange`/`refresh`/`ws_ticket` route references, pinned `constant`s.
+  - `build()` validates the declaration: references must resolve; `exchange`/`refresh` routes must not be `Private` (no bearer exists yet when they run); the `ws_ticket` mint must be `Private`; one flow per router tree (groups and `merge` adopt it or panic).
+- declared Bearer flows generate session-lifecycle machinery: one `AuthStore` over `TokenStore`/`SessionStore`, single-flight refresh, 401 → refresh → one replay, proactive refresh from `expiresAt`, `onSessionExpired`, an `AUTH_FLOW` constant, and an `auth` namespace.
+- `-> token` (exchange) and `-> { access, refresh, expires_in }` (oauth2, all but `access` optional) bind a default refresh hook to the declared route. Unusable bindings (body-taking, untyped, ws/redirect routes) warn and fall back to a manual `auth.refresh`.
+- `GeneratorConfig::ws_ticket_path` is auto-derived from the flow's `ws_ticket` route when unset.
+- `#[endpoint]` handlers returning `Response` skip response-type extraction (redirects, cookie callbacks); `RouteBuilder::opaque()` drops body/query/response metadata for non-contract endpoints (OAuth callbacks, webhooks).
+- `WsRouteBuilder`/`RouteBuilder` forward `layer()`/`auth_layer()` mid-chain.
+- `RouteCollection::extend` panics on two flows instead of silently keeping the first — same rule as the router's merge.
+
+### Security hardening
+
+- a forgotten identity extractor on a private route is now a compile error, and visibility–extractor contradictions fail at the endpoint definition.
+- each credential claim sits on the type that enforces it, so searching for `#[credential]` finds every auth gate, and the declaration, client options, and generated code all read from the same flag.
+
 ## 0.3.0
 
 ### Breaking changes

@@ -723,7 +723,7 @@ fn generates_websocket_typed_send_and_receive() {
 // ===========================================================================
 
 #[test]
-fn default_config_is_bearer_fail_closed_with_same_origin_credentials() {
+fn default_config_is_bearer_requiring_token_with_same_origin_credentials() {
     let routes = api_routes! {
         getSession: GET "/session" [auth] -> SessionResponse;
     };

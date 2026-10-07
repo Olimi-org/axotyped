@@ -6,7 +6,7 @@
 //! 3. nested group scopes inherit active layers
 //! 4. layering has zero effect on collected codegen metadata
 
-use axotyped::{ApiRouter, IntoApiRouter, RouteCollection};
+use axotyped::{ApiRouter, RouteCollection, register};
 use axum::body::Body;
 use axum::extract::{Extension, Request};
 use axum::http::{Request as HttpRequest, StatusCode};
@@ -17,7 +17,27 @@ use tower::Service;
 #[derive(Clone, Default)]
 struct AppState;
 
-async fn ok_handler() -> &'static str {
+// Test identity extractor — satisfies the private chain's compile-time
+// authorization requirement (Enforced).
+#[derive(Clone, Copy)]
+pub struct TestAuth;
+
+impl axotyped::EndpointParam for TestAuth {
+    type Auth = axotyped::Credential;
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for TestAuth {
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(
+        _parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(TestAuth)
+    }
+}
+
+#[axotyped::endpoint]
+async fn ok_handler(_auth: TestAuth) -> &'static str {
     "ok"
 }
 
@@ -50,10 +70,10 @@ async fn send(router: axum::Router<AppState>, path: &str) -> StatusCode {
 #[tokio::test]
 async fn layer_gates_only_subsequent_routes_in_scope() {
     let router = ApiRouter::<AppState>::new()
-        .get("/open", ok_handler)
-        .into_api_router()
+        .get("/open", register!(ok_handler))
+        
         .layer(axum::middleware::from_fn(deny_short))
-        .get("/gated", ok_handler)
+        .get("/gated", register!(ok_handler))
         .build()
         .0;
 
@@ -64,10 +84,10 @@ async fn layer_gates_only_subsequent_routes_in_scope() {
 #[tokio::test]
 async fn layer_does_not_leak_to_sibling_groups() {
     let router = ApiRouter::<AppState>::new()
-        .group("a", |g| g.get("/x", ok_handler))
+        .group("a", |g| g.get("/x", register!(ok_handler)))
         .group("b", |g| {
             g.layer(axum::middleware::from_fn(deny_short))
-                .get("/y", ok_handler)
+                .get("/y", register!(ok_handler))
         })
         .build()
         .0;
@@ -81,10 +101,10 @@ async fn layer_does_not_leak_to_sibling_groups() {
 async fn parent_layer_applies_to_later_groups() {
     // A layer added BEFORE entering a group must reach that group's routes.
     let router = ApiRouter::<AppState>::new()
-        .get("/free", ok_handler)
-        .into_api_router()
+        .get("/free", register!(ok_handler))
+        
         .layer(axum::middleware::from_fn(deny_short))
-        .group_prefixed("admin", |g| g.get("/thing", ok_handler))
+        .group_prefixed("admin", |g| g.get("/thing", register!(ok_handler)))
         .build()
         .0;
 
@@ -97,7 +117,7 @@ async fn nested_group_inherits_ancestor_layers() {
     let router = ApiRouter::<AppState>::new()
         .group_prefixed("admin", |g| {
             g.layer(axum::middleware::from_fn(deny_short))
-                .group_prefixed("deep", |h| h.get("/res", ok_handler))
+                .group_prefixed("deep", |h| h.get("/res", register!(ok_handler)))
         })
         .build()
         .0;
@@ -117,7 +137,7 @@ async fn layers_compose_and_outermost_runs_first() {
     let router = ApiRouter::<AppState>::new()
         .layer(axum::middleware::from_fn(deny_short))
         .layer(axum::middleware::from_fn(passthrough))
-        .get("/stacked", ok_handler)
+        .get("/stacked", register!(ok_handler))
         .build()
         .0;
 
@@ -135,21 +155,21 @@ fn collect_routes(collection: RouteCollection) -> Vec<String> {
 async fn codegen_metadata_identical_with_and_without_layers() {
     let clean = {
         let (_, c): (_, RouteCollection) = ApiRouter::<AppState>::new()
-            .get("/users/{id}", ok_handler)
-            .into_api_router()
-            .post("/users/{id}", ok_handler)
-            .into_api_router()
+            .get("/users/{id}", register!(ok_handler))
+            
+            .post("/users/{id}", register!(ok_handler))
+            
             .build();
         c
     };
 
     let layered = {
         let (_, c): (_, RouteCollection) = ApiRouter::<AppState>::new()
-            .get("/users/{id}", ok_handler)
-            .into_api_router()
+            .get("/users/{id}", register!(ok_handler))
+            
             .layer(axum::middleware::from_fn(deny_short))
-            .post("/users/{id}", ok_handler)
-            .into_api_router()
+            .post("/users/{id}", register!(ok_handler))
+            
             .build();
         c
     };
@@ -194,7 +214,8 @@ async fn require_identity(
 }
 
 /// Final consumer: extracts what upstream middleware already computed.
-async fn whoami(Extension(id): Extension<Identity>) -> String {
+#[axotyped::endpoint]
+async fn whoami(Extension(id): Extension<Identity>, _auth: TestAuth) -> String {
     id.0.to_string()
 }
 
@@ -207,7 +228,7 @@ async fn extensions_published_by_outer_wrapper_reach_scope_layered_handlers() {
     // boundary between the app router and the isolated route routers.
     let router = ApiRouter::<AppState>::new()
         .layer(axum::middleware::from_fn(require_identity))
-        .get("/me", whoami)
+        .get("/me", register!(whoami))
         .build()
         .0
         .layer(axum::middleware::from_fn(resolve_identity));

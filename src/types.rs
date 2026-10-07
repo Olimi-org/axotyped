@@ -107,12 +107,11 @@ impl RouteDefinition {
 }
 
 // ---------------------------------------------------------------------------
-// Type collection (ts-rs feature)
+// Type collection
 // ---------------------------------------------------------------------------
 
 /// A type-erased `T::export_all(&cfg)` function pointer.
 /// Used to call ts-rs's export mechanism for types discovered during route building.
-#[cfg(feature = "ts-rs")]
 type ExportFn = fn(&crate::ts::Config) -> Result<(), crate::ts::ExportError>;
 
 /// Called when a route names type `T` for TypeScript export.
@@ -142,7 +141,6 @@ impl Collector for NoCollect {
 
 /// Collects route types for ts-rs export via `export_all()`.
 /// Deduplicates by `TypeId` so shared generic impls emit one declaration.
-#[cfg(feature = "ts-rs")]
 #[derive(Debug, Clone, Default)]
 pub struct TypeRegistry {
     /// TypeId → export_all function pointer, for deduplication and export.
@@ -151,12 +149,10 @@ pub struct TypeRegistry {
 }
 
 /// Returns true for stdlib wrappers handled inline (`Vec` as `T[]`, `Option` as `T | null`).
-#[cfg(feature = "ts-rs")]
 fn is_container_wrapper(type_name: &str) -> bool {
     type_name.contains("::vec::Vec<") || type_name.contains("::option::Option<")
 }
 
-#[cfg(feature = "ts-rs")]
 impl TypeRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -190,7 +186,6 @@ impl TypeRegistry {
     }
 }
 
-#[cfg(feature = "ts-rs")]
 impl Collector for TypeRegistry {
     fn register<T: crate::MaybeTs + 'static>(&mut self) {
         let type_name = std::any::type_name::<T>();
@@ -212,33 +207,12 @@ impl Collector for TypeRegistry {
     }
 }
 
-/// Placeholder registry when ts-rs is not enabled — no type collection.
-#[cfg(not(feature = "ts-rs"))]
-#[derive(Debug, Clone, Default)]
-pub struct TypeRegistry;
-
-#[cfg(not(feature = "ts-rs"))]
-impl TypeRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        true
-    }
-
-    pub fn len(&self) -> usize {
-        0
-    }
-
-    pub fn extend(&mut self, _other: TypeRegistry) {}
-}
-
 /// A collection of route definitions and their associated TypeScript types.
 #[derive(Debug, Clone, Default)]
 pub struct RouteCollection {
     routes: Vec<RouteDefinition>,
     types: TypeRegistry,
+    auth_flow: Option<crate::auth_flow::AuthFlow>,
 }
 
 impl RouteCollection {
@@ -248,8 +222,16 @@ impl RouteCollection {
 
     /// Builds a `RouteCollection` from routes and a type registry.
     /// Used by [`crate::ApiRouter::build`].
-    pub(crate) fn assemble(routes: Vec<RouteDefinition>, types: TypeRegistry) -> Self {
-        Self { routes, types }
+    pub(crate) fn assemble(
+        routes: Vec<RouteDefinition>,
+        types: TypeRegistry,
+        auth_flow: Option<crate::auth_flow::AuthFlow>,
+    ) -> Self {
+        Self {
+            routes,
+            types,
+            auth_flow,
+        }
     }
 
     pub fn push(&mut self, route: RouteDefinition) {
@@ -259,6 +241,29 @@ impl RouteCollection {
     pub fn extend(&mut self, other: RouteCollection) {
         self.routes.extend(other.routes);
         self.types.extend(other.types);
+        // Same rule as the router's merge: one credential lifecycle per
+        // collection — a second flow is a declaration conflict, not an
+        // override. Fails fast rather than silently keeping the first.
+        match (&self.auth_flow, other.auth_flow) {
+            (Some(existing), Some(flow)) => panic!(
+                "two auth flows declared ('{}' and '{}'); \
+                 an API has one credential lifecycle",
+                existing.name, flow.name
+            ),
+            (None, flow) => self.auth_flow = flow,
+            _ => {}
+        }
+    }
+
+    /// The declared credential lifecycle, if the router carried an
+    /// [`auth_flow`](crate::ApiRouter::auth_flow) declaration.
+    pub fn auth_flow(&self) -> Option<&crate::auth_flow::AuthFlow> {
+        self.auth_flow.as_ref()
+    }
+
+    /// Look up a route by its client method name (first match).
+    pub(crate) fn find_by_name(&self, name: &str) -> Option<&RouteDefinition> {
+        self.routes.iter().find(|r| r.name == name)
     }
 
     pub fn routes(&self) -> &[RouteDefinition] {
@@ -272,7 +277,6 @@ impl RouteCollection {
     /// Exports collected types and dependencies to `dir` via `export_all()`.
     /// Call before `generate_to_file()`; replaces manual per-type exports.
     /// Types come from `.response::<T>()`, `.body::<T>()`, `.query::<T>()`, `.events::<A, B>()`.
-    #[cfg(feature = "ts-rs")]
     pub fn export_types(&self, dir: &std::path::Path) -> Result<(), std::io::Error> {
         self.export_types_with(dir, crate::ts::Config::from_env())
     }
@@ -280,7 +284,6 @@ impl RouteCollection {
     /// Exports types with an explicit ts-rs [`Config`](crate::ts::Config).
     /// Use [`GeneratorConfig::ts_config`](crate::GeneratorConfig::ts_config) to keep
     /// binding and client integer rendering aligned.
-    #[cfg(feature = "ts-rs")]
     pub fn export_types_with(
         &self,
         dir: &std::path::Path,

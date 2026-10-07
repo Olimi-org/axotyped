@@ -1,4 +1,4 @@
-use axotyped::{ApiRouter, HttpMethod, IntoApiRouter, Visibility};
+use axotyped::{ApiRouter, HttpMethod, Visibility, register};
 use axum::extract::{Json, Path, State};
 use serde::Deserialize;
 
@@ -6,43 +6,63 @@ use serde::Deserialize;
 struct AppState;
 
 #[derive(serde::Serialize)]
-#[cfg_attr(feature = "ts-rs", derive(axotyped::TS))]
+#[derive(axotyped::TS)]
 struct UserResponse {
     _id: String,
 }
 
 #[derive(Deserialize)]
-#[cfg_attr(feature = "ts-rs", derive(axotyped::TS))]
+#[derive(axotyped::TS)]
 struct CreateUserRequest {
     _name: String,
 }
 
 #[derive(Deserialize)]
-#[cfg_attr(feature = "ts-rs", derive(axotyped::TS))]
+#[derive(axotyped::TS)]
 struct ListQuery {
     _limit: Option<u32>,
 }
 
 // Handler functions representing realistic endpoints
-async fn list_users(
-    State(_state): State<AppState>,
-    axum::extract::Query(_query): axum::extract::Query<ListQuery>,
-) -> Json<Vec<UserResponse>> {
+
+// Test identity extractor — satisfies the private chain's compile-time
+// authorization requirement (Enforced), extracting as a no-op.
+#[derive(Clone, Copy)]
+pub struct TestAuth;
+
+impl axotyped::EndpointParam for TestAuth {
+    type Auth = axotyped::Credential;
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for TestAuth {
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(
+        _parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(TestAuth)
+    }
+}
+
+#[axotyped::endpoint]
+async fn list_users(_auth: TestAuth, State(_state): State<AppState>,
+    axum::extract::Query(_query): axum::extract::Query<ListQuery>) -> Json<Vec<UserResponse>> {
     Json(vec![])
 }
 
-async fn get_user(State(_state): State<AppState>, Path(_id): Path<String>) -> Json<UserResponse> {
+#[axotyped::endpoint]
+async fn get_user(_auth: TestAuth, State(_state): State<AppState>, Path(_id): Path<String>) -> Json<UserResponse> {
     Json(UserResponse { _id: "1".into() })
 }
 
-async fn create_user(
-    State(_state): State<AppState>,
-    Json(_body): Json<CreateUserRequest>,
-) -> Json<UserResponse> {
+#[axotyped::endpoint]
+async fn create_user(_auth: TestAuth, State(_state): State<AppState>,
+    Json(_body): Json<CreateUserRequest>) -> Json<UserResponse> {
     Json(UserResponse { _id: "1".into() })
 }
 
-async fn delete_user(State(_state): State<AppState>, Path(_id): Path<String>) {}
+#[axotyped::endpoint]
+async fn delete_user(_auth: TestAuth, State(_state): State<AppState>, Path(_id): Path<String>) {}
 
 // ---------------------------------------------------------------------------
 // Auto-naming: handler function name → camelCase
@@ -51,7 +71,7 @@ async fn delete_user(State(_state): State<AppState>, Path(_id): Path<String>) {}
 #[test]
 fn auto_name_from_handler() {
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .get("/users", list_users)
+        .get("/users", register!(list_users))
         .response::<Vec<UserResponse>>()
         .build();
 
@@ -61,10 +81,11 @@ fn auto_name_from_handler() {
 
 #[test]
 fn auto_name_single_word() {
-    async fn register(State(_s): State<AppState>, Json(_b): Json<CreateUserRequest>) {}
+    #[axotyped::endpoint]
+async fn register(_auth: TestAuth, State(_s): State<AppState>, Json(_b): Json<CreateUserRequest>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .post("/register", register)
+        .post("/register", register!(register))
         .body::<CreateUserRequest>()
         .build();
 
@@ -74,7 +95,7 @@ fn auto_name_single_word() {
 #[test]
 fn as_overrides_auto_name() {
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .get("/users/{id}", get_user)
+        .get("/users/{id}", register!(get_user))
         .response::<UserResponse>()
         .as_("getById")
         .build();
@@ -89,7 +110,7 @@ fn as_overrides_auto_name() {
 #[test]
 fn json_shorthand() {
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .post("/users", create_user)
+        .post("/users", register!(create_user))
         .json::<CreateUserRequest, UserResponse>()
         .build();
 
@@ -103,16 +124,15 @@ fn json_shorthand() {
 
 #[test]
 fn json_shorthand_put() {
-    async fn update_user(
-        State(_s): State<AppState>,
+    #[axotyped::endpoint]
+async fn update_user(_auth: TestAuth, State(_s): State<AppState>,
         Path(_id): Path<String>,
-        Json(_b): Json<CreateUserRequest>,
-    ) -> Json<UserResponse> {
+        Json(_b): Json<CreateUserRequest>) -> Json<UserResponse> {
         Json(UserResponse { _id: "1".into() })
     }
 
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .put("/users/{id}", update_user)
+        .put("/users/{id}", register!(update_user))
         .json::<CreateUserRequest, UserResponse>()
         .build();
 
@@ -132,14 +152,14 @@ fn json_shorthand_put() {
 fn builder_full_api() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group("users", |g| {
-            g.get("/users", list_users)
+            g.get("/users", register!(list_users))
                 .response::<Vec<UserResponse>>()
-                .get("/users/{id}", get_user)
+                .get("/users/{id}", register!(get_user))
                 .response::<UserResponse>()
                 .as_("getById")
-                .post("/users", create_user)
+                .post("/users", register!(create_user))
                 .json::<CreateUserRequest, UserResponse>()
-                .delete("/users/{id}", delete_user)
+                .delete("/users/{id}", register!(delete_user))
         })
         .build();
 
@@ -161,15 +181,16 @@ fn builder_full_api() {
 
 #[test]
 fn builder_group_scoping() {
-    async fn health(State(_s): State<AppState>) {}
+    #[axotyped::endpoint]
+async fn health(_auth: TestAuth, State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group("users", |g| {
-            g.get("/users", list_users).response::<Vec<UserResponse>>()
+            g.get("/users", register!(list_users)).response::<Vec<UserResponse>>()
         })
-        .get("/health", health)
+        .get("/health", register!(health))
         .as_("health")
-        .group("admin", |g| g.delete("/users/{id}", delete_user))
+        .group("admin", |g| g.delete("/users/{id}", register!(delete_user)))
         .build();
 
     assert_eq!(routes.routes()[0].group.as_deref(), Some("users"));
@@ -184,11 +205,11 @@ fn builder_group_scoping() {
 #[test]
 fn builder_merge() {
     let users = ApiRouter::<AppState>::new().group("users", |g| {
-        g.get("/users", list_users).response::<Vec<UserResponse>>()
+        g.get("/users", register!(list_users)).response::<Vec<UserResponse>>()
     });
 
     let admin =
-        ApiRouter::<AppState>::new().group("admin", |g| g.delete("/users/{id}", delete_user));
+        ApiRouter::<AppState>::new().group("admin", |g| g.delete("/users/{id}", register!(delete_user)));
 
     let (_router, routes) = ApiRouter::<AppState>::new()
         .merge(users)
@@ -207,7 +228,7 @@ fn builder_merge() {
 #[test]
 fn builder_query_type() {
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .get("/users", list_users)
+        .get("/users", register!(list_users))
         .query::<ListQuery>()
         .response::<Vec<UserResponse>>()
         .build();
@@ -218,10 +239,11 @@ fn builder_query_type() {
 
 #[test]
 fn builder_redirect() {
-    async fn authorize(State(_s): State<AppState>) {}
+    #[axotyped::endpoint]
+async fn authorize(_auth: TestAuth, State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .get("/oauth/{provider}/authorize", authorize)
+        .get("/oauth/{provider}/authorize", register!(authorize))
         .redirect()
         .build();
 
@@ -240,27 +262,28 @@ fn builder_redirect() {
 #[test]
 fn builder_websocket_typed() {
     #[derive(Deserialize)]
-    #[cfg_attr(feature = "ts-rs", derive(axotyped::TS))]
+    #[derive(axotyped::TS)]
     struct WsParams {
         _token: String,
     }
 
     #[derive(serde::Serialize)]
-    #[cfg_attr(feature = "ts-rs", derive(axotyped::TS))]
+    #[derive(axotyped::TS)]
     struct ClientEvent {
         _msg: String,
     }
 
     #[derive(serde::Serialize)]
-    #[cfg_attr(feature = "ts-rs", derive(axotyped::TS))]
+    #[derive(axotyped::TS)]
     struct ServerEvent {
         _reply: String,
     }
 
-    async fn ws_upgrade(State(_s): State<AppState>) {}
+    #[axotyped::endpoint]
+async fn ws_upgrade(_auth: TestAuth, State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .ws("/ws", ws_upgrade)
+        .ws("/ws", register!(ws_upgrade))
         .query::<WsParams>()
         .events::<ClientEvent, ServerEvent>()
         .build();
@@ -279,21 +302,22 @@ fn builder_websocket_typed() {
 #[test]
 fn builder_websocket_with_path_params() {
     #[derive(serde::Serialize)]
-    #[cfg_attr(feature = "ts-rs", derive(axotyped::TS))]
+    #[derive(axotyped::TS)]
     struct ClientEvent {
         _msg: String,
     }
 
     #[derive(serde::Serialize)]
-    #[cfg_attr(feature = "ts-rs", derive(axotyped::TS))]
+    #[derive(axotyped::TS)]
     struct ServerEvent {
         _reply: String,
     }
 
-    async fn session_ws(State(_s): State<AppState>, Path(_id): Path<String>) {}
+    #[axotyped::endpoint]
+async fn session_ws(_auth: TestAuth, State(_s): State<AppState>, Path(_id): Path<String>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .ws("/ws/{sessionId}", session_ws)
+        .ws("/ws/{sessionId}", register!(session_ws))
         .events::<ClientEvent, ServerEvent>()
         .build();
 
@@ -308,21 +332,22 @@ fn builder_websocket_with_path_params() {
 #[test]
 fn builder_websocket_with_auth() {
     #[derive(serde::Serialize)]
-    #[cfg_attr(feature = "ts-rs", derive(axotyped::TS))]
+    #[derive(axotyped::TS)]
     struct ClientEvent {
         _msg: String,
     }
 
     #[derive(serde::Serialize)]
-    #[cfg_attr(feature = "ts-rs", derive(axotyped::TS))]
+    #[derive(axotyped::TS)]
     struct ServerEvent {
         _reply: String,
     }
 
-    async fn ws_upgrade(State(_s): State<AppState>) {}
+    #[axotyped::endpoint]
+    async fn ws_upgrade(_auth: TestAuth, State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .ws("/ws", ws_upgrade)
+        .ws("/ws", register!(ws_upgrade))
         .events::<ClientEvent, ServerEvent>()
         .build();
 
@@ -334,21 +359,22 @@ fn builder_websocket_with_auth() {
 #[test]
 fn builder_websocket_custom_name() {
     #[derive(serde::Serialize)]
-    #[cfg_attr(feature = "ts-rs", derive(axotyped::TS))]
+    #[derive(axotyped::TS)]
     struct ClientEvent {
         _msg: String,
     }
 
     #[derive(serde::Serialize)]
-    #[cfg_attr(feature = "ts-rs", derive(axotyped::TS))]
+    #[derive(axotyped::TS)]
     struct ServerEvent {
         _reply: String,
     }
 
-    async fn ws_handler(State(_s): State<AppState>) {}
+    #[axotyped::endpoint]
+async fn ws_handler(_auth: TestAuth, State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .ws("/ws", ws_handler)
+        .ws("/ws", register!(ws_handler))
         .events::<ClientEvent, ServerEvent>()
         .as_("connect")
         .build();
@@ -365,9 +391,9 @@ fn builder_websocket_custom_name() {
 fn builder_generates_valid_ts() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group("users", |g| {
-            g.get("/users", list_users)
+            g.get("/users", register!(list_users))
                 .response::<Vec<UserResponse>>()
-                .post("/users", create_user)
+                .post("/users", register!(create_user))
                 .json::<CreateUserRequest, UserResponse>()
         })
         .build();
@@ -392,7 +418,7 @@ fn builder_generates_valid_ts() {
 fn group_does_not_apply_prefix() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group("auth", |g| {
-            g.get("/login", list_users).response::<Vec<UserResponse>>()
+            g.get("/login", register!(list_users)).response::<Vec<UserResponse>>()
         })
         .build();
 
@@ -405,7 +431,7 @@ fn group_does_not_apply_prefix() {
 fn group_prefixed_applies_prefix() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_prefixed("admin", |g| {
-            g.get("/users", list_users).response::<Vec<UserResponse>>()
+            g.get("/users", register!(list_users)).response::<Vec<UserResponse>>()
         })
         .build();
 
@@ -418,9 +444,9 @@ fn group_prefixed_applies_prefix() {
 fn group_prefixed_private_by_default() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_prefixed("admin", |g| {
-            g.get("/users", list_users)
+            g.get("/users", register!(list_users))
                 .response::<Vec<UserResponse>>()
-                .post("/users", create_user)
+                .post("/users", register!(create_user))
                 .json::<CreateUserRequest, UserResponse>()
         })
         .build();
@@ -440,7 +466,7 @@ fn group_prefixed_custom_prefix() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_prefixed("admin", |g| {
             g.set_prefix("/adm")
-                .get("/users", list_users)
+                .get("/users", register!(list_users))
                 .response::<Vec<UserResponse>>()
         })
         .build();
@@ -450,12 +476,13 @@ fn group_prefixed_custom_prefix() {
 
 #[test]
 fn group_prefixed_does_not_leak_state() {
-    async fn health(State(_s): State<AppState>) {}
+    #[axotyped::endpoint]
+    async fn health(_auth: TestAuth, State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .group_prefixed("admin", |g| g.delete("/users/{id}", delete_user))
+        .group_prefixed("admin", |g| g.delete("/users/{id}", register!(delete_user)))
         // Routes after group_prefixed should NOT have admin group/prefix
-        .get("/health", health)
+        .get("/health", register!(health))
         .build();
 
     let admin_route = &routes.routes()[0];
@@ -476,15 +503,16 @@ fn group_prefixed_does_not_leak_state() {
 
 #[test]
 fn routes_are_private_by_default() {
-    async fn health(State(_s): State<AppState>) {}
+    #[axotyped::endpoint]
+    async fn health(_auth: TestAuth, State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .get("/users", list_users)
+        .get("/users", register!(list_users))
         .response::<Vec<UserResponse>>()
-        .get("/health", health)
+        .get("/health", register!(health))
         .as_("health")
-        .ws("/events", health)
-        .into_api_router()
+        .ws("/events", register!(health))
+        
         .build();
 
     for r in routes.routes() {
@@ -494,15 +522,16 @@ fn routes_are_private_by_default() {
 
 #[test]
 fn group_public_marks_routes_public_and_does_not_leak() {
-    async fn hook(State(_s): State<AppState>) {}
+    #[axotyped::endpoint]
+async fn hook(_auth: TestAuth, State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_public("webhooks", |g| {
             g.set_prefix("/webhooks")
-                .post("/stripe", hook)
-                .post("/github", hook)
+                .post("/stripe", register!(hook))
+                .post("/github", register!(hook))
         })
-        .group("admin", |g| g.delete("/users/{id}", delete_user))
+        .group("admin", |g| g.delete("/users/{id}", register!(delete_user)))
         .build();
 
     assert!(
@@ -525,13 +554,14 @@ fn group_public_marks_routes_public_and_does_not_leak() {
 
 #[test]
 fn group_permissive_marks_routes_permissive_and_does_not_leak() {
-    async fn hook(State(_s): State<AppState>) {}
+    #[axotyped::endpoint]
+    async fn hook(_auth: TestAuth, State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_permissive("feed", |g| {
-            g.get("/feed", hook).get("/trending", hook)
+            g.get("/feed", register!(hook)).get("/trending", register!(hook))
         })
-        .delete("/users/{id}", delete_user)
+        .delete("/users/{id}", register!(delete_user))
         .build();
 
     for r in &routes.routes()[..2] {
@@ -548,30 +578,32 @@ fn group_permissive_marks_routes_permissive_and_does_not_leak() {
 
 #[test]
 fn group_permissive_forwards_from_mid_chain_builders() {
-    async fn hook(State(_s): State<AppState>) {}
+    #[axotyped::endpoint]
+    async fn hook(_auth: TestAuth, State(_s): State<AppState>) {}
 
     // RouteBuilder forward: chain starting with an HTTP route.
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .get("/health", hook)
-        .group_permissive("feed", |g| g.get("/feed", hook))
+        .get("/health", register!(hook))
+        .group_permissive("feed", |g| g.get("/feed", register!(hook)))
         .build();
     assert_eq!(routes.routes()[1].visibility, Visibility::Permissive);
 
     // WsRouteBuilder forward: chain starting with a WebSocket route.
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .ws("/events", hook)
-        .group_permissive("feed", |g| g.get("/feed", hook))
+        .ws("/events", register!(hook))
+        .group_permissive("feed", |g| g.get("/feed", register!(hook)))
         .build();
     assert_eq!(routes.routes()[1].visibility, Visibility::Permissive);
 }
 
 #[test]
 fn group_public_forwards_from_mid_chain_builders() {
-    async fn hook(State(_s): State<AppState>) {}
+    #[axotyped::endpoint]
+    async fn hook(_auth: TestAuth, State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
-        .get("/health", hook)
-        .group_public("webhooks", |g| g.post("/stripe", hook))
+        .get("/health", register!(hook))
+        .group_public("webhooks", |g| g.post("/stripe", register!(hook)))
         .build();
     assert_eq!(routes.routes()[1].visibility, Visibility::Public);
 }
@@ -580,7 +612,7 @@ fn group_public_forwards_from_mid_chain_builders() {
 fn nested_group_inside_group_public_inherits_publicity() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_public("pub", |g| {
-            g.group_prefixed("deep", |h| h.get("/res", list_users))
+            g.group_prefixed("deep", |h| h.get("/res", register!(list_users)))
         })
         .build();
 
@@ -595,11 +627,11 @@ fn nested_group_inside_group_public_inherits_publicity() {
 fn group_prefixed_multiple_methods() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_prefixed("admin", |g| {
-            g.get("/users", list_users)
+            g.get("/users", register!(list_users))
                 .response::<Vec<UserResponse>>()
-                .post("/users", create_user)
+                .post("/users", register!(create_user))
                 .json::<CreateUserRequest, UserResponse>()
-                .delete("/users/{id}", delete_user)
+                .delete("/users/{id}", register!(delete_user))
         })
         .build();
 
@@ -627,9 +659,9 @@ fn route_table_trait_manual_impl() {
 
     impl RouteTable<AppState> for ManualRoutes {
         fn define<C: Collector>(r: ApiRouter<AppState, C>) -> ApiRouter<AppState, C> {
-            r.get("/health", list_users)
+            r.get("/health", register!(list_users))
                 .as_("health")
-                .group_prefixed("admin", |g| g.delete("/users/{id}", delete_user))
+                .group_prefixed("admin", |g| g.delete("/users/{id}", register!(delete_user)))
         }
     }
 
@@ -645,7 +677,7 @@ fn route_table_trait_manual_impl() {
 fn set_prefix_without_group_with() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .set_prefix("/api/v1")
-        .get("/users", list_users)
+        .get("/users", register!(list_users))
         .response::<Vec<UserResponse>>()
         .build();
 
@@ -660,7 +692,7 @@ fn define_routes_custom_identifier_name() {
 
     define_routes! {
         pub CustomRoutes for AppState, |route| {
-            route.get("/health", list_users).as_("health")
+            route.get("/health", register!(list_users)).as_("health")
         }
     }
 
@@ -687,10 +719,10 @@ async fn auth_mw(
 fn auth_layer_derives_auth_metadata_inside_public_scope() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_public("pub", |g| {
-            g.get("/open", list_users)
-                .into_api_router()
+            g.get("/open", register!(list_users))
+                
                 .auth_layer(axum::middleware::from_fn(auth_mw))
-                .get("/gated", get_user)
+                .get("/gated", register!(get_user))
         })
         .build();
 
@@ -716,7 +748,7 @@ fn auth_layer_overrides_public_declarations_and_records_contradiction() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_public("mixed", |g| {
             g.auth_layer(axum::middleware::from_fn(auth_mw))
-                .post("/hook", create_user)
+                .post("/hook", register!(create_user))
         })
         .build();
 
@@ -737,9 +769,9 @@ fn auth_layer_does_not_leak_to_sibling_scopes() {
         .group_public("pub", |g| {
             g.group_prefixed("admin", |a| {
                 a.auth_layer(axum::middleware::from_fn(auth_mw))
-                    .get("/inner", get_user)
+                    .get("/inner", register!(get_user))
             })
-            .group_prefixed("other", |o| o.get("/sibling", get_user))
+            .group_prefixed("other", |o| o.get("/sibling", register!(get_user)))
         })
         .build();
 
@@ -762,7 +794,7 @@ fn auth_layer_inherits_into_nested_groups() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_prefixed("v1", |v1| {
             v1.auth_layer(axum::middleware::from_fn(auth_mw))
-                .group_prefixed("admin", |a| a.get("/users", list_users))
+                .group_prefixed("admin", |a| a.get("/users", register!(list_users)))
         })
         .build();
 
@@ -776,7 +808,7 @@ fn plain_layer_leaves_auth_metadata_untouched() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_public("pub", |g| {
             g.layer(axum::middleware::from_fn(auth_mw))
-                .get("/rate_limited", get_user)
+                .get("/rate_limited", register!(get_user))
         })
         .build();
 

@@ -290,10 +290,27 @@ fn public_flag_opts_out_of_auth() {
 }
 
 mod endpoint_visibility {
-    use axotyped::{ApiRouter, IntoApiRouter, Visibility, endpoint};
+    use axotyped::{ApiRouter, Visibility, endpoint};
+
+    #[derive(Clone, Copy)]
+    pub struct TestAuth;
+
+    impl axotyped::EndpointParam for TestAuth {
+        type Auth = axotyped::Credential;
+    }
+
+    impl<S: Send + Sync> axum::extract::FromRequestParts<S> for TestAuth {
+        type Rejection = std::convert::Infallible;
+        async fn from_request_parts(
+            _parts: &mut axum::http::request::Parts,
+            _state: &S,
+        ) -> Result<Self, Self::Rejection> {
+            Ok(TestAuth)
+        }
+    }
 
     #[endpoint]
-    pub async fn admin_thing() -> &'static str {
+    pub async fn admin_thing(_auth: TestAuth) -> &'static str {
         "secret"
     }
 
@@ -308,7 +325,7 @@ mod endpoint_visibility {
     }
 
     fn build(routes_def: impl FnOnce(ApiRouter<()>) -> ApiRouter<()>) -> Vec<Visibility> {
-        let (_router, routes) = routes_def(ApiRouter::<()>::new()).into_api_router().build();
+        let (_router, routes) = routes_def(ApiRouter::<()>::new()).build();
         routes.routes().iter().map(|r| r.visibility).collect()
     }
 
@@ -343,7 +360,7 @@ mod endpoint_visibility {
         let (_router, routes) = ApiRouter::<()>::new()
             .get("/feed", axotyped::register!(feed))
             .as_("feed")
-            .into_api_router()
+            
             .build();
         let r = &routes.routes()[0];
         assert_eq!(r.visibility, Visibility::Permissive);

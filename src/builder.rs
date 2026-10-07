@@ -31,7 +31,6 @@ use axum::Router;
 use axum::handler::Handler;
 use axum::routing::{self, MethodRouter};
 
-#[cfg(feature = "ts-rs")]
 use crate::types::TypeRegistry;
 use crate::types::{Collector, HttpMethod, NoCollect, RouteCollection, RouteDefinition, Visibility};
 
@@ -57,19 +56,11 @@ fn apply_scope_layers<S>(router: Router<S>, layers: &[LayerApplier<S>]) -> Route
 // ---------------------------------------------------------------------------
 
 /// Trait bound for types that can be collected into the TypeRegistry.
-/// When `ts-rs` feature is enabled, this requires `crate::ts::TS`.
-/// When disabled, only requires `'static` (collection is a no-op).
-#[cfg(feature = "ts-rs")]
+/// Unconditional since 0.4.0: every type named in a route contract must
+/// implement [`TS`](crate::TS) — the route table is the client contract.
 pub trait MaybeTs: crate::ts::TS {}
 
-#[cfg(feature = "ts-rs")]
 impl<T: crate::ts::TS> MaybeTs for T {}
-
-#[cfg(not(feature = "ts-rs"))]
-pub trait MaybeTs: 'static {}
-
-#[cfg(not(feature = "ts-rs"))]
-impl<T: 'static> MaybeTs for T {}
 
 // ---------------------------------------------------------------------------
 // Registered handler + IntoEndpointHandler
@@ -106,32 +97,27 @@ pub trait IntoEndpointHandler<S, T> {
     /// The underlying axum handler type.
     type Handler;
 
+    /// The handler's `#[endpoint]` metadata type. Carries the type-level
+    /// authorization answer (`PrivatelyAuthorized`) the router's
+    /// private-by-default chain checks at compile time.
+    type Meta: crate::EndpointMeta;
+
     /// Extract the handler for routing.
     fn into_handler(self) -> Self::Handler;
 
     /// Apply this endpoint's inferred type metadata through `collector`.
-    /// No-op for raw handlers.
     fn apply_meta<C: Collector>(def: &mut RouteDefinition, collector: &mut C);
 }
 
-impl<H, T, S> IntoEndpointHandler<S, T> for H
-where
-    H: Handler<T, S> + 'static,
-    T: 'static,
-{
-    type Handler = H;
-    fn into_handler(self) -> Self::Handler {
-        self
-    }
-
-    fn apply_meta<C: Collector>(_: &mut RouteDefinition, _: &mut C) {}
-}
-
+// Raw (non-`register!`) handlers are deliberately NOT registrable: without
+// `#[endpoint]` there is no metadata, no type-level authorization, and no
+// type information for the client generator.
 impl<H, Meta, S, T> IntoEndpointHandler<S, T> for Registered<H, Meta>
 where
     Meta: crate::EndpointMeta,
 {
     type Handler = H;
+    type Meta = Meta;
     fn into_handler(self) -> Self::Handler {
         self.handler
     }
@@ -198,7 +184,7 @@ fn handler_name_from_type_name(type_name: &str) -> &str {
 /// `"forgot_password"` → `"forgotPassword"`
 /// `"list_users"` → `"listUsers"`
 /// `"register"` → `"register"` (no-op)
-fn snake_to_camel(s: &str) -> String {
+pub(crate) fn snake_to_camel(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut capitalize_next = false;
 
@@ -217,7 +203,7 @@ fn snake_to_camel(s: &str) -> String {
 }
 
 /// Derive a camelCase client method name from a handler function's type name.
-fn default_name_from_handler<H: 'static>() -> String {
+pub(crate) fn default_name_from_handler<H: 'static>() -> String {
     let full = std::any::type_name::<H>();
     let raw = handler_name_from_type_name(full);
     snake_to_camel(raw)
@@ -258,7 +244,7 @@ impl Scope {
         (declared, effective)
     }
 }
-pub struct ApiRouter<S = (), C: Collector = NoCollect> {
+pub struct ApiRouter<S = (), C: Collector = NoCollect, AuthScope = crate::params::PrivateScope> {
     router: Router<S>,
     routes: Vec<RouteDefinition>,
     collector: C,
@@ -268,9 +254,15 @@ pub struct ApiRouter<S = (), C: Collector = NoCollect> {
     scope: Scope,
     /// Layers applied to routes registered after they are added.
     layers: Vec<LayerApplier<S>>,
+    /// Declared credential lifecycle. Root-level: one declaration per router
+    /// tree, validated against the full route table at `build()`.
+    auth_flow: Option<crate::auth_flow::AuthFlow>,
+    /// Type-level registration scope — decides which handlers compile here
+    /// (see [`AllowsRoute`](crate::AllowsRoute)).
+    _auth_scope: std::marker::PhantomData<AuthScope>,
 }
 
-impl<S, C> ApiRouter<S, C>
+impl<S, C, AuthScope> ApiRouter<S, C, AuthScope>
 where
     S: Clone + Send + Sync + 'static,
     C: Collector,
@@ -285,7 +277,62 @@ where
             current_prefix: None,
             scope: Scope::default(),
             layers: Vec::new(),
+            auth_flow: None,
+            _auth_scope: PhantomData,
         }
+    }
+
+    /// Re-materialize a router from scope-erased parts (free-fn builds and
+    /// group merges). Scope type is irrelevant post-registration.
+    pub fn from_parts(parts: RouterParts<S, C>) -> ApiRouter<S, C, AuthScope> {
+        ApiRouter {
+            router: parts.router,
+            routes: parts.routes,
+            collector: parts.collector,
+            current_group: None,
+            current_prefix: None,
+            scope: Scope::default(),
+            layers: Vec::new(),
+            auth_flow: parts.auth_flow,
+            _auth_scope: PhantomData,
+        }
+    }
+
+    /// Swap the type-level scope (used by `auth_layer`).
+    fn retarget_scope<NewScope>(self) -> ApiRouter<S, C, NewScope> {
+        ApiRouter {
+            router: self.router,
+            routes: self.routes,
+            collector: self.collector,
+            current_group: self.current_group,
+            current_prefix: self.current_prefix,
+            scope: self.scope,
+            layers: self.layers,
+            auth_flow: self.auth_flow,
+            _auth_scope: PhantomData,
+        }
+    }
+
+    /// Declare this API's credential lifecycle.
+    ///
+    /// The declaration names the routes that mint/renew the bearer so the
+    /// generated client can own the session lifecycle (single-flight
+    /// re-derivation, 401 replay, expiry events). Validated at `build()`:
+    /// referenced routes must exist, bootstrap/refresh routes must not be
+    /// `Private` (requiring a bearer there is circular — none exists
+    /// yet when they run), and the WS ticket mint must be `Private`.
+    ///
+    /// One declaration per router tree; merging two routers that both carry
+    /// one fails fast.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// r.auth_flow(SessionAuth::flow())
+    ///     .get("/auth/me", register!(me)) // permissive bootstrap
+    /// ```
+    pub fn auth_flow(mut self, flow: crate::auth_flow::AuthFlow) -> Self {
+        self.auth_flow = Some(flow);
+        self
     }
 
     /// Borrow the collector (e.g. to call `export` after building).
@@ -324,12 +371,12 @@ where
     ///      .post("/stripe", register!(stripe_hook))
     ///      .post("/github", register!(github_hook))   // both public
     /// })
-    /// .post("/course", register!(create_course))       // requires auth
+    /// .post("/course", register!(create_course))       // a credential
     /// ```
-    pub fn group_public<R, F>(mut self, name: &str, routes: F) -> Self
+    pub fn group_public<R, F>(self, name: &str, routes: F) -> Self
     where
-        F: FnOnce(ApiRouter<S, C>) -> R,
-        R: IntoApiRouter<S, C>,
+        F: FnOnce(ApiRouter<S, C, crate::params::PublicScope>) -> R,
+        R: IntoApiRouterAny<S, C>,
     {
         let inner = ApiRouter {
             router: Router::new(),
@@ -342,14 +389,13 @@ where
                 ..self.scope
             },
             layers: self.layers.clone(),
+            auth_flow: None,
+            _auth_scope: PhantomData,
         };
 
-        let inner = routes(inner).into_api_router();
+        let parts = routes(inner).into_router_parts();
 
-        self.router = self.router.merge(inner.router);
-        self.routes.extend(inner.routes);
-        self.collector.merge_collection(inner.collector);
-        self
+        self.absorb_parts(parts)
     }
 
     /// Closure-based group containing routes with best-effort credentials.
@@ -368,12 +414,12 @@ where
     /// r.group_permissive("feed", |g| {
     ///     g.get("/feed", register!(get_feed))   // best-effort creds
     /// })
-    /// .post("/course", register!(create_course)) // requires auth
+    /// .post("/course", register!(create_course)) // a credential
     /// ```
-    pub fn group_permissive<R, F>(mut self, name: &str, routes: F) -> Self
+    pub fn group_permissive<R, F>(self, name: &str, routes: F) -> Self
     where
-        F: FnOnce(ApiRouter<S, C>) -> R,
-        R: IntoApiRouter<S, C>,
+        F: FnOnce(ApiRouter<S, C, crate::params::PermissiveScope>) -> R,
+        R: IntoApiRouterAny<S, C>,
     {
         let inner = ApiRouter {
             router: Router::new(),
@@ -386,14 +432,13 @@ where
                 ..self.scope
             },
             layers: self.layers.clone(),
+            auth_flow: None,
+            _auth_scope: PhantomData,
         };
 
-        let inner = routes(inner).into_api_router();
+        let parts = routes(inner).into_router_parts();
 
-        self.router = self.router.merge(inner.router);
-        self.routes.extend(inner.routes);
-        self.collector.merge_collection(inner.collector);
-        self
+        self.absorb_parts(parts)
     }
 
     /// Register a tower layer for routes added after this call within the
@@ -455,7 +500,7 @@ where
     /// })
     /// .get("/health", register!(health))
     /// ```
-    pub fn auth_layer<L>(mut self, layer: L) -> Self
+    pub fn auth_layer<L>(mut self, layer: L) -> ApiRouter<S, C, crate::params::LayeredAuthScope>
     where
         L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
         L::Service: tower::Service<axum::extract::Request, Error = std::convert::Infallible>
@@ -468,15 +513,18 @@ where
         <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
     {
         self.scope.protected = true;
-        self.layer(layer)
+        // Middleware now enforces authentication for this scope's routes:
+        // the extractor requirement is lifted at the type level, and the
+        // claim is explicit at the call site.
+        self.retarget_scope().layer(layer)
     }
 
     /// Group with scoped TS namespace; does not modify path prefixes.
     /// See [`group_prefixed`](Self::group_prefixed) for the prefixed variant.
-    pub fn group<R, F>(mut self, name: &str, routes: F) -> Self
+    pub fn group<R, F>(self, name: &str, routes: F) -> Self
     where
-        F: FnOnce(ApiRouter<S, C>) -> R,
-        R: IntoApiRouter<S, C>,
+        F: FnOnce(ApiRouter<S, C, AuthScope>) -> R,
+        R: IntoApiRouterAny<S, C>,
     {
         let inner = ApiRouter {
             router: Router::new(),
@@ -486,14 +534,13 @@ where
             current_prefix: self.current_prefix.clone(),
             scope: self.scope,
             layers: self.layers.clone(),
+            auth_flow: None,
+            _auth_scope: PhantomData,
         };
 
-        let inner = routes(inner).into_api_router();
+        let parts = routes(inner).into_router_parts();
 
-        self.router = self.router.merge(inner.router);
-        self.routes.extend(inner.routes);
-        self.collector.merge_collection(inner.collector);
-        self
+        self.absorb_parts(parts)
     }
 
     /// Group with scoped TS namespace and URL prefix (`/{name}`).
@@ -510,10 +557,10 @@ where
     ///         .response::<Vec<CourseRecord>>()
     /// })
     /// ```
-    pub fn group_prefixed<R, F>(mut self, name: &str, routes: F) -> Self
+    pub fn group_prefixed<R, F>(self, name: &str, routes: F) -> Self
     where
-        F: FnOnce(ApiRouter<S, C>) -> R,
-        R: IntoApiRouter<S, C>,
+        F: FnOnce(ApiRouter<S, C, AuthScope>) -> R,
+        R: IntoApiRouterAny<S, C>,
     {
         let default_prefix = match &self.current_prefix {
             Some(p) => format!("{}/{}", p.trim_end_matches('/'), name),
@@ -527,28 +574,58 @@ where
             current_prefix: Some(default_prefix),
             scope: self.scope,
             layers: self.layers.clone(),
+            auth_flow: None,
+            _auth_scope: PhantomData,
         };
 
-        let inner = routes(inner).into_api_router();
+        let parts = routes(inner).into_router_parts();
 
-        self.router = self.router.merge(inner.router);
-        self.routes.extend(inner.routes);
-        self.collector.merge_collection(inner.collector);
+        self.absorb_parts(parts)
+    }
+
+    /// The one merge rule for subtree parts (groups and `merge` alike):
+    /// routes/types fold in, and a flow declared inside the subtree is a
+    /// declaration for the whole tree — adopted when none exists yet, or
+    /// fails fast against an existing one. Never silently dropped.
+    fn absorb_parts(mut self, parts: RouterParts<S, C>) -> Self {
+        if let Some(flow) = parts.auth_flow {
+            if let Some(existing) = &self.auth_flow {
+                panic!(
+                    "two auth flows declared ('{}' and '{}'); \
+                     an API has one credential lifecycle",
+                    existing.name, flow.name
+                );
+            }
+            self.auth_flow = Some(flow);
+        }
+        self.router = self.router.merge(parts.router);
+        self.routes.extend(parts.routes);
+        self.collector.merge_collection(parts.collector);
         self
     }
 
     /// Merge another `ApiRouter`'s router and routes into this one.
-    pub fn merge(mut self, other: ApiRouter<S, C>) -> Self {
-        self.router = self.router.merge(other.router);
-        self.routes.extend(other.routes);
-        self.collector.merge_collection(other.collector);
-        self
+    pub fn merge(self, other: ApiRouter<S, C, AuthScope>) -> Self {
+        self.absorb_parts(other.into_router_parts())
     }
 
     /// Consume the builder, returning router and route metadata.
+    ///
+    /// When an [`auth_flow`](Self::auth_flow) declaration is present it is
+    /// validated against the complete route table first — a mis-declared
+    /// credential lifecycle fails fast at startup instead of surfacing as a
+    /// broken client.
     pub fn build(self) -> (Router<S>, RouteCollection) {
-        let collection =
-            RouteCollection::assemble(self.routes, self.collector.into_type_registry());
+        if let Some(flow) = &self.auth_flow {
+            if let Err(e) = flow.validate(&self.routes) {
+                panic!("auth_scheme '{}': {e}", flow.name);
+            }
+        }
+        let collection = RouteCollection::assemble(
+            self.routes,
+            self.collector.into_type_registry(),
+            self.auth_flow,
+        );
         (self.router, collection)
     }
 
@@ -561,11 +638,12 @@ where
         method: HttpMethod,
         to_method_router: fn(EH::Handler) -> MethodRouter<S>,
         ep: EH,
-    ) -> RouteBuilder<S, C>
+    ) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         let mut def = route_into_def(
             &mut self.router,
@@ -595,51 +673,56 @@ where
     /// body/response/query types are auto-applied from the `#[endpoint]` metadata through the
     /// router's collector. Otherwise, use `.body()`, `.response()`, etc. to specify types
     /// manually.
-    pub fn get<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn get<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.register(path, HttpMethod::Get, routing::get, ep)
     }
 
     /// Add a POST route.
-    pub fn post<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn post<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.register(path, HttpMethod::Post, routing::post, ep)
     }
 
     /// Add a PUT route.
-    pub fn put<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn put<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.register(path, HttpMethod::Put, routing::put, ep)
     }
 
     /// Add a PATCH route.
-    pub fn patch<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn patch<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.register(path, HttpMethod::Patch, routing::patch, ep)
     }
 
     /// Add a DELETE route.
-    pub fn delete<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn delete<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.register(path, HttpMethod::Delete, routing::delete, ep)
     }
@@ -649,11 +732,12 @@ where
     /// Returns a [`WsRouteBuilder`] that only exposes WS-relevant methods
     /// (`.query()`, `.events()`, `.done()`). Internally uses
     /// `routing::get()` since WebSocket upgrades start as HTTP GET requests.
-    pub fn ws<EH, T>(mut self, path: &str, ep: EH) -> WsRouteBuilder<S, C>
+    pub fn ws<EH, T>(mut self, path: &str, ep: EH) -> WsRouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         let mut def = route_into_def(
             &mut self.router,
@@ -743,54 +827,57 @@ where
     }
 }
 
-/// Trait for types that can be automatically finalized into an [`ApiRouter`].
-pub trait IntoApiRouter<S, C: Collector> {
-    fn into_api_router(self) -> ApiRouter<S, C>;
+/// Scope-erased router contents — what group closures may end in (a router
+/// of any scope, or an unfinished route builder), and what merging and
+/// `build()` consume. The type-level scope is irrelevant once the routes
+/// exist; it existed to police registration.
+pub struct RouterParts<S, C: Collector> {
+    pub router: Router<S>,
+    pub routes: Vec<RouteDefinition>,
+    pub collector: C,
+    pub auth_flow: Option<crate::auth_flow::AuthFlow>,
 }
 
-impl<S, C: Collector> IntoApiRouter<S, C> for ApiRouter<S, C> {
-    fn into_api_router(self) -> ApiRouter<S, C> {
-        self
+impl<S, C: Collector, Sc> From<ApiRouter<S, C, Sc>> for RouterParts<S, C> {
+    fn from(r: ApiRouter<S, C, Sc>) -> Self {
+        Self {
+            router: r.router,
+            routes: r.routes,
+            collector: r.collector,
+            auth_flow: r.auth_flow,
+        }
     }
 }
 
-impl<S, C> IntoApiRouter<S, C> for RouteBuilder<S, C>
+/// Anything a group closure can end in. Groups merge by parts, so the
+/// closure may transition scopes (e.g. via `auth_layer`) inside.
+pub trait IntoApiRouterAny<S, C: Collector> {
+    fn into_router_parts(self) -> RouterParts<S, C>;
+}
+
+impl<S, C: Collector, Sc> IntoApiRouterAny<S, C> for ApiRouter<S, C, Sc> {
+    fn into_router_parts(self) -> RouterParts<S, C> {
+        self.into()
+    }
+}
+
+impl<S, C, Sc> IntoApiRouterAny<S, C> for RouteBuilder<S, C, Sc>
 where
     S: Clone + Send + Sync + 'static,
     C: Collector,
 {
-    fn into_api_router(self) -> ApiRouter<S, C> {
-        self.done()
+    fn into_router_parts(self) -> RouterParts<S, C> {
+        self.done().into()
     }
 }
 
-impl<S, C> IntoApiRouter<S, C> for WsRouteBuilder<S, C>
+impl<S, C, Sc> IntoApiRouterAny<S, C> for WsRouteBuilder<S, C, Sc>
 where
     S: Clone + Send + Sync + 'static,
     C: Collector,
 {
-    fn into_api_router(self) -> ApiRouter<S, C> {
-        self.done()
-    }
-}
-
-impl<S, C> From<RouteBuilder<S, C>> for ApiRouter<S, C>
-where
-    S: Clone + Send + Sync + 'static,
-    C: Collector,
-{
-    fn from(builder: RouteBuilder<S, C>) -> Self {
-        builder.done()
-    }
-}
-
-impl<S, C> From<WsRouteBuilder<S, C>> for ApiRouter<S, C>
-where
-    S: Clone + Send + Sync + 'static,
-    C: Collector,
-{
-    fn from(builder: WsRouteBuilder<S, C>) -> Self {
-        builder.done()
+    fn into_router_parts(self) -> RouterParts<S, C> {
+        self.done().into()
     }
 }
 
@@ -815,10 +902,9 @@ pub fn build_routes<S, R, F>(define: F) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
     F: FnOnce(ApiRouter<S, NoCollect>) -> R,
-    R: IntoApiRouter<S, NoCollect>,
+    R: IntoApiRouterAny<S, NoCollect>,
 {
-    define(ApiRouter::<S, NoCollect>::new())
-        .into_api_router()
+    ApiRouter::<S, NoCollect>::from_parts(define(ApiRouter::<S, NoCollect>::new()).into_router_parts())
         .build()
         .0
 }
@@ -828,15 +914,13 @@ where
 ///
 /// Call this only from a debug-only codegen entry point so the collecting monomorphization is
 /// dead-code-eliminated from release builds.
-#[cfg(feature = "ts-rs")]
 pub fn collect_routes<S, R, F>(define: F) -> RouteCollection
 where
     S: Clone + Send + Sync + 'static,
     F: FnOnce(ApiRouter<S, TypeRegistry>) -> R,
-    R: IntoApiRouter<S, TypeRegistry>,
+    R: IntoApiRouterAny<S, TypeRegistry>,
 {
-    define(ApiRouter::<S, TypeRegistry>::new())
-        .into_api_router()
+    ApiRouter::<S, TypeRegistry>::from_parts(define(ApiRouter::<S, TypeRegistry>::new()).into_router_parts())
         .build()
         .1
 }
@@ -848,15 +932,13 @@ where
 /// a collecting build — call it only where the ts-rs export machinery is acceptable (typically a
 /// debug-only entry point) so it can be dead-code-eliminated from release builds. For the lean
 /// production router, use [`build_routes`].
-#[cfg(feature = "ts-rs")]
 pub fn build_typed<S, R, F>(define: F) -> (Router<S>, RouteCollection)
 where
     S: Clone + Send + Sync + 'static,
     F: FnOnce(ApiRouter<S, TypeRegistry>) -> R,
-    R: IntoApiRouter<S, TypeRegistry>,
+    R: IntoApiRouterAny<S, TypeRegistry>,
 {
-    define(ApiRouter::<S, TypeRegistry>::new())
-        .into_api_router()
+    ApiRouter::<S, TypeRegistry>::from_parts(define(ApiRouter::<S, TypeRegistry>::new()).into_router_parts())
         .build()
 }
 
@@ -906,7 +988,6 @@ pub trait RouteTable<S> {
     ///
     /// Call from a debug-only codegen entry point or test so the collecting monomorphization
     /// is dead-code-eliminated from release builds.
-    #[cfg(feature = "ts-rs")]
     fn collect_types() -> RouteCollection
     where
         S: Clone + Send + Sync + 'static,
@@ -915,7 +996,6 @@ pub trait RouteTable<S> {
     }
 
     /// Collecting build returning [`Router`] and [`RouteCollection`].
-    #[cfg(feature = "ts-rs")]
     fn build() -> (Router<S>, RouteCollection)
     where
         S: Clone + Send + Sync + 'static,
@@ -923,31 +1003,9 @@ pub trait RouteTable<S> {
         build_typed(|r| Self::define(r))
     }
 
-    /// Without the `ts-rs` feature there are no types to export, but route
-    /// *metadata* (names, paths, auth flags, params) still collects — matching
-    /// [`MaybeTs`]'s no-op-collection design — so callers behave identically
-    /// minus the type bindings.
-    #[cfg(not(feature = "ts-rs"))]
-    fn build() -> (Router<S>, RouteCollection)
-    where
-        S: Clone + Send + Sync + 'static,
-    {
-        Self::define(ApiRouter::<S, NoCollect>::new())
-            .into_api_router()
-            .build()
-    }
-
-    /// Collect route metadata without the `ts-rs` feature (no type bindings).
-    #[cfg(not(feature = "ts-rs"))]
-    fn collect_types() -> RouteCollection
-    where
-        S: Clone + Send + Sync + 'static,
-    {
-        Self::build().1
-    }
 }
 
-impl<S, C> Default for ApiRouter<S, C>
+impl<S, C, AuthScope> Default for ApiRouter<S, C, AuthScope>
 where
     S: Clone + Send + Sync + 'static,
     C: Collector,
@@ -963,12 +1021,12 @@ where
 
 /// In-progress route definition. Chain `.body::<T>()`, `.response::<T>()`,
 /// `.redirect()`, then finalize with `.done()` or `.as_("name")`.
-pub struct RouteBuilder<S, C: Collector = NoCollect> {
-    parent: ApiRouter<S, C>,
+pub struct RouteBuilder<S, C: Collector = NoCollect, AuthScope = crate::params::PrivateScope> {
+    parent: ApiRouter<S, C, AuthScope>,
     def: RouteDefinition,
 }
 
-impl<S, C> RouteBuilder<S, C>
+impl<S, C, AuthScope> RouteBuilder<S, C, AuthScope>
 where
     S: Clone + Send + Sync + 'static,
     C: Collector,
@@ -1015,6 +1073,17 @@ where
         self
     }
 
+    /// Drop the route's body/query/response metadata from the generated
+    /// client. For endpoints whose wire shape is not part of the client
+    /// contract — OpenID/OAuth callbacks parsing foreign query payloads,
+    /// redirects — while keeping `register!`'s compile-time authorization.
+    pub fn opaque(mut self) -> Self {
+        self.def.body_type = None;
+        self.def.query_type = None;
+        self.def.response_type = None;
+        self
+    }
+
     /// Allow this route to follow redirects (`[allow_redirects]` equivalent).
     /// A route property decided server-side — never caller-suppliable. Only
     /// takes effect for credentialless calls; anything carrying auth or
@@ -1025,14 +1094,14 @@ where
     }
 
     /// Internal helper: finalize the route into parent ApiRouter.
-    fn done(mut self) -> ApiRouter<S, C> {
+    fn done(mut self) -> ApiRouter<S, C, AuthScope> {
         // name was already set from the handler in ApiRouter::register()
         self.parent.routes.push(self.def);
         self.parent
     }
 
     /// Finalize the route with an explicit client method name, overriding the auto-derived name.
-    pub fn as_(mut self, name: &str) -> ApiRouter<S, C> {
+    pub fn as_(mut self, name: &str) -> ApiRouter<S, C, AuthScope> {
         self.def.name = name.to_string();
         self.parent.routes.push(self.def);
         self.parent
@@ -1041,103 +1110,147 @@ where
     // --- Auto-closing forwarding route methods ---
 
     /// Add a GET route, auto-finalizing the current route in the chain.
-    pub fn get<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn get<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.done().get(path, ep)
     }
 
     /// Add a POST route, auto-finalizing the current route in the chain.
-    pub fn post<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn post<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.done().post(path, ep)
     }
 
     /// Add a PUT route, auto-finalizing the current route in the chain.
-    pub fn put<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn put<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.done().put(path, ep)
     }
 
     /// Add a PATCH route, auto-finalizing the current route in the chain.
-    pub fn patch<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn patch<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.done().patch(path, ep)
     }
 
     /// Add a DELETE route, auto-finalizing the current route in the chain.
-    pub fn delete<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn delete<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.done().delete(path, ep)
     }
 
     /// Add a WebSocket route, auto-finalizing the current route in the chain.
-    pub fn ws<EH, T>(self, path: &str, ep: EH) -> WsRouteBuilder<S, C>
+    pub fn ws<EH, T>(self, path: &str, ep: EH) -> WsRouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.done().ws(path, ep)
     }
 
-    /// Scoped closure-based group, auto-finalizing the current route in the chain.
-    pub fn group<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    /// Like [`layer`](ApiRouter::layer), auto-finalizing the current route in
+    /// the chain first. Non-auth middleware: codegen is unaffected.
+    pub fn layer<L>(self, layer: L) -> ApiRouter<S, C, AuthScope>
     where
-        F: FnOnce(ApiRouter<S, C>) -> R,
-        R: IntoApiRouter<S, C>,
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<axum::extract::Request, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Response:
+            axum::response::IntoResponse,
+        <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
+    {
+        self.done().layer(layer)
+    }
+
+    /// Like [`auth_layer`](ApiRouter::auth_layer), auto-finalizing the current
+    /// route first. Middleware now enforces this scope's authentication —
+    /// the compile-time extractor requirement is lifted from here on.
+    pub fn auth_layer<L>(
+        self,
+        layer: L,
+    ) -> ApiRouter<S, C, crate::params::LayeredAuthScope>
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<axum::extract::Request, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Response:
+            axum::response::IntoResponse,
+        <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
+    {
+        self.done().auth_layer(layer)
+    }
+
+    /// Scoped closure-based group, auto-finalizing the current route in the chain.
+    pub fn group<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C, AuthScope>
+    where
+        F: FnOnce(ApiRouter<S, C, AuthScope>) -> R,
+        R: IntoApiRouterAny<S, C>,
     {
         self.done().group(name, routes)
     }
 
     /// Scoped closure-based prefixed group, auto-finalizing the current route in the chain.
-    pub fn group_prefixed<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    pub fn group_prefixed<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C, AuthScope>
     where
-        F: FnOnce(ApiRouter<S, C>) -> R,
-        R: IntoApiRouter<S, C>,
+        F: FnOnce(ApiRouter<S, C, AuthScope>) -> R,
+        R: IntoApiRouterAny<S, C>,
     {
         self.done().group_prefixed(name, routes)
     }
 
     /// Scoped closure-based permissive group, auto-finalizing the current route in the chain.
-    pub fn group_permissive<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    pub fn group_permissive<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C, AuthScope>
     where
-        F: FnOnce(ApiRouter<S, C>) -> R,
-        R: IntoApiRouter<S, C>,
+        F: FnOnce(ApiRouter<S, C, crate::params::PermissiveScope>) -> R,
+        R: IntoApiRouterAny<S, C>,
     {
         self.done().group_permissive(name, routes)
     }
 
     /// Scoped closure-based public group, auto-finalizing the current route in the chain.
-    pub fn group_public<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    pub fn group_public<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C, AuthScope>
     where
-        F: FnOnce(ApiRouter<S, C>) -> R,
-        R: IntoApiRouter<S, C>,
+        F: FnOnce(ApiRouter<S, C, crate::params::PublicScope>) -> R,
+        R: IntoApiRouterAny<S, C>,
     {
         self.done().group_public(name, routes)
     }
 
     /// Set a URL prefix on the parent router, auto-finalizing the current route in the chain.
-    pub fn set_prefix(self, prefix: &str) -> ApiRouter<S, C> {
+    pub fn set_prefix(self, prefix: &str) -> ApiRouter<S, C, AuthScope> {
         self.done().set_prefix(prefix)
     }
 
@@ -1160,12 +1273,12 @@ where
 ///
 /// Methods that don't make sense for WS (`.body()`, `.response()`, `.json()`,
 /// `.redirect()`) are not available.
-pub struct WsRouteBuilder<S, C: Collector = NoCollect> {
-    parent: ApiRouter<S, C>,
+pub struct WsRouteBuilder<S, C: Collector = NoCollect, AuthScope = crate::params::PrivateScope> {
+    parent: ApiRouter<S, C, AuthScope>,
     def: RouteDefinition,
 }
 
-impl<S, C> WsRouteBuilder<S, C>
+impl<S, C, AuthScope> WsRouteBuilder<S, C, AuthScope>
 where
     S: Clone + Send + Sync + 'static,
     C: Collector,
@@ -1197,13 +1310,13 @@ where
     /// Visibility for WebSocket routes comes from `group_public` /
     /// `group_permissive` or `#[endpoint(public|permissive)]`, like every
     /// other route.
-    fn done(mut self) -> ApiRouter<S, C> {
+    fn done(mut self) -> ApiRouter<S, C, AuthScope> {
         self.parent.routes.push(self.def);
         self.parent
     }
 
     /// Finalize the route with an explicit client method name, overriding the auto-derived name.
-    pub fn as_(mut self, name: &str) -> ApiRouter<S, C> {
+    pub fn as_(mut self, name: &str) -> ApiRouter<S, C, AuthScope> {
         self.def.name = name.to_string();
         self.parent.routes.push(self.def);
         self.parent
@@ -1212,103 +1325,109 @@ where
     // --- Auto-closing forwarding route methods ---
 
     /// Add a GET route, auto-finalizing the current WS route in the chain.
-    pub fn get<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn get<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.done().get(path, ep)
     }
 
     /// Add a POST route, auto-finalizing the current WS route in the chain.
-    pub fn post<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn post<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.done().post(path, ep)
     }
 
     /// Add a PUT route, auto-finalizing the current WS route in the chain.
-    pub fn put<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn put<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.done().put(path, ep)
     }
 
     /// Add a PATCH route, auto-finalizing the current WS route in the chain.
-    pub fn patch<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn patch<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.done().patch(path, ep)
     }
 
     /// Add a DELETE route, auto-finalizing the current WS route in the chain.
-    pub fn delete<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C>
+    pub fn delete<EH, T>(self, path: &str, ep: EH) -> RouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.done().delete(path, ep)
     }
 
     /// Add a WebSocket route, auto-finalizing the current WS route in the chain.
-    pub fn ws<EH, T>(self, path: &str, ep: EH) -> WsRouteBuilder<S, C>
+    pub fn ws<EH, T>(self, path: &str, ep: EH) -> WsRouteBuilder<S, C, AuthScope>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
         T: 'static,
+        AuthScope: crate::params::AllowsRoute<S, EH, T>,
     {
         self.done().ws(path, ep)
     }
 
     /// Scoped closure-based group, auto-finalizing the current WS route in the chain.
-    pub fn group<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    pub fn group<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C, AuthScope>
     where
-        F: FnOnce(ApiRouter<S, C>) -> R,
-        R: IntoApiRouter<S, C>,
+        F: FnOnce(ApiRouter<S, C, AuthScope>) -> R,
+        R: IntoApiRouterAny<S, C>,
     {
         self.done().group(name, routes)
     }
 
     /// Scoped closure-based prefixed group, auto-finalizing the current WS route in the chain.
-    pub fn group_prefixed<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    pub fn group_prefixed<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C, AuthScope>
     where
-        F: FnOnce(ApiRouter<S, C>) -> R,
-        R: IntoApiRouter<S, C>,
+        F: FnOnce(ApiRouter<S, C, AuthScope>) -> R,
+        R: IntoApiRouterAny<S, C>,
     {
         self.done().group_prefixed(name, routes)
     }
 
     /// Scoped closure-based permissive group, auto-finalizing the current WS route in the chain.
-    pub fn group_permissive<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    pub fn group_permissive<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C, AuthScope>
     where
-        F: FnOnce(ApiRouter<S, C>) -> R,
-        R: IntoApiRouter<S, C>,
+        F: FnOnce(ApiRouter<S, C, crate::params::PermissiveScope>) -> R,
+        R: IntoApiRouterAny<S, C>,
     {
         self.done().group_permissive(name, routes)
     }
 
     /// Scoped closure-based public group, auto-finalizing the current WS route in the chain.
-    pub fn group_public<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C>
+    pub fn group_public<R, F>(self, name: &str, routes: F) -> ApiRouter<S, C, AuthScope>
     where
-        F: FnOnce(ApiRouter<S, C>) -> R,
-        R: IntoApiRouter<S, C>,
+        F: FnOnce(ApiRouter<S, C, crate::params::PublicScope>) -> R,
+        R: IntoApiRouterAny<S, C>,
     {
         self.done().group_public(name, routes)
     }
 
     /// Set a URL prefix on the parent router, auto-finalizing the current WS route in the chain.
-    pub fn set_prefix(self, prefix: &str) -> ApiRouter<S, C> {
+    pub fn set_prefix(self, prefix: &str) -> ApiRouter<S, C, AuthScope> {
         self.done().set_prefix(prefix)
     }
 

@@ -80,7 +80,6 @@ impl Default for GeneratorConfig {
 impl GeneratorConfig {
     /// Returns a ts-rs [`Config`](crate::ts::Config) with matching `large_int_type`,
     /// for use with [`RouteCollection::export_types_with`](crate::RouteCollection::export_types_with).
-    #[cfg(feature = "ts-rs")]
     pub fn ts_config(&self) -> crate::ts::Config {
         crate::ts::Config::from_env().with_large_int(self.large_int_type.clone())
     }
@@ -525,6 +524,22 @@ const OPTIONS_INTERFACE_BEARER: &str = r#"export interface __OPTS__ {
   getToken?: () => Promise<string | null>;
 "#;
 
+/// Extra options when an `auth_scheme!` flow is declared: the client owns the
+/// session lifecycle instead of every consumer re-implementing it.
+/// `auth` options field. The store is a union: string stores (exchange /
+/// static flows) and OAuthSession stores (oauth2 pairs) share one contract;
+/// the runtime reads the bearer from either shape.
+const OPTIONS_AUTH_LIFECYCLE_FIELD: &str = r#"  /**
+   * Session lifecycle (declared via `auth_scheme!`). `store` replaces bare
+   * `getToken` as the bearer source when set (string or OAuthSession
+   * shape — follow the declared flow kind); `refresh` is single-flighted,
+   * replayed once on a 401, and run proactively when a session's
+   * `expiresAt` is inside the refresh skew; `onSessionExpired` fires when
+   * refresh cannot produce a working token.
+   */
+  auth?: AuthLifecycleOptions;
+"#;
+
 const OPTIONS_INTERFACE_PLAIN_HEAD: &str = r#"export interface __OPTS__ {
   baseUrl: string;
 "#;
@@ -543,10 +558,15 @@ const OPTIONS_INTERFACE_NONE: &str = r#"export interface __OPTS__ {
 "#;
 
 /// Assemble the options interface for the configured auth scheme.
-fn options_interface(config: &GeneratorConfig) -> String {
+fn options_interface(config: &GeneratorConfig, lifecycle: bool) -> String {
     let mut s = String::new();
     match config.auth_scheme {
-        AuthScheme::Bearer => s.push_str(OPTIONS_INTERFACE_BEARER),
+        AuthScheme::Bearer => {
+            s.push_str(OPTIONS_INTERFACE_BEARER);
+            if lifecycle {
+                s.push_str(OPTIONS_AUTH_LIFECYCLE_FIELD);
+            }
+        }
         AuthScheme::Cookie => {
             s.push_str(OPTIONS_INTERFACE_PLAIN_HEAD);
             if config.csrf_header_name.is_some() {
@@ -561,6 +581,81 @@ fn options_interface(config: &GeneratorConfig) -> String {
     s
 }
 
+/// Bearer storage owned by the app. The client reads it before every
+/// credentialed call; knowledge of the token's wire shape lives here and
+/// only here.
+const TOKEN_STORE_INTERFACE: &str = r#"export interface TokenStore {
+  get(): string | null;
+  set(token: string | null): void;
+}
+
+/** OAuth2 session persisted by the generated runtime: the single storage
+    path for the credential pair plus derived expiry. */
+export interface OAuthSession {
+  access: string;
+  /** Rotating refresh token; `null` on non-rotating providers or when none
+   * was ever issued. */
+  refresh: string | null;
+  /** Epoch ms, from `expires_in` when declared, else decoded from the JWT
+   * `exp` claim; `null` when neither is readable. */
+  expiresAt: number | null;
+}
+
+/** OAuth2 session storage owned by the app. */
+export interface SessionStore {
+  get(): OAuthSession | null;
+  set(session: OAuthSession | null): void;
+}
+
+/** Decode the `exp` claim (epoch ms) from an unverified JWT payload. The
+    signature is verified server-side; this only schedules refreshes. */
+function decodeJwtExp(token: string): number | null {
+  try {
+    const part = token.split(".")[1];
+    if (!part) return null;
+    const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
+    const json = decodeURIComponent(
+      atob(b64)
+        .split("")
+        .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
+        .join(""),
+    );
+    const exp = JSON.parse(json)?.exp;
+    return typeof exp === "number" ? exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Credential storage the runtime talks to. `TokenStore` (string) and
+    `SessionStore` (OAuthSession) are both assignable shapes — implement
+    whichever matches the declared flow kind. */
+export interface AuthStore {
+  get(): string | OAuthSession | null;
+  set(credential: string | OAuthSession | null): void;
+}
+
+/** Session lifecycle configuration (declared via `auth_scheme!`). */
+export interface AuthLifecycleOptions {
+  /** Bearer/session source; replaces `getToken` when set. */
+  store?: AuthStore;
+  /**
+   * Refresh the session from the lower-grade credential (refresh token,
+   * session cookie). Single-flighted: parallel 401s share one call. Return
+   * `null` when the session cannot be recovered. When the declaration names
+   * the response field (`-> token`), the generated client already binds this
+   * to the declared route — only override to customize.
+   */
+  refresh?: () => Promise<string | null>;
+  /**
+   * Terminal session loss — refresh produced no token (or the replay still
+   * 401'd). Should be idempotent: a parallel-401 storm fans out into several
+   * failed calls that all report the same dead session.
+   */
+  onSessionExpired?: (error: __ERROR__) => void;
+}
+"#;
+
 const REQUEST_OPTIONS_TYPE: &str = "\
 /** Route call options. Fully generator-pinned per route — route methods take
     no caller options, so these fields are never user-supplied. */
@@ -573,6 +668,8 @@ type RequestOptions = {
   permissive?: boolean;
   /** Follow redirects only for credentialless calls to declaring routes. */
   allowRedirects?: boolean;
+  /** @internal — lifecycle replay guard, set only by the 401 retry path. */
+  retried?: boolean;
 };
 \
 /** The `request` helper produced by `createRequest`, for the routes factory. */
@@ -632,6 +729,7 @@ function createRequest(options: __OPTS__) {
   // browser engines.
   const boundFetch =
     options.fetch !== undefined ? options.fetch : globalThis.fetch.bind(globalThis);
+__TOKEN_PREAMBLE__
 
   async function request<T>(path: string, opts?: RequestOptions): Promise<T>;
   async function request<T>(
@@ -682,25 +780,211 @@ const REQUEST_AUTH_BEARER: &str = r#"
     // fails for want of them; any other [auth] route requires a token.
     if (auth) {
       if (permissive) {
-        if (options.getToken) {
-          const token = await options.getToken();
+        if (getToken) {
+          const token = await getToken();
           if (token) headers.Authorization = `Bearer ${token}`;
         }
       } else {
-        if (!options.getToken) {
+        if (!getToken) {
           throw new Error(
-            `Route declared [auth] but options.getToken was not configured (${method} ${path})`,
+            `Route declared [auth] but no token source was configured (getToken / auth.store) (${method} ${path})`,
           );
         }
-        const token = await options.getToken();
+        const token = await getToken();
         if (!token) {
           throw new Error(
-            `options.getToken() returned no token for an [auth] route (${method} ${path})`,
+            `The configured token source returned no token for an [auth] route (${method} ${path})`,
           );
         }
         headers.Authorization = `Bearer ${token}`;
       }
     }
+"#;
+
+/// Token-source preamble emitted under [`AuthScheme::Bearer`]. Without a
+/// declared flow it is a plain local alias; with one, `auth.store` (when
+/// configured) becomes the bearer source, the refresh hook resolves
+/// (app-supplied, or auto-bound to the declared lifecycle route), and the
+/// single-flight machinery the 401 replay path uses comes into existence.
+const TOKEN_PREAMBLE_PLAIN: &str = r#"  const getToken = options.getToken;
+"#;
+
+/// Facts needed to emit a refresh hook auto-bound to a declared lifecycle
+/// route (`-> field` / `-> { access, refresh, expires_in }`).
+struct AutoRefresh {
+    method: &'static str,
+    path: String,
+    auth: bool,
+    permissive: bool,
+    response_ts: String,
+    /// camelCased response field(s) carrying the credential.
+    mode: AutoMode,
+}
+
+enum AutoMode {
+    /// Single bearer field (exchange kinds).
+    Bearer { field: String },
+    /// OAuth2 pair: access required; refresh (rotating) and expires_in
+    /// (seconds) optional — absent refresh keeps the stored one, absent
+    /// expires_in falls back to decoding the JWT `exp` claim.
+    Pair {
+        access: String,
+        refresh: Option<String>,
+        expires_in: Option<String>,
+    },
+}
+
+/// Assemble the lifecycle token preamble (store resolution + refresh hook +
+/// single-flight). `auto` is `Some` when the declaration carried `-> field`
+/// and the route it binds to is usable; then the hook defaults to calling
+/// that route instead of requiring app glue.
+fn token_preamble(auto: Option<&AutoRefresh>) -> String {
+    let mut s = String::from(
+        r#"  // Token source: the store owns the credential when configured; getToken
+  // stays the low-level escape hatch. Shape-aware: string stores (exchange)
+  // yield the bearer directly; OAuthSession stores (oauth2) yield
+  // `.access` and refresh proactively when expiry is inside the skew
+  // window — the 401 path below stays as the fallback.
+  const getToken: (() => Promise<string | null>) | undefined = options.auth?.store
+    ? async () => {
+        let s = options.auth!.store!.get();
+        if (
+          s && typeof s === "object" &&
+          s.expiresAt !== null && Date.now() >= s.expiresAt - 30_000 &&
+          refreshHook && refreshDepth === 0
+        ) {
+          await refreshOnce();
+          s = options.auth!.store!.get();
+        }
+        return typeof s === "string" ? s : (s?.access ?? null);
+      }
+    : options.getToken;
+"#,
+    );
+    match auto {
+        None => s.push_str(
+            r#"  const refreshHook: (() => Promise<string | null>) | undefined = options.auth?.refresh;
+"#,
+        ),
+        Some(a) => {
+            let path = build_path_template(&a.path);
+            let call = format!(
+                r#"await request<{resp}>({path}, {{ method: "{method}", auth: {auth}, permissive: {permissive}, allowRedirects: false }})"#,
+                resp = a.response_ts,
+                path = path,
+                method = a.method,
+                auth = a.auth,
+                permissive = a.permissive,
+            );
+            match &a.mode {
+                AutoMode::Bearer { field } => s.push_str(&format!(
+                    r#"  // Refresh hook: app-supplied, or auto-bound to the declared lifecycle
+  // route (`-> field` in auth_scheme!) — the ambient credential (session
+  // cookie) rides the call; `null` from the declared field means the
+  // session cannot be recovered.
+  const refreshHook: (() => Promise<string | null>) | undefined =
+    options.auth?.refresh ??
+    (async () => {{
+      const resp = {call};
+      const fresh = resp?.{field} ?? null;
+      // Persist so the 401 replay re-reads a fresh bearer, not the stale
+      // one — zero-glue means the hook owns storage, not the app.
+      if (fresh !== null) options.auth?.store?.set(fresh);
+      return fresh;
+    }});
+"#,
+                    call = call,
+                    field = field,
+                )),
+                AutoMode::Pair { access, refresh, expires_in } => {
+                    let keep = match refresh {
+                        Some(f) => format!("resp?.{f} ?? prevRefresh"),
+                        None => "prevRefresh".to_string(),
+                    };
+                    let exp = match expires_in {
+                        Some(f) => format!(
+                            "resp?.{f} != null ? Date.now() + resp.{f} * 1000 : decodeJwtExp(resp.{access})"
+                        ),
+                        None => format!("decodeJwtExp(resp.{access})"),
+                    };
+                    s.push_str(&format!(
+                        r#"  // Refresh hook: app-supplied, or auto-bound to the declared lifecycle
+  // route (`-> {{ access, refresh, expires_in }}` in auth_scheme!). Maps the
+  // response into an OAuthSession, persists it through the store, returns
+  // the bearer. Rotation-agnostic: an absent refresh field keeps the stored
+  // one. `null` access means the session cannot be recovered.
+  const refreshHook: (() => Promise<string | null>) | undefined =
+    options.auth?.refresh ??
+    (async () => {{
+      const resp = {call};
+      if (!resp || resp?.{access} == null) return null;
+      const prev = options.auth?.store?.get() ?? null;
+      const prevRefresh = typeof prev === "object" ? (prev?.refresh ?? null) : null;
+      const session: OAuthSession = {{
+        access: resp.{access},
+        refresh: {keep},
+        expiresAt: {exp},
+      }};
+      options.auth?.store?.set(session);
+      return session.access;
+    }});
+"#,
+                        call = call,
+                        access = access,
+                        keep = keep,
+                        exp = exp,
+                    ));
+                }
+            }
+        }
+    }
+    s.push_str(
+        r#"  // Single-flight refresh: parallel 401s (a page boot firing several
+  // credentialed calls with a stale bearer) share one refresh call — with
+  // rotating credentials, concurrent refreshes invalidate each other.
+  let refreshInFlight: Promise<string | null> | null = null;
+  // >0 while a refresh (and its inner lifecycle request) runs. The token
+  // read and the 401-retry path both check it: a lifecycle route that
+  // itself attaches credentials must never trigger a second refresh
+  // against the already-in-flight one — that would self-await and hang.
+  let refreshDepth = 0;
+  const refreshOnce = (): Promise<string | null> => {
+    if (!refreshInFlight) {
+      refreshInFlight = (async () => {
+        refreshDepth++;
+        try {
+          return await refreshHook!();
+        } finally {
+          refreshDepth--;
+          refreshInFlight = null;
+        }
+      })();
+    }
+    return refreshInFlight;
+  };
+"#,
+    );
+    s
+}
+
+/// Inserted at the top of the `!response.ok` branch when a lifecycle is
+/// declared: a 401 from a credentialed route is a session event. Refresh
+/// once (single-flighted), replay the request with the fresh token, and
+/// report terminal expiry. Permissive routes are excluded — an anonymous 401
+/// is an answer for them, not a session event.
+const REQUEST_401_RETRY: &str = r#"      if (auth && !permissive && refreshHook && refreshDepth === 0) {
+        if (opts.retried !== true) {
+          const fresh = await refreshOnce();
+          if (fresh !== null) {
+            return (request as unknown as (
+              p: string,
+              o: RequestOptions | undefined,
+              r: boolean | undefined,
+            ) => Promise<T>)(path, { ...opts, retried: true }, rawResponse);
+          }
+        }
+        options.auth?.onSessionExpired?.(new __ERROR__("session expired", 401));
+      }
 "#;
 
 /// Auth section of the request helper for [`AuthScheme::Cookie`]: browsers
@@ -747,6 +1031,7 @@ const REQUEST_HELPER_POST: &str = r#"
     });
 
     if (!response.ok) {
+__401_RETRY__
       const text = await response.text();
       let message: string;
       let errorBody: unknown;
@@ -773,10 +1058,17 @@ const REQUEST_HELPER_POST: &str = r#"
 "#;
 
 /// Assemble the request helper for the configured auth scheme.
-fn request_helper(config: &GeneratorConfig) -> String {
-    let mut s = String::from(REQUEST_HELPER_PRE);
+fn request_helper(config: &GeneratorConfig, lifecycle: bool, lifecycle_preamble: &str) -> String {
+    let preamble: &str = match config.auth_scheme {
+        AuthScheme::Bearer if lifecycle => lifecycle_preamble,
+        AuthScheme::Bearer => TOKEN_PREAMBLE_PLAIN,
+        _ => "",
+    };
+    let mut s = REQUEST_HELPER_PRE.replace("__TOKEN_PREAMBLE__", preamble);
     match config.auth_scheme {
-        AuthScheme::Bearer => s.push_str(REQUEST_AUTH_BEARER),
+        AuthScheme::Bearer => {
+            s.push_str(REQUEST_AUTH_BEARER);
+        }
         AuthScheme::Cookie => {
             s.push_str(REQUEST_AUTH_COOKIE);
             if config.csrf_header_name.is_some() {
@@ -785,7 +1077,8 @@ fn request_helper(config: &GeneratorConfig) -> String {
         }
         AuthScheme::None => {}
     }
-    s.push_str(REQUEST_HELPER_POST);
+    let retry: &str = if lifecycle { REQUEST_401_RETRY } else { "" };
+    s.push_str(&REQUEST_HELPER_POST.replace("__401_RETRY__", retry));
     s
 }
 
@@ -838,6 +1131,95 @@ pub fn generate_with_warnings(
     config: &GeneratorConfig,
 ) -> (String, Vec<String>) {
     let mut warnings = Vec::new();
+
+    // A declared flow is the router's truth about the WS credential
+    // pathway too: when the config leaves ws_ticket_path unset, the flow's
+    // mint route supplies it (no second place to keep in sync).
+    let mut config = config.clone();
+    if let Some(flow) = routes.auth_flow() {
+        if config.ws_ticket_path.is_none() {
+            if let Some(path) = flow
+                .ws_ticket
+                .as_deref()
+                .and_then(|name| routes.find_by_name(name))
+            {
+                config.ws_ticket_path = Some(path.path.clone());
+            }
+        }
+        if config.auth_scheme != AuthScheme::Bearer {
+            warnings.push(format!(
+                "auth flow '{}' is declared but the client was generated with a \
+                 non-Bearer scheme; the declaration only drives Bearer lifecycle \
+                 machinery and is ignored here.",
+                flow.name
+            ));
+        }
+    }
+
+    // Resolve the auto-bound refresh hook (exchange kind + `-> field`).
+    // Anything that prevents the emitted hook from working is a warning +
+    // manual `auth.refresh`, never a silently broken default.
+    let mut auto: Option<AutoRefresh> = None;
+    if let Some(flow) = routes.auth_flow() {
+        if config.auth_scheme == AuthScheme::Bearer && flow.token_fields.is_some() {
+            let camel = |f: &str| crate::builder::snake_to_camel(f);
+            let mode = match flow.token_fields.as_ref().unwrap() {
+                crate::auth_flow::TokenFields::Bearer(field) => AutoMode::Bearer {
+                    field: camel(field),
+                },
+                crate::auth_flow::TokenFields::Pair {
+                    access,
+                    refresh,
+                    expires_in,
+                } => AutoMode::Pair {
+                    access: camel(access),
+                    refresh: refresh.as_deref().map(camel),
+                    expires_in: expires_in.as_deref().map(camel),
+                },
+            };
+            let route_name = flow
+                .refresh
+                .as_deref()
+                .or_else(|| flow.bootstrap.first().map(|s| s.as_str()));
+            match route_name.and_then(|name| routes.find_by_name(name)) {
+                None => warnings.push(format!(
+                    "auth flow '{}': token fields declared but their route is \
+                     not registered — no default refresh hook; pass auth.refresh manually.",
+                    flow.name
+                )),
+                Some(r) if r.websocket || r.redirect => warnings.push(format!(
+                    "auth flow '{}': the lifecycle route '{}' is a {} route; the default \
+                     refresh hook only binds to plain HTTP routes. Pass auth.refresh manually.",
+                    flow.name, r.name, if r.websocket { "websocket" } else { "redirect" }
+                )),
+                Some(r) if r.body_type.is_some() => warnings.push(format!(
+                    "auth flow '{}': lifecycle route '{}' takes a request body; the \
+                     default refresh hook cannot supply one. Pass auth.refresh manually.",
+                    flow.name, r.name
+                )),
+                Some(r) if r.response_type.is_none() => warnings.push(format!(
+                    "auth flow '{}': lifecycle route '{}' declares no response type \
+                     (.response::<T>() or #[endpoint]); cannot extract the token \
+                     fields. Pass auth.refresh manually.",
+                    flow.name, r.name
+                )),
+                Some(r) => {
+                    auto = Some(AutoRefresh {
+                        method: r.method.as_str(),
+                        path: r.path.clone(),
+                        auth: r.is_credentialed(),
+                        permissive: r.is_permissive(),
+                        response_ts: rust_type_to_ts_with(
+                            r.response_type.as_deref().unwrap(),
+                            config.large_int_type.as_str(),
+                        ),
+                        mode,
+                    });
+                }
+            }
+        }
+    }
+
     for route in routes.iter().filter(|r| r.is_credentialed()) {
         if route.declared == Visibility::Public {
             warnings.push(format!(
@@ -872,11 +1254,22 @@ pub fn generate_with_warnings(
         }
     }
 
-    (generate_client(routes, config), warnings)
+    (generate_client(routes, &config, auto.as_ref()), warnings)
 }
 
-fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String {
+fn generate_client(
+    routes: &RouteCollection,
+    config: &GeneratorConfig,
+    auto: Option<&AutoRefresh>,
+) -> String {
     let mut out = String::new();
+
+    // Lifecycle machinery exists only for a declared flow under Bearer —
+    // every other emission below branches on this one flag.
+    let lifecycle = routes
+        .auth_flow()
+        .is_some_and(|f| f.kind != crate::auth_flow::AuthFlowKind::StaticBearer)
+        && config.auth_scheme == AuthScheme::Bearer;
 
     // Header
     w!(out, "// Auto-generated by axotyped. Do not edit.");
@@ -933,11 +1326,24 @@ fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String
 
     out.push_str(&substitute(ERROR_CLASS));
     w!(out);
-    out.push_str(&substitute(&options_interface(config)));
+    if lifecycle {
+        out.push_str(&substitute(TOKEN_STORE_INTERFACE));
+        w!(out);
+    }
+    out.push_str(&substitute(&options_interface(config, lifecycle)));
     w!(out);
     out.push_str(REQUEST_OPTIONS_TYPE);
     w!(out);
-    out.push_str(&substitute(&request_helper(config)));
+    let lifecycle_preamble = if lifecycle {
+        token_preamble(auto)
+    } else {
+        String::new()
+    };
+    out.push_str(&substitute(&request_helper(
+        config,
+        lifecycle,
+        &lifecycle_preamble,
+    )));
     w!(out);
 
     // Typed WebSocket helpers — only if any WS route exists
@@ -963,6 +1369,10 @@ fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String
         version = env!("CARGO_PKG_VERSION")
     );
     w!(out);
+    if let Some(flow) = routes.auth_flow() {
+        out.push_str(&auth_flow_constant(flow));
+        w!(out);
+    }
     // `{type_name}` resolves acyclically because the routes factory is a
     // separate function; `withOptions`'s self-reference sits under an object
     // property, which TS resolves lazily. The exported factory is emitted
@@ -1026,6 +1436,28 @@ fn generate_grouped_routes(out: &mut String, routes: &RouteCollection, config: &
         match &route.group {
             Some(group) => groups.entry(group.clone()).or_default().push(route),
             None => ungrouped.push(route),
+        }
+    }
+
+    // The declared flow's lifecycle routes also surface under a synthetic
+    // `auth` namespace — `api.auth.me()` next to `api.me()` — so bootstrap,
+    // refresh, and ticket minting are discoverable in one place. Routes
+    // already grouped under "auth" are not duplicated.
+    if config.auth_scheme == AuthScheme::Bearer {
+        if let Some(flow) = routes.auth_flow() {
+            let entry = groups.entry("auth".to_string()).or_default();
+            for name in flow
+                .bootstrap
+                .iter()
+                .chain(flow.refresh.iter())
+                .chain(flow.ws_ticket.iter())
+            {
+                if let Some(route) = routes.find_by_name(name) {
+                    if !entry.iter().any(|r| r.name == route.name) {
+                        entry.push(route);
+                    }
+                }
+            }
         }
     }
 
@@ -1150,6 +1582,71 @@ fn generate_redirect_method(
             write!(out, ": ({params}) => `${{options.baseUrl}}{path_inner}`").unwrap();
         }
     }
+}
+
+/// Emits the `AUTH_FLOW` constant: the server-side declaration, pinned
+/// client-side so consumers (and the app's auth glue) read facts — flow
+/// kind, lifecycle method names, scheme constants — from one object.
+fn auth_flow_constant(flow: &crate::auth_flow::AuthFlow) -> String {
+    let mut s = String::new();
+    w!(
+        s,
+        "/** Credential lifecycle declared server-side via `auth_scheme!`. */"
+    );
+    w!(s, "export const AUTH_FLOW = {{");
+    w!(s, "  kind: \"{}\",", escape_js_string(flow.kind.label()));
+    w!(
+        s,
+        "  bootstrap: [{}],",
+        flow.bootstrap
+            .iter()
+            .map(|n| format!("\"{}\"", escape_js_string(n)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    match &flow.refresh {
+        Some(name) => w!(
+            s,
+            "  refresh: \"{}\",",
+            escape_js_string(name)
+        ),
+        None => w!(s, "  refresh: null,"),
+    }
+    match &flow.ws_ticket {
+        Some(name) => w!(s, "  wsTicket: \"{}\",", escape_js_string(name)),
+        None => w!(s, "  wsTicket: null,"),
+    }
+    match &flow.token_fields {
+        Some(crate::auth_flow::TokenFields::Bearer(field)) => {
+            w!(
+                s,
+                "  tokenFields: {{ access: \"{}\" }},",
+                escape_js_string(&crate::builder::snake_to_camel(field))
+            );
+        }
+        Some(crate::auth_flow::TokenFields::Pair { access, refresh, expires_in }) => {
+            let camel = |f: &Option<String>| {
+                f.as_deref().map(|x| format!("\"{}\"", escape_js_string(&crate::builder::snake_to_camel(x))))
+            };
+            w!(s, "  tokenFields: {{ access: \"{a}\", refresh: {r}, expiresIn: {e} }},",
+                a = escape_js_string(&crate::builder::snake_to_camel(access)),
+                r = camel(refresh).as_deref().unwrap_or("null"),
+                e = camel(expires_in).as_deref().unwrap_or("null"));
+        }
+        None => w!(s, "  tokenFields: null,"),
+    }
+    w!(s, "  constants: {{");
+    for (key, value) in &flow.constants {
+        w!(
+            s,
+            "    {}: \"{}\",",
+            crate::builder::snake_to_camel(key),
+            escape_js_string(value)
+        );
+    }
+    w!(s, "  }},");
+    w!(s, "}} as const;");
+    s
 }
 
 /// Derives a type name from a factory name (`createFooClient` -> `FooClient`).
