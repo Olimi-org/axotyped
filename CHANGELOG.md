@@ -1,10 +1,9 @@
-## 0.4.0 (2026-10-06)
+## 0.4.0 (2026-10-07)
 
 ### Breaking changes
 
-- **The client runtime no longer owns credential state.** The `AuthEngine`, the provenance ledger, the store mirrors (`TokenStore`/`SessionStore`/`AuthStore`/`OAuthSession`), `AuthLifecycleOptions`, and the `auth: { store, refresh, onSessionExpired }` options object are gone. `createTransport` takes `(options, policy, operations)`.
 - **Every client names its credential with `getToken`.** A declared flow offers `onUnauthorized` alongside it; there is no second bearer source.
-- **`onUnauthorized` replaces the engine's 401 recovery.** Called after a 401 on a `required` bearer route; return the credential to replay with, or `null` when the session cannot be renewed. Throwing is treated as `null` — either way the server's own 401 surfaces, not the hook's error. Replay is bounded at two, and the replay credential is the hook's *return value*: the transport never re-reads `getToken` to decide who the caller is, so a request cannot be re-sent under a session the application has since replaced.
+- **`onUnauthorized` is the 401 replay hook.** Called after a 401 on a `required` bearer route; return the credential to replay with, or `null` when the session cannot be renewed. Throwing is treated as `null` — either way the server's own 401 surfaces, not the hook's error. Replay is bounded at two, and the replay credential is the hook's *return value*: the transport never re-reads `getToken` to decide who the caller is, so a request cannot be re-sent under a session the application has since replaced.
 - **Cookie routes do not replay.** Nothing an application does mid-flight changes what the browser already put in the cookie jar; a cookie 401 is terminal by construction.
 - **Proactive renewal, rotation persistence, and single-flight are the application's.** `singleFlight` and `jwtExpiry` are exported as stateless primitives for it.
 - **`-> token` now buys a generated renewal helper instead of wiring the transport.** `auth_scheme!` emits `refreshBearer(client)` (or `refreshSession(client)` for an oauth2 pair) that calls the declared route and lifts the declared fields off its response. Because the helper reads them off the *imported response type*, `tsc` checks every declared name against what the client will parse — replacing the runtime's uncheckable string-keyed extraction. `AUTH` is emitted as data for application glue; nothing in the runtime interprets it.
