@@ -33,9 +33,6 @@ pub struct PathParam {
 }
 
 /// What a route declares — and effectively is — regarding authentication.
-///
-/// Matched on directly so each state carries its own meaning instead of
-/// combining booleans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Visibility {
     /// Requires authentication. The generated client attaches credentials
@@ -44,8 +41,7 @@ pub enum Visibility {
     Private,
     /// Open. The generated client sends no credentials for the call.
     Public,
-    /// Best-effort credentials: attached when available, never required.
-    /// Anonymous calls go out as-is; the endpoint is expected to serve both.
+    /// Credentials attached when available, never required.
     Permissive,
 }
 
@@ -58,15 +54,11 @@ pub struct RouteDefinition {
     pub method: HttpMethod,
     /// Route path (e.g., `/register`, `/admin/users/{id}`).
     pub path: String,
-    /// Effective visibility after scopes and layers. Drives codegen:
-    /// `Private` requires credentials, `Permissive` attaches them
-    /// best-effort, `Public` sends none.
+    /// Effective visibility after scopes and layers.
     pub visibility: Visibility,
-    /// Declaration-site visibility (`#[endpoint(public|permissive)]`,
-    /// `[public|permissive]`, or a `group_public`/`group_permissive` scope).
-    /// Differs from `visibility` when an `auth_layer` in scope forces a
-    /// declared-public route back to `Private` (reported by
-    /// `generate_with_warnings`).
+    /// Declaration-site visibility. Differs from `visibility` when an
+    /// `auth_layer` in scope forces a declared-public route to `Private`
+    /// (reported by `generate_with_warnings`).
     pub declared: Visibility,
     /// Rust type name of the request body (stringified via `stringify!()`).
     pub body_type: Option<String>,
@@ -79,9 +71,7 @@ pub struct RouteDefinition {
     /// Group name for nested object structure (e.g., `emailPassword`).
     pub group: Option<String>,
     /// Whether this route may follow redirects (`[allow_redirects]`).
-    /// A route property decided server-side at generation time — never
-    /// caller-suppliable. Only takes effect for credentialless calls;
-    /// anything carrying auth or cookies still refuses.
+    /// Server-side route property. Applies to credentialless calls only.
     pub allow_redirects: bool,
     /// Whether this route is a browser redirect (not a fetch call).
     pub redirect: bool,
@@ -94,13 +84,12 @@ pub struct RouteDefinition {
 }
 
 impl RouteDefinition {
-    /// Whether calls carry credentials (`Private` or `Permissive` effective
-    /// visibility): transport guard, cache bypass, and redirect refusal apply.
+    /// Whether calls carry credentials (`Private` or `Permissive`).
     pub fn is_credentialed(&self) -> bool {
         !matches!(self.visibility, Visibility::Public)
     }
 
-    /// Whether credentials are best-effort rather than required.
+    /// Whether credentials are attached when available, never required.
     pub fn is_permissive(&self) -> bool {
         matches!(self.visibility, Visibility::Permissive)
     }
@@ -111,7 +100,6 @@ impl RouteDefinition {
 // ---------------------------------------------------------------------------
 
 /// A type-erased `T::export_all(&cfg)` function pointer.
-/// Used to call ts-rs's export mechanism for types discovered during route building.
 type ExportFn = fn(&crate::ts::Config) -> Result<(), crate::ts::ExportError>;
 
 /// Called when a route names type `T` for TypeScript export.
@@ -241,9 +229,7 @@ impl RouteCollection {
     pub fn extend(&mut self, other: RouteCollection) {
         self.routes.extend(other.routes);
         self.types.extend(other.types);
-        // Same rule as the router's merge: one credential lifecycle per
-        // collection — a second flow is a declaration conflict, not an
-        // override. Fails fast rather than silently keeping the first.
+        // One credential lifecycle per collection.
         match (&self.auth_flow, other.auth_flow) {
             (Some(existing), Some(flow)) => panic!(
                 "two auth flows declared ('{}' and '{}'); \
@@ -252,6 +238,12 @@ impl RouteCollection {
             ),
             (None, flow) => self.auth_flow = flow,
             _ => {}
+        }
+        // Re-validate: each side was validated against its own routes only.
+        if let Some(flow) = &self.auth_flow {
+            if let Err(e) = flow.validate(&self.routes) {
+                panic!("auth_scheme '{}': merged route table invalidates the flow: {e}", flow.name);
+            }
         }
     }
 
@@ -275,8 +267,6 @@ impl RouteCollection {
     }
 
     /// Exports collected types and dependencies to `dir` via `export_all()`.
-    /// Call before `generate_to_file()`; replaces manual per-type exports.
-    /// Types come from `.response::<T>()`, `.body::<T>()`, `.query::<T>()`, `.events::<A, B>()`.
     pub fn export_types(&self, dir: &std::path::Path) -> Result<(), std::io::Error> {
         self.export_types_with(dir, crate::ts::Config::from_env())
     }
@@ -374,17 +364,9 @@ impl<'a> IntoIterator for &'a RouteCollection {
 }
 
 /// Returns true if `name` can be emitted as-is in generated code.
-/// ASCII identifier check plus reserved-word rejection; rejected names
-/// become synthetic `__param_N` placeholders.
 pub fn is_valid_js_identifier(name: &str) -> bool {
-    // ECMAScript reserved words (rejected unconditionally so output is safe
-    // in strict / module / generator contexts) plus the strict-mode binding
-    // bans `arguments` and `eval`. Contextual names like `async`/`of`/`as`/
-    // `from`/`get`/`set` are legal as plain bindings and stay allowed.
+    // ECMAScript reserved words plus `arguments` / `eval`.
     const RESERVED: &[&str] = &[
-        // Reserved words (incl. `await`/`yield`/`enum`, reserved only in
-        // module / async / generator / strict contexts — rejected
-        // unconditionally so output is safe in all of them)
         "await",
         "break",
         "case",
@@ -423,9 +405,7 @@ pub fn is_valid_js_identifier(name: &str) -> bool {
         "while",
         "with",
         "yield",
-        // Future reserved words in strict mode / modules (incl. class-side
-        // `static`, `private`, `protected`, `public` — still FutureReservedWord
-        // per spec even though class syntax implements them)
+        // Future reserved words in strict mode / modules
         "implements",
         "interface",
         "let",
@@ -448,8 +428,6 @@ pub fn is_valid_js_identifier(name: &str) -> bool {
 }
 
 /// Extracts `{...}` params from a path (e.g. `/users/{id}` -> `[id]`).
-/// Repeats collapse to first occurrence; non-identifiers become `__param_N`,
-/// matching path-template generation.
 pub fn extract_path_params(path: &str) -> Vec<PathParam> {
     let raws = scan_raw_path_params(path);
 
@@ -470,7 +448,6 @@ pub fn extract_path_params(path: &str) -> Vec<PathParam> {
 }
 
 /// Returns raw `{...}` contents in first-occurrence order.
-/// An unterminated `{` ends the scan; the remainder is literal text.
 fn scan_raw_path_params(path: &str) -> Vec<&str> {
     let mut raws: Vec<&str> = Vec::new();
     let mut rest = path;
@@ -489,17 +466,7 @@ fn scan_raw_path_params(path: &str) -> Vec<&str> {
     raws
 }
 
-/// Raw names in `path` that are valid identifiers.
-pub(crate) fn scan_taken_param_names(path: &str) -> std::collections::BTreeSet<String> {
-    scan_raw_path_params(path)
-        .into_iter()
-        .filter(|raw| is_valid_js_identifier(raw))
-        .map(String::from)
-        .collect()
-}
-
-/// Maps a raw param name to its emitted name, allocating `__param_N`
-/// for invalid identifiers. Shared by param extraction and template generation.
+/// Maps a raw param name to its emitted name.
 pub(crate) fn sanitize_param_name_with(
     taken: &std::collections::BTreeSet<String>,
     next_synthetic: &mut usize,

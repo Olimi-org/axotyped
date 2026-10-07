@@ -47,9 +47,7 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
 
     // Options: `#[endpoint]`, a visibility (`public` | `permissive`), and/or
-    // the `allow_redirects` route property — e.g. `#[endpoint(public)]` or
-    // `#[endpoint(public, allow_redirects)]`. Anything else is a compile
-    // error so typos can never silently flip visibility.
+    // `allow_redirects`. Anything else is a compile error.
     let mut is_public = false;
     let mut is_permissive = false;
     let mut allow_redirects = false;
@@ -88,16 +86,22 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
     let param_types = extract_param_types(&item_fn);
 
     // Credential classification. Every parameter must implement
-    // `EndpointParam` (the assert fn gives the actionable error for a
-    // missing impl); the constants then decide, at the type level, whether
-    // this handler may register on a private-by-default chain.
+    // `EndpointParam`.
     let custom_params: Vec<&Type> = param_types
         .iter()
-        .filter(|t| {
-            let name = last_segment_ident(t);
-            !KNOWN_AMBIENT_EXTRACTORS.contains(&name.as_str())
-        })
+        .filter(|t| !is_ambient_extractor(t))
         .collect();
+    // Ambient-classified params on `public`/`permissive` endpoints are
+    // checked at the type level (`Auth = OptionalCredential`).
+    let declared_credentialless = is_public || is_permissive;
+    let ambient_params: Vec<&Type> = if declared_credentialless {
+        param_types
+            .iter()
+            .filter(|t| is_ambient_extractor(t))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let assert_fn_name = quote::format_ident!("{}__param_assertions", fn_name);
     let param_assertions = quote! {
         #[doc(hidden)]
@@ -105,20 +109,21 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
         fn #assert_fn_name() {
             fn __param<T: ::axotyped::EndpointParam>() {}
             #(__param::<#param_types>();)*
+            fn __truly_ambient<T>()
+            where
+                T: ::axotyped::EndpointParam<Auth = ::axotyped::OptionalCredential>,
+            {}
+            #(__truly_ambient::<#ambient_params>();)*
         }
     };
 
-    // Type-level authorization fold. Starts `Enforced` when the endpoint
-    // declared itself public/permissive (its declaration IS the compile-time
-    // authorization), then ORs every parameter's credential flag. Ends up on
-    // `EndpointMeta::Authorization`; the private-by-default chain bounds
-    // registration on it projecting to `Allowed`.
+    // Type-level authorization fold.
     let mut authz = if is_public || is_permissive {
         quote! { ::axotyped::Credential }
     } else {
         quote! { ::axotyped::OptionalCredential }
     };
-    // Params-only fold — the coherence input before the declaration folds in.
+    // Params-only fold.
     let mut param_fold = quote! { ::axotyped::OptionalCredential };
     for p in &custom_params {
         let prev = param_fold;
@@ -131,17 +136,13 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
     }
 
-    // Definition-site coherence: declaring a credentialless visibility
-    // (public/permissive) while some parameter extractor requires a
-    // credential is a contradiction — the extractor rejects the anonymous
-    // callers the declaration promises to serve. Fails to compile at THIS
-    // endpoint, with the trait names carrying the explanation.
-    let non_private = is_public || is_permissive;
+    // Definition-site coherence: a `public`/`permissive` endpoint with a
+    // credential-requiring parameter does not compile.
     let coherence_impl = quote! {
         #[doc(hidden)]
         impl ::axotyped::EndpointVisibilityCoherence for #meta_struct_name where
             ::axotyped::AssertCredentiallessDeclaration<{
-                !#non_private
+                !#declared_credentialless
                     || !<#param_fold as ::axotyped::FlagConst>::IS_CREDENTIAL
             }>: ::axotyped::IsCoherentWithParams,
         {}
@@ -183,10 +184,8 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! {},
     };
 
-    // Visibility declarations record both the declared and (for now)
-    // effective state; an auth layer in scope later forces effective back to
-    // `Private` (server enforcement is the ground truth). Redirect-following
-    // is likewise declared here, never caller-supplied.
+    // Record declared and effective visibility; redirect-following is
+    // declared here.
     let visibility_stmt = if is_public {
         quote! {
             __def.declared = ::axotyped::Visibility::Public;
@@ -206,11 +205,24 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // Response type alias for `auth_scheme!` field probes.
+    let response_alias = match &response_type {
+        Some(t) => {
+            let alias_ident = quote::format_ident!("{}__Response", fn_name);
+            quote! {
+                #[allow(non_camel_case_types)]
+                #[doc(hidden)]
+                pub type #alias_ident = #t;
+            }
+        }
+        None => quote! {},
+    };
+
     let expanded = quote! {
-        // Original function unchanged
         #item_fn
 
-        // Companion metadata struct — zero-sized, no runtime cost
+        #response_alias
+
         #[allow(non_camel_case_types)]
         pub struct #meta_struct_name;
 
@@ -248,11 +260,7 @@ fn endpoint_attr_error() -> TokenStream {
 // #[enforced] / #[ambient] — extractor credential classification
 // ---------------------------------------------------------------------------
 
-/// Mark an extractor as requiring authentication: a request without valid
-/// credentials cannot reach the handler body through it (extraction fails
-/// or rejects). Replaces the manual
-/// `impl EndpointParam { type Auth = Credential }` boilerplate; the claim
-/// sits on the type that performs the check.
+/// Mark an extractor as requiring authentication.
 ///
 /// ```rust,ignore
 /// #[axotyped::credential]
@@ -263,10 +271,7 @@ pub fn credential(_attr: TokenStream, item: TokenStream) -> TokenStream {
     credential_marker(item, quote! { ::axotyped::Credential })
 }
 
-/// Mark an extractor as allowing anonymous requests: extraction succeeds
-/// without credentials and yields no identity (e.g. `OptionalAuthUser`
-/// returning `None`). Explicit form of the default classification for
-/// custom extractors.
+/// Mark an extractor as allowing anonymous requests.
 #[proc_macro_attribute]
 pub fn optional_credential(_attr: TokenStream, item: TokenStream) -> TokenStream {
     credential_marker(item, quote! { ::axotyped::OptionalCredential })
@@ -284,6 +289,67 @@ fn credential_marker(item: TokenStream, flag: proc_macro2::TokenStream) -> Token
         }
     }
     .into()
+}
+
+// ---------------------------------------------------------------------------
+// check_response_fields! — compile-time probe used by auth_scheme!
+// ---------------------------------------------------------------------------
+
+/// Verify that each named field exists on a handler's response wire.
+///
+/// Input: a handler path followed by one or more field idents
+/// (`me token` or `exchange_tokens access_token, refresh_token`). The path
+/// is transformed with the same suffix rule `register!` uses for metadata
+/// (`me` → `me__Response`), and each field name is checked at compile time
+/// against `WireFields` — the wire field names the TS derive publishes
+/// from the type itself, so field privacy in another module is no barrier.
+/// A missing field (or a response type without the derive) is a compile
+/// error at the declaration site. Expands to items only, so it is safe in
+/// statement position.
+#[proc_macro]
+pub fn check_response_fields(input: TokenStream) -> TokenStream {
+    struct Fields {
+        path: syn::Path,
+        fields: Vec<syn::Ident>,
+    }
+
+    impl syn::parse::Parse for Fields {
+        fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+            let path = input.parse()?;
+            let mut fields = Vec::new();
+            while !input.is_empty() {
+                fields.push(input.parse()?);
+                if input.peek(syn::Token![,]) {
+                    input.parse::<syn::Token![,]>()?;
+                }
+            }
+            if fields.is_empty() {
+                return Err(input.error("expected at least one response field name"));
+            }
+            Ok(Fields { path, fields })
+        }
+    }
+
+    let parsed = syn::parse_macro_input!(input as Fields);
+    let mut alias = parsed.path;
+    if let Some(last) = alias.segments.last_mut() {
+        last.ident = quote::format_ident!("{}__Response", last.ident);
+    }
+
+    let mut out = quote! {};
+    for field in &parsed.fields {
+        out = quote! {
+            #out
+            const _: () = assert!(
+                ::axotyped::wire_field_declared(
+                    <#alias as ::axotyped::WireFields>::WIRE_FIELDS,
+                    stringify!(#field),
+                ),
+                "axotyped: the response type has no field with this wire name — check the `auth_scheme!` field declaration",
+            );
+        };
+    }
+    TokenStream::from(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -456,22 +522,46 @@ fn extract_generic_from_type<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a Type
 }
 
 
-/// Extractor names with `EndpointParam` blanket impls in axotyped — skipped
-/// by the authorization fold (their flag is `Ambient` by construction).
-/// Must stay in sync with `src/params.rs`. Skipping matters for privacy:
-/// the fold lands in the public `EndpointMeta::Authorization` associated
-/// type, which must not mention private DTOs riding inside `Json<T>` and
-/// friends; only custom (necessarily public) extractors fold.
+/// Extractor names with `EndpointParam` blanket impls — skipped by the
+/// authorization fold. Must stay in sync with `src/params.rs`.
 const KNOWN_AMBIENT_EXTRACTORS: &[&str] = &[
     "State", "Json", "Query", "Path", "Extension", "HeaderMap", "Request",
     "RawQuery", "MatchedPath", "OriginalUri", "ConnectInfo", "WebSocketUpgrade",
     "Option",
 ];
 
-/// All typed parameter types of the handler — every extractor in an
-/// `#[endpoint]` signature must implement `EndpointParam` (blanket impls
-/// cover axum's built-ins; custom extractors declare whether they enforce
-/// authentication).
+/// Whether a parameter type is axum infrastructure (skipped by the fold)
+/// rather than a custom extractor (folded). Matching is path-aware: a bare
+/// name is assumed to be axum's; a qualified non-`axum` path folds. A custom
+/// extractor sharing a bare name with a built-in must use its qualified path.
+///
+/// `public`/`permissive` endpoints additionally check each
+/// ambient-classified parameter at the type level
+/// (`EndpointParam<Auth = OptionalCredential>`).
+fn is_ambient_extractor(ty: &Type) -> bool {
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    if type_path.path.segments.len() > 1 || type_path.path.leading_colon.is_some() {
+        return type_path
+            .path
+            .segments
+            .first()
+            .map(|s| s.ident == "axum")
+            .unwrap_or(false);
+    }
+    KNOWN_AMBIENT_EXTRACTORS.contains(
+        &type_path
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default()
+            .as_str(),
+    )
+}
+
+/// All typed parameter types of the handler.
 fn extract_param_types(item_fn: &ItemFn) -> Vec<Type> {
     item_fn
         .sig
@@ -484,9 +574,7 @@ fn extract_param_types(item_fn: &ItemFn) -> Vec<Type> {
         .collect()
 }
 
-/// Recursively unwrap `Vec<T>` and `Option<T>` wrappers, returning the
-/// innermost non-container type(s). This ensures types that only appear
-/// inside a container (e.g. `Vec<SkillProgress>`) still get registered.
+/// Recursively unwrap `Vec<T>` and `Option<T>` wrappers.
 fn unwrap_container_types(ty: &Type) -> Vec<Type> {
     let mut current = ty;
     loop {

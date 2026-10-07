@@ -27,6 +27,7 @@ pub(crate) fn type_override_struct(
         bound: attr.bound.clone(),
         ts_enum: None,
         is_enum: quote!(false), // we dont know what the override is, so we preserve is_enum
+        wire_fields: None,
     })
 }
 
@@ -50,5 +51,6 @@ pub(crate) fn type_override_enum(
         bound: attr.bound.clone(),
         ts_enum: None,
         is_enum: quote!(true), // we dont know what the override is, so we preserve is_enum
+        wire_fields: None,
     })
 }

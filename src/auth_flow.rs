@@ -24,20 +24,14 @@
 //! ```
 //!
 //! [`ApiRouter::build`](crate::ApiRouter::build) validates the declaration
-//! against the registered routes and fails fast at startup: referenced routes
-//! must exist, bootstrap/refresh routes must not be `Private` (no bearer
-//! exists yet when they run — the circular-marking bug this prevents), and
-//! the WS ticket mint must be `Private` (it converts a live bearer into a
-//! single-use proof).
+//! against the registered routes and panics on mismatch: references must
+//! resolve, `exchange`/`refresh` routes must not be `Private`, and the WS
+//! ticket mint must be `Private`.
 
 use crate::types::{RouteDefinition, Visibility};
 
-/// The shape of the credential lifecycle a scheme declares.
-///
-/// A label for v0: it constrains which fields are required and is emitted
-/// into the client's `AUTH_FLOW` constant. Kind-specific sugar (authorize URL
-/// builders, PKCE plumbing) is deliberately out of scope — flow logic lives
-/// in the app, the declaration carries facts.
+/// The shape of the credential lifecycle a scheme declares. Emitted into
+/// the client's `AUTH` constant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthFlowKind {
     /// Authorization-code (+ PKCE) OAuth2: an external issuer exchanges a
@@ -63,17 +57,13 @@ impl AuthFlowKind {
 
 /// Response fields of a lifecycle route that carry the credential.
 ///
-/// `Bearer` covers exchange-style flows (one token; the ambient credential
-/// is server-side). `Pair` covers OAuth2 token responses: access plus an
-/// optional rotating refresh and optional `expires_in` (RFC 6749 makes both
-/// optional; WorkOS, for one, omits `expires_in`).
+/// `Bearer` covers exchange-style flows. `Pair` covers OAuth2 token
+/// responses: access plus optional refresh and `expires_in`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenFields {
     /// Single field carrying the bearer.
     Bearer(String),
-    /// OAuth2 pair: access field (required), refresh field (absent on
-    /// non-rotating providers), `expires_in` field (seconds; absent on
-    /// WorkOS — expiry then comes from the JWT `exp` claim).
+    /// OAuth2 pair: access (required), refresh and `expires_in` (optional).
     Pair {
         access: String,
         refresh: Option<String>,
@@ -102,16 +92,14 @@ pub struct AuthFlow {
     /// credential. Must not be `Private`.
     pub bootstrap: Vec<String>,
     /// Client method name of the route that renews a bearer. Must not be
-    /// `Private` (the old bearer is expired — that is why it runs). May be
-    /// the same route as a bootstrap entry (cookie re-exchange).
+    /// `Private`. May be the same route as a bootstrap entry.
     pub refresh: Option<String>,
     /// Response fields carrying the credential on the lifecycle routes
-    /// (`-> token` for exchange kinds, `-> { access, refresh, expires_in }`
-    /// for oauth2), camelCased for the client. When set, the generated
-    /// client binds a default `auth.refresh` hook to the declared route.
+    /// (`-> token` for exchange kinds, `-> { access, ... }` for oauth2).
+    /// When set, the generated client emits a typed renewal helper that
+    /// reads these fields off the lifecycle route's response type.
     pub token_fields: Option<TokenFields>,
-    /// Client method name of the route minting single-use WS upgrade tickets
-    /// from a live bearer. Must be `Private`.
+    /// Client method name of the WS ticket mint. Must be `Private`.
     pub ws_ticket: Option<String>,
 }
 
@@ -216,12 +204,8 @@ impl AuthFlow {
         self
     }
 
-    /// Validate the declaration against a route table. Returns a
-    /// human-readable error designed to be panicked on at `build()` — a
-    /// mis-declared flow is a developer error, not a runtime condition.
+    /// Validate the declaration against a route table.
     pub(crate) fn validate(&self, routes: &[RouteDefinition]) -> Result<(), String> {
-        // Kind consistency first: a nonsensical declaration is reported as
-        // such, before any route lookup noise.
         match self.kind {
             AuthFlowKind::StaticBearer
                 if !self.bootstrap.is_empty() || self.refresh.is_some() =>
@@ -270,10 +254,28 @@ impl AuthFlow {
             }
         }
 
-        let find = |name: &str| routes.iter().find(|r| r.name == name);
-
         let check = |name: &str, role: &str, must_be_private: bool| -> Result<(), String> {
-            let Some(route) = find(name) else {
+            let mut matches: Vec<&RouteDefinition> =
+                routes.iter().filter(|r| r.name == name).collect();
+            if matches.len() > 1 {
+                let where_at: Vec<String> = matches
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{} {} (group '{}')",
+                            r.method,
+                            r.path,
+                            r.group.as_deref().unwrap_or("<root>")
+                        )
+                    })
+                    .collect();
+                return Err(format!(
+                    "{role} route '{name}' is ambiguous — it matches multiple routes: \
+                     [{}]. Rename the others with .as_().",
+                    where_at.join(", ")
+                ));
+            }
+            let Some(route) = matches.pop() else {
                 return Err(format!(
                     "{role} route '{name}' is not registered on this router. If it was \
                      renamed with .as_(), reference the client method name via \
@@ -283,18 +285,41 @@ impl AuthFlow {
             if must_be_private {
                 if route.visibility != Visibility::Private {
                     return Err(format!(
-                        "{role} route '{name}' ({} {}) must be Private: it converts a \
-                         live bearer into a single-use upgrade proof, so it must never \
-                         be reachable without credentials.",
+                        "{role} route '{name}' ({} {}) must be Private.",
+                        route.method, route.path
+                    ));
+                }
+                // A socket never has a descriptor in the client — the
+                // generator skips any [ws] route without both event types,
+                // since there is no contract to emit. Naming one as the
+                // ticket mint would leave `TRANSPORT.wsTicket` pointing at a
+                // key `OPERATIONS` never emits, and the handshake would fail
+                // at connect time with nothing to act on.
+                if route.websocket
+                    && (route.ws_send_type.is_none() || route.ws_receive_type.is_none())
+                {
+                    return Err(format!(
+                        "{role} route '{name}' ({} {}) is a WebSocket route without declared \
+                         event types, so no client descriptor is generated for it. Declare \
+                         `.events::<Send, Receive>()` on the route, or point {role} at a \
+                         separate HTTP mint.",
+                        route.method, route.path
+                    ));
+                }
+                if route.body_type.is_some()
+                    || route.query_type.is_some()
+                    || !route.path_params.is_empty()
+                {
+                    return Err(format!(
+                        "{role} route '{name}' ({} {}) takes a body, query, or path \
+                         parameters and cannot serve the handshake.",
                         route.method, route.path
                     ));
                 }
             } else if route.visibility == Visibility::Private {
                 return Err(format!(
-                    "{role} route '{name}' ({} {}) is Private, but lifecycle routes \
-                     mint the credential — no bearer exists yet when they run, so \
-                     requiring one is circular (the request can never be \
-                     sent). Register it public or permissive.",
+                    "{role} route '{name}' ({} {}) is Private. Lifecycle routes mint \
+                     the credential; register it public or permissive.",
                     route.method, route.path
                 ));
             }
@@ -365,11 +390,11 @@ mod tests {
     }
 
     #[test]
-    fn private_bootstrap_is_circular_and_fails() {
+    fn private_bootstrap_fails() {
         let flow = AuthFlow::new("SessionAuth", AuthFlowKind::Exchange).bootstrap_named("me");
         let routes = vec![route("me", Visibility::Private)];
         let err = flow.validate(&routes).unwrap_err();
-        assert!(err.contains("circular"), "{err}");
+        assert!(err.contains("is Private"), "{err}");
     }
 
     #[test]
@@ -399,5 +424,32 @@ mod tests {
         // Same transform the builder applies to handler fn items.
         fn ws_ticket_issue() {}
         assert_eq!(endpoint_name(ws_ticket_issue), "wsTicketIssue");
+    }
+
+    fn socket(events: bool) -> RouteDefinition {
+        let mut r = route("socket", Visibility::Private);
+        r.path = "/ws".into();
+        r.websocket = true;
+        r.ws_send_type = events.then(|| "ClientEvent".into());
+        r.ws_receive_type = events.then(|| "ServerEvent".into());
+        r
+    }
+
+    /// The generator emits no descriptor for a socket without both event
+    /// types, so `TRANSPORT.wsTicket` would name a key `OPERATIONS` never
+    /// writes — the handshake would resolve to nothing at connect time.
+    #[test]
+    fn ws_ticket_naming_an_untyped_socket_fails() {
+        let flow = AuthFlow::new("StaticToken", AuthFlowKind::StaticBearer)
+            .ws_ticket_named("socket");
+        let err = flow.validate(&[socket(false)]).unwrap_err();
+        assert!(err.contains("event types"), "{err}");
+    }
+
+    #[test]
+    fn ws_ticket_naming_a_typed_socket_passes() {
+        let flow = AuthFlow::new("StaticToken", AuthFlowKind::StaticBearer)
+            .ws_ticket_named("socket");
+        assert!(flow.validate(&[socket(true)]).is_ok());
     }
 }

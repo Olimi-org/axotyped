@@ -16,6 +16,9 @@ pub(crate) fn named(attr: &StructAttr, ts_name: Expr, fields: &FieldsNamed) -> R
     let mut formatted_fields = Vec::new();
     let mut flattened_fields = Vec::new();
     let mut dependencies = Dependencies::new(crate_rename.clone());
+    // Wire field names; flattening disables the list.
+    let mut wire_fields = Vec::new();
+    let mut wire_fields_complete = true;
 
     if let Some(tag) = &attr.tag {
         formatted_fields.push(quote! {
@@ -24,7 +27,7 @@ pub(crate) fn named(attr: &StructAttr, ts_name: Expr, fields: &FieldsNamed) -> R
     }
 
     for field in &fields.named {
-        format_field(
+        match format_field(
             &crate_rename,
             &mut formatted_fields,
             &mut flattened_fields,
@@ -32,7 +35,11 @@ pub(crate) fn named(attr: &StructAttr, ts_name: Expr, fields: &FieldsNamed) -> R
             field,
             &attr.rename_all,
             attr.optional_fields,
-        )?;
+        )? {
+            WireName::Named(name) => wire_fields.push(name),
+            WireName::Flattened => wire_fields_complete = false,
+            WireName::Skipped => {}
+        }
     }
 
     let fields = quote!(<[String]>::join(&[#(#formatted_fields),*], " "));
@@ -74,7 +81,19 @@ pub(crate) fn named(attr: &StructAttr, ts_name: Expr, fields: &FieldsNamed) -> R
         bound: attr.bound.clone(),
         ts_enum: None,
         is_enum: quote!(false),
+        wire_fields: if wire_fields_complete {
+            Some(wire_fields)
+        } else {
+            None
+        },
     })
+}
+
+/// A struct field's wire name contribution.
+enum WireName {
+    Named(String),
+    Flattened,
+    Skipped,
 }
 
 // build an expression which expands to a string, representing a single field of a struct.
@@ -95,13 +114,13 @@ fn format_field(
     field: &Field,
     rename_all: &Option<Inflection>,
     struct_optional: Optional,
-) -> Result<()> {
+) -> Result<WireName> {
     let field_attr = FieldAttr::from_attrs(&field.attrs)?;
 
     field_attr.assert_validity(field)?;
 
     if field_attr.skip {
-        return Ok(());
+        return Ok(WireName::Skipped);
     }
 
     let ty = field_attr.type_as(&field.ty);
@@ -125,7 +144,7 @@ fn format_field(
 
     if field_attr.flatten {
         flattened_fields.push(quote!(<#ty as #crate_rename::TS>::inline_flattened(cfg)));
-        return Ok(());
+        return Ok(WireName::Flattened);
     }
 
     let formatted_ty = field_attr
@@ -145,6 +164,7 @@ fn format_field(
         (None, Some(rn)) => rn.apply(&field_name),
         (None, None) => field_name,
     };
+    let wire_name = name.clone();
     let valid_name = raw_name_to_ts_field(name);
 
     // Start every doc string with a newline, because when other characters are in front, it is not "understood" by VSCode
@@ -157,5 +177,5 @@ fn format_field(
         format!("{}{}{}: {},", #docs, #valid_name, #optional_annotation, #formatted_ty)
     });
 
-    Ok(())
+    Ok(WireName::Named(wire_name))
 }

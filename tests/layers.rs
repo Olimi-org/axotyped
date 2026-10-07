@@ -73,7 +73,7 @@ async fn layer_gates_only_subsequent_routes_in_scope() {
         .get("/open", register!(ok_handler))
         
         .layer(axum::middleware::from_fn(deny_short))
-        .get("/gated", register!(ok_handler))
+        .get("/gated", register!(ok_handler)).as_("gated")
         .build()
         .0;
 
@@ -157,7 +157,7 @@ async fn codegen_metadata_identical_with_and_without_layers() {
         let (_, c): (_, RouteCollection) = ApiRouter::<AppState>::new()
             .get("/users/{id}", register!(ok_handler))
             
-            .post("/users/{id}", register!(ok_handler))
+            .post("/users/{id}", register!(ok_handler)).as_("updateUser")
             
             .build();
         c
@@ -168,7 +168,7 @@ async fn codegen_metadata_identical_with_and_without_layers() {
             .get("/users/{id}", register!(ok_handler))
             
             .layer(axum::middleware::from_fn(deny_short))
-            .post("/users/{id}", register!(ok_handler))
+            .post("/users/{id}", register!(ok_handler)).as_("updateUser")
             
             .build();
         c

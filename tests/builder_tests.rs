@@ -44,6 +44,34 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for TestAuth {
     }
 }
 
+// Anonymous handler for public/permissive-scope tests — no credential
+// extractor, so it satisfies the mirror compile-time rule for anonymous
+// scopes.
+#[axotyped::endpoint]
+async fn open_resource(State(_s): State<AppState>) {}
+
+// Custom extractor deliberately sharing a name with an axum built-in.
+// Referenced by qualified path it must participate in the credential fold
+// like any other custom extractor (a bare name is assumed to be axum's).
+mod shadow {
+    #[derive(Clone, Copy)]
+    pub struct State;
+
+    impl axotyped::EndpointParam for State {
+        type Auth = axotyped::Credential;
+    }
+
+    impl<S: Send + Sync> axum::extract::FromRequestParts<S> for State {
+        type Rejection = std::convert::Infallible;
+        async fn from_request_parts(
+            _parts: &mut axum::http::request::Parts,
+            _state: &S,
+        ) -> Result<Self, Self::Rejection> {
+            Ok(State)
+        }
+    }
+}
+
 #[axotyped::endpoint]
 async fn list_users(_auth: TestAuth, State(_state): State<AppState>,
     axum::extract::Query(_query): axum::extract::Query<ListQuery>) -> Json<Vec<UserResponse>> {
@@ -512,24 +540,36 @@ fn routes_are_private_by_default() {
         .get("/health", register!(health))
         .as_("health")
         .ws("/events", register!(health))
+        .events::<ClientEvent, ServerEvent>()
+        .as_("events")
         
         .build();
 
     for r in routes.routes() {
         assert!(r.is_credentialed(), "route '{}' must be private by default", r.name);
     }
+    #[derive(serde::Serialize, axotyped::TS)]
+    struct ClientEvent {
+        kind: String,
+    }
+    #[derive(serde::Serialize, axotyped::TS)]
+    struct ServerEvent {
+        kind: String,
+    }
 }
 
 #[test]
 fn group_public_marks_routes_public_and_does_not_leak() {
+    // No credential extractor: public scopes reject credential-requiring
+    // handlers at compile time, so scope-mechanics tests use anonymous ones.
     #[axotyped::endpoint]
-async fn hook(_auth: TestAuth, State(_s): State<AppState>) {}
+async fn hook(State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_public("webhooks", |g| {
             g.set_prefix("/webhooks")
                 .post("/stripe", register!(hook))
-                .post("/github", register!(hook))
+                .post("/github", register!(hook)).as_("githubHook")
         })
         .group("admin", |g| g.delete("/users/{id}", register!(delete_user)))
         .build();
@@ -555,11 +595,11 @@ async fn hook(_auth: TestAuth, State(_s): State<AppState>) {}
 #[test]
 fn group_permissive_marks_routes_permissive_and_does_not_leak() {
     #[axotyped::endpoint]
-    async fn hook(_auth: TestAuth, State(_s): State<AppState>) {}
+    async fn hook(State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_permissive("feed", |g| {
-            g.get("/feed", register!(hook)).get("/trending", register!(hook))
+            g.get("/feed", register!(hook)).get("/trending", register!(hook)).as_("trending")
         })
         .delete("/users/{id}", register!(delete_user))
         .build();
@@ -580,39 +620,67 @@ fn group_permissive_marks_routes_permissive_and_does_not_leak() {
 fn group_permissive_forwards_from_mid_chain_builders() {
     #[axotyped::endpoint]
     async fn hook(_auth: TestAuth, State(_s): State<AppState>) {}
+    #[axotyped::endpoint]
+    async fn anon_hook(State(_s): State<AppState>) {}
 
     // RouteBuilder forward: chain starting with an HTTP route.
     let (_router, routes) = ApiRouter::<AppState>::new()
         .get("/health", register!(hook))
-        .group_permissive("feed", |g| g.get("/feed", register!(hook)))
+        .group_permissive("feed", |g| g.get("/feed", register!(anon_hook)))
         .build();
     assert_eq!(routes.routes()[1].visibility, Visibility::Permissive);
 
     // WsRouteBuilder forward: chain starting with a WebSocket route.
     let (_router, routes) = ApiRouter::<AppState>::new()
         .ws("/events", register!(hook))
-        .group_permissive("feed", |g| g.get("/feed", register!(hook)))
+        .events::<ClientEvent, ServerEvent>()
+        .group_permissive("feed", |g| g.get("/feed", register!(anon_hook)))
         .build();
     assert_eq!(routes.routes()[1].visibility, Visibility::Permissive);
 }
+    #[derive(serde::Serialize, axotyped::TS)]
+    struct ClientEvent {
+        kind: String,
+    }
+    #[derive(serde::Serialize, axotyped::TS)]
+    struct ServerEvent {
+        kind: String,
+    }
 
 #[test]
 fn group_public_forwards_from_mid_chain_builders() {
     #[axotyped::endpoint]
     async fn hook(_auth: TestAuth, State(_s): State<AppState>) {}
+    #[axotyped::endpoint]
+    async fn anon_hook(State(_s): State<AppState>) {}
 
     let (_router, routes) = ApiRouter::<AppState>::new()
         .get("/health", register!(hook))
-        .group_public("webhooks", |g| g.post("/stripe", register!(hook)))
+        .group_public("webhooks", |g| g.post("/stripe", register!(anon_hook)))
         .build();
     assert_eq!(routes.routes()[1].visibility, Visibility::Public);
+}
+
+#[test]
+fn qualified_custom_extractor_named_like_builtin_is_checked() {
+    // shadow::State shares its name with axum's State but is referenced by
+    // qualified path, so the credential fold must see it: this registers
+    // on the private chain (and would be rejected from a public group).
+    #[axotyped::endpoint]
+    async fn shadowed(_s: shadow::State, State(_st): State<AppState>) {}
+
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .get("/shadow", register!(shadowed))
+        .build();
+    assert_eq!(routes.routes()[0].name, "shadowed");
+    assert!(routes.routes()[0].is_credentialed());
 }
 
 #[test]
 fn nested_group_inside_group_public_inherits_publicity() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_public("pub", |g| {
-            g.group_prefixed("deep", |h| h.get("/res", register!(list_users)))
+            g.group_prefixed("deep", |h| h.get("/res", register!(open_resource)))
         })
         .build();
 
@@ -719,8 +787,8 @@ async fn auth_mw(
 fn auth_layer_derives_auth_metadata_inside_public_scope() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_public("pub", |g| {
-            g.get("/open", register!(list_users))
-                
+            g.get("/open", register!(open_resource))
+
                 .auth_layer(axum::middleware::from_fn(auth_mw))
                 .get("/gated", register!(get_user))
         })
@@ -771,7 +839,7 @@ fn auth_layer_does_not_leak_to_sibling_scopes() {
                 a.auth_layer(axum::middleware::from_fn(auth_mw))
                     .get("/inner", register!(get_user))
             })
-            .group_prefixed("other", |o| o.get("/sibling", register!(get_user)))
+            .group_prefixed("other", |o| o.get("/sibling", register!(open_resource)))
         })
         .build();
 
@@ -808,7 +876,7 @@ fn plain_layer_leaves_auth_metadata_untouched() {
     let (_router, routes) = ApiRouter::<AppState>::new()
         .group_public("pub", |g| {
             g.layer(axum::middleware::from_fn(auth_mw))
-                .get("/rate_limited", register!(get_user))
+                .get("/rate_limited", register!(open_resource))
         })
         .build();
 
@@ -821,4 +889,28 @@ fn plain_layer_leaves_auth_metadata_untouched() {
         r.declared == Visibility::Public,
         "public-scope membership is preserved regardless of plain layering"
     );
+}
+
+#[test]
+#[should_panic(expected = "share the client method name")]
+fn duplicate_client_names_in_one_group_fail_build() {
+    let _ = ApiRouter::<AppState>::new()
+        .get("/a", register!(list_users))
+        .get("/b", register!(list_users))
+        .build();
+}
+
+#[test]
+fn same_name_in_different_groups_is_fine() {
+    let (_router, routes) = ApiRouter::<AppState>::new()
+        .group_prefixed("v1", |g| g.get("/users", register!(list_users)))
+        .group_prefixed("v2", |g| g.get("/users", register!(list_users)))
+        .build();
+    let names: Vec<(Option<&str>, &str)> = routes
+        .routes()
+        .iter()
+        .map(|r| (r.group.as_deref(), r.name.as_str()))
+        .collect();
+    assert!(names.contains(&(Some("v1"), "listUsers")));
+    assert!(names.contains(&(Some("v2"), "listUsers")));
 }

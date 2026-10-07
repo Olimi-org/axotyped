@@ -30,6 +30,8 @@ struct DerivedTS {
     bound: Option<Vec<WherePredicate>>,
     ts_enum: Option<Repr>,
     is_enum: TokenStream,
+    /// Field names the type serializes to, when exhaustively enumerable.
+    wire_fields: Option<Vec<String>>,
 
     export: bool,
     export_to: Option<Expr>,
@@ -90,6 +92,15 @@ impl DerivedTS {
         let decl = self.generate_decl_fn(&rust_ty, &generics);
         let dependencies = &self.dependencies;
         let generics_fn = self.generate_generics_fn(&generics);
+        let wire_fields_impl = self.wire_fields.map(|names| {
+            let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+            quote! {
+                #[automatically_derived]
+                impl #impl_generics #crate_rename::WireFields for #rust_ty #ty_generics #where_clause {
+                    const WIRE_FIELDS: &'static [&'static str] = &[#(#names),*];
+                }
+            }
+        });
 
         quote! {
             #[automatically_derived]
@@ -119,6 +130,8 @@ impl DerivedTS {
             }
 
             #export
+
+            #wire_fields_impl
         }
     }
 

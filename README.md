@@ -164,7 +164,7 @@ ApiRouter::<AppState>::new()
 
 ### Authentication model: deny-by-default, checked by the compiler
 
-Every route is private unless you say otherwise. An unannotated route can never generate a credential-less client. Since 0.4.0 this is a compile error, reported where the mistake is.
+Every route is private unless declared otherwise. An unannotated route without an enforcing extractor is a compile error at the registration call.
 
 It works in two steps. First, tell axotyped which of your extractors actually enforce authentication. Axum's built-ins (`State`, `Json`, `Query`, `Path`, …) are already covered — they never reject anyone. Your own identity extractors pick a side:
 
@@ -179,7 +179,7 @@ pub struct AuthUser(pub UserIdentity);
 pub struct OptionalAuthUser(pub Option<UserIdentity>);
 ```
 
-Two rules to remember: custom extractors must be `pub` (their credential flag lands in a public type, so a private struct won't compile), and every parameter of an `#[endpoint]` handler must resolve to one of these — a missing impl is a compile error telling you to classify it.
+Custom extractors must be `pub`, and every `#[endpoint]` parameter must resolve to a classified extractor. An extractor sharing a bare name with an axum built-in (`State`, `Path`, …) must use its qualified path (`crate::auth::State`); a bare name is treated as axum's.
 
 Second, every private route must take an extractor that enforces authentication:
 
@@ -204,16 +204,17 @@ r.group_public("webhooks", |g| {
 })
 ```
 
-Two mistakes become compile errors:
+Three mistakes become compile errors:
 
 * Private route without an enforcing extractor → error at the **registration call** (`PrivateScope: AllowsRoute … not satisfied`). You forgot the extractor.
-* `public`/`permissive` handler that *takes* a credential extractor → error at the **endpoint definition** (`AssertCredentiallessDeclaration<false>`). Anonymous callers were promised a route that rejects them; either make the route private or drop the enforcing extractor.
+* `public`/`permissive` handler that *takes* a credential extractor → error at the **endpoint definition** (`AssertCredentiallessDeclaration<false>`).
+* Credential-requiring handler inside a `group_public`/`group_permissive` scope → error at the **registration call**.
 
-Middleware counts too: `.auth_layer(mw)` says "this middleware enforces auth for everything under it" and lifts the extractor requirement for that scope (claim it explicitly there). Plain `.layer()` doesn't — use it for non-auth middleware like signature checks or rate limiting.
+Middleware counts too: `.auth_layer(mw)` marks the scope `Private` and lifts the extractor requirement. Plain `.layer()` leaves visibility unchanged.
 
-A `permissive` route sends the token when the client has one and sends nothing when it doesn't; the handler runs in both cases (Bearer: the header is attached only when a token resolves; Cookie: `omit` is allowed). Permissive routes still count as credentialed for guard/cache/redirect purposes, and degrade to anonymous under `AuthScheme::None` without diagnostics.
+A `permissive` route attaches the token when one resolves and sends anonymously otherwise. Permissive routes count as credentialed for guard/cache/redirect purposes.
 
-Redirect-following is a server-side route property (`#[endpoint(public, allow_redirects)]`, `.allow_redirects()`), never a caller option: only credentialless calls to declaring routes follow redirects, everything else refuses. Route methods take no options argument.
+Redirect-following is a server-side route property (`#[endpoint(public, allow_redirects)]`, `.allow_redirects()`). Only credentialless calls to declaring routes follow redirects. Route methods take no options argument.
 
 The prefix defaults to `"/{name}"` but can be overridden with `.set_prefix()` inside the closure.
 
@@ -230,7 +231,7 @@ ApiRouter::<Arc<AppState>>::new()
 
 ### Manual type specification
 
-You can still specify types explicitly on the builder when needed. This works on registered routes (raw handlers no longer compile):
+You can specify types explicitly on registered routes:
 
 ```rust
 ApiRouter::<AppState>::new()
@@ -384,7 +385,6 @@ CI: `cargo test check_ts_client` fails if the committed file is stale.
 | `large_int_type` | `"number"` | TS binding for u64/i64/u128/i128/usize/isize (`"number"`, `"bigint"`, or `"string"`) |
 | `auth_scheme` | `Bearer` | Client authentication model: `Bearer` (token header), `Cookie` (session cookies), or `None` |
 | `csrf_header_name` | `None` | Anti-CSRF header attached to mutating requests under `AuthScheme::Cookie` (e.g. `Some("X-CSRF-Token")`) |
-| `ws_ticket_path` | `None` | Endpoint issuing single-use WS tickets for authenticated WebSocket routes under `AuthScheme::Bearer` |
 
 ### Auth schemes
 
@@ -464,36 +464,79 @@ Pick the `kind` that matches your app:
 
 A few things worth knowing:
 
-* **`exchange` vs `refresh`.** `exchange` is the first mint (login, cookie swap); `refresh` is the renewal the client calls on 401. They can be the same route (cookie re-exchange, as above) or different ones. You can list several `exchange` routes; there is at most one `refresh`.
-* **`-> token` binds the default refresh hook.** With the field declared, the client renews through your typed response (`resp?.token ?? null`) and persists the result to the store, so the 401 replay re-reads a fresh bearer. Pass `auth.refresh` only to customize. Field names are camelCased for the client (`access_token` → `accessToken`).
-* **`build()` rejects bad declarations at startup.** Referenced routes must exist (renamed with `.as_()`? reference the client name via `bootstrap_named`/`refresh_named`/`ws_ticket_named`); `exchange`/`refresh` routes must *not* be `Private` (no bearer exists yet when they run, so requiring one would be circular); the `ws_ticket` mint *must* be `Private` (it converts a live bearer into a single-use proof); token fields must match the kind; one flow per router tree (groups and `merge` adopt it or panic). Anything the hook can't bind to (body-taking, untyped, ws/redirect routes) produces a `generate_with_warnings()` warning and falls back to a manual `auth.refresh`.
-* **The client does the rest.** With a Bearer flow declared you get: an `AuthStore` (`TokenStore` for strings, `SessionStore` for OAuth pairs — implement whichever matches your kind), single-flight refresh (parallel 401s share one call), 401 → refresh → one replay on credentialed routes, proactive refresh when `expiresAt` nears, `onSessionExpired` for terminal loss, a pinned `AUTH_FLOW` constant, and an `auth` namespace aliasing the lifecycle routes (`api.auth.me()` next to `api.me()`):
+* **`exchange` vs `refresh`.** `exchange` is the first mint; `refresh` is the renewal route the generated helper calls. They can be the same route or different ones. Multiple `exchange` routes are allowed; at most one `refresh`.
+* **One bearer source per client.** Every client names its credential source with `getToken`. Nothing else is offered.
+* **`-> token` buys a typed renewal helper.** The generated file emits `refreshBearer(client)` (or `refreshSession(client)` for an oauth2 pair) that calls the declared route and lifts the declared fields off its response. Field names are emitted verbatim (the JSON key, so `#[serde(rename)]` fields use the renamed key), and because the helper reads them off the *imported response type*, `tsc` checks every one. Nothing in the runtime interprets `AUTH`.
+* **Client method names are unique per group.** Collisions fail `build()`; rename one with `.as_()`. A route or group named after a built-in client helper (`withOptions`) is reported too — it would be overwritten.
+* **`build()` validates the declaration.** References must resolve (renamed routes via `*_named`); `exchange`/`refresh` routes must not be `Private`; the `ws_ticket` mint must be `Private`; one flow per router tree. A lifecycle route the helper cannot call back argument-free (it takes a body, path params, a query, is a socket or redirect route, or declares no response type) warns and emits no helper.
+
+#### What the transport owns, and what you own
+
+The client runtime holds **no credential state** — no store, no ledger, no renewal schedule. The split is drawn at what each side can see:
+
+| Transport (always) | Your application |
+|---|---|
+| Attaches the credential `getToken` returns, when the operation declares `auth` | Where the credential lives and when it is written |
+| Refuses the unsafe combinations: no credentials over http to non-loopback, `credentials: "omit"` on a required cookie route, no token on a required bearer route | When a session renews — on a 401, on a timer, on a route you consider sensitive |
+| Guards the request itself: `cache: "no-store"` when authenticated, `redirect: "error"` unless the route declares otherwise | What a lapsed session means (redirect, re-login, silent) |
+| Re-sends a 401 **at most twice**, through `onUnauthorized` | Cross-tab renewal, idle scheduling, offline handling, per-route renewal policy |
+
+`onUnauthorized` returns the credential to replay with, or `null` when the session cannot be renewed; throwing is treated as `null`, and either way the server's own 401 is what surfaces. The replay credential is that **return value** — the transport never re-reads `getToken` to decide who the caller is, so a request cannot be re-sent under a session you have since replaced. Cookie routes never replay: nothing you do mid-flight changes what the browser already put in the jar.
+
+Two primitives are exported for the session layer you do own — `singleFlight` (coalesce parallel renewals; without it a burst of 401s mints N tokens, and under a rotating refresh token the earlier ones are already dead) and `jwtExpiry` (read the `exp` claim for scheduling):
 
 ```typescript
-const api = createApiClient({
-  baseUrl: "http://localhost:3000",
-  auth: {
-    store, // your TokenStore / SessionStore
-    onSessionExpired: () => redirectToLogin(),
-    // refresh: custom fn — only if you skipped `-> token`
-  },
+import { createApiClient, jwtExpiry, refreshBearer, singleFlight } from "./api";
+
+let token: string | null = null;
+
+/** Always mints. Coalesces parallel renewals into one exchange. */
+const renewNow = singleFlight(async () => {
+  const fresh = await refreshBearer(api);
+  token = fresh;
+  return fresh;
 });
+
+const api = createApiClient({
+  baseUrl: "https://api.example.com",
+  getToken: () => token,
+  // The server rejected the current token — renew unconditionally. The
+  // proactive `renew` below would happily return a still-unexpired token
+  // the server has revoked, and the transport does not re-send a rejected
+  // credential, so that 401 would be terminal.
+  onUnauthorized: () => renewNow(),
+});
+
+/** Proactive renewal: reuse the token until it nears expiry. */
+export const renew = async () => {
+  const current = token;
+  if (current && (jwtExpiry(current) ?? 0) > Date.now() + 30_000) {
+    return current;
+  }
+  return renewNow();
+};
 ```
 
-* **`static_bearer` stays lean.** It emits only the `AUTH_FLOW` facts, the `auth` namespace, and the WS ticket path below.
-* **Extras.** `constant issuer: "https://…"` pins facts like issuer/client-id into `AUTH_FLOW.constants` (key camelCased). `ws_ticket: register!(issue_ticket)` names the mint for the WS handshake, and `GeneratorConfig::ws_ticket_path` is auto-derived from it when unset.
+Scope that `singleFlight` to one credential source, and layer cross-tab coordination on top of it — the transport has no view of your tab topology.
+
+* **`static_bearer` stays lean.** Only `AUTH` facts, the `auth` namespace, and WS ticket wiring.
+* **Extras.** `constant issuer: "https://…"` pins facts into `AUTH.constants`. `ws_ticket: register!(issue_ticket)` names the mint for the WS handshake.
 
 ## Generated output
 
-The generated client includes:
-- Type imports from `ts-rs` bindings
-- A typed error class (extends `Error` with `status` and `body`)
-- A client options interface shaped by the auth scheme (`baseUrl`,
-  scheme-specific credential fields, `credentials`, `fetch`, `onError`)
-- A factory function returning typed fetch methods with optional grouping
-- A type alias: `export type ApiClient = ReturnType<typeof createApiClient>`
+Generation writes **two files**: the client (declarations) and the runtime module (`<name>-runtime.ts`).
 
-See [tests/snapshots/yauth_style.ts](tests/snapshots/yauth_style.ts) for a full example.
+The client file includes:
+- Type imports from `ts-rs` bindings
+- An `OPERATIONS` descriptor table (`method`, `path`, `params`, `auth`, `body`, `response`, `allowRedirects`, `ws`)
+- The `AUTH` strategy and `TRANSPORT` policy consts
+- A client options interface and factory + typed methods bound to descriptors, plus an `ApiClient` type alias
+- A version assertion against the runtime sibling
+
+The runtime module owns the transport guard, the request executor, the bounded 401 replay, the WS ticket handshake, and the WebSocket wrapper. It holds no credential state. It runs under `bun test`.
+
+See [tests/snapshots/yauth_style.ts](tests/snapshots/yauth_style.ts) for a full
+client example and [src/runtime.ts](src/runtime.ts) for the shared machine.
 
 ## License
 

@@ -1,4 +1,7 @@
-use axotyped::{HttpMethod, api_routes};
+#[macro_use]
+mod common;
+
+use axotyped::HttpMethod;
 
 #[test]
 fn simple_get_route() {
@@ -367,4 +370,54 @@ mod endpoint_visibility {
         assert_eq!(r.declared, Visibility::Permissive);
         assert!(r.is_credentialed(), "permissive stays credentialed for guard/cache");
     }
+}
+
+// -- bare-name shadowing of axum built-ins -----------------------------------
+//
+// `is_ambient_extractor` assumes a bare built-in name is axum's. On a
+// credentialless declaration that assumption is type-checked: an
+// ambient-classified parameter must truly be ambient. A shadowing
+// extractor that genuinely admits anonymous callers passes; the
+// `#[credential]` shadow fails (compile_fail doctest on the params
+// module) with the same contradiction error as any custom credential
+// parameter.
+
+#[axotyped::optional_credential]
+pub struct Path;
+
+#[axotyped::endpoint(public)]
+async fn shadowed_optional_path(_p: Path) {}
+
+#[test]
+fn shadowing_built_in_name_with_optional_credential_compiles_on_public() {
+    // Compilation of `shadowed_optional_path` above IS the assertion: its
+    // `__param_assertions` ran `__truly_ambient::<Path>()`, which holds
+    // because `Auth = OptionalCredential`.
+    let _ = shadowed_optional_path;
+}
+
+// -- common axum extractors carry EndpointParam impls ------------------------
+//
+// #[endpoint] asserts EndpointParam for EVERY parameter and the orphan rule
+// bars downstream crates from adding impls for foreign types — compilation
+// of these handlers IS the assertion that the extractor set is usable at all.
+
+#[derive(serde::Deserialize, Default)]
+pub struct FormData {
+    pub name: String,
+}
+
+#[axotyped::endpoint]
+async fn submit_form(axum::Form(_form): axum::Form<FormData>) {}
+
+// (No `Result<T, E>` fixture: axum 0.8 has no Result extractor — the shape
+// cannot reach a handler signature, so it carries no EndpointParam impl.)
+
+#[axotyped::endpoint]
+async fn echo_raw(_body: String) {}
+
+#[test]
+fn common_axum_extractors_are_endpoint_params() {
+    let _ = submit_form;
+    let _ = echo_raw;
 }

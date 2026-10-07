@@ -21,6 +21,9 @@ default = []
 # Blanket `EndpointParam` impl for `WebSocketUpgrade` (WS handlers).
 axum-ws = ["axum/ws"]
 
+# Blanket `EndpointParam` impl for `axum::extract::Multipart`.
+axum-multipart = ["axum/multipart"]
+
 # --- ts-rs serde integration ---
 serde-compat = ["axotyped-macros/serde-compat"]
 no-serde-warnings = ["axotyped-macros/no-serde-warnings"]

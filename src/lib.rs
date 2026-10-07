@@ -32,21 +32,22 @@ mod builder;
 mod generator;
 mod types;
 #[macro_use]
-mod macros;
+
 
 mod auth_flow;
 mod params;
 
 // Re-export public API
-pub use auth_flow::{AuthFlow, AuthFlowKind, endpoint_name};
+pub use auth_flow::{AuthFlow, AuthFlowKind, TokenFields, endpoint_name};
 pub use params::{
     AllowsRoute, OptionalCredential, Allowed, AssertCredentiallessDeclaration, AuthFlag, AuthOr,
     EndpointParam, EndpointVisibilityCoherence, Credential, FlagConst, IsCoherentWithParams,
-    LayeredAuthScope, NotAllowed, PermissiveScope, PrivateScope, PublicScope,
+    LayeredAuthScope, NotAllowed, PermissiveScope, PrivateScope, PublicScope, WireFields,
+    wire_field_declared,
 };
 pub use generator::{
-    AuthScheme, CheckError, GeneratorConfig, check, generate, generate_to_file,
-    generate_with_warnings,
+    AuthScheme, CheckError, GeneratorConfig, check, generate, generate_runtime_source,
+    generate_to_file, generate_with_warnings,
 };
 pub use types::{
     Collector, HttpMethod, NoCollect, PathParam, RouteCollection, RouteDefinition, TypeRegistry,
@@ -70,6 +71,8 @@ pub type TypedApiRouter<S = ()> = ApiRouter<S, TypeRegistry>;
 
 // Re-export the #[endpoint] attribute macro and register!() call-site macro.
 pub use axotyped_macros::{credential, endpoint, optional_credential, register};
+#[doc(hidden)]
+pub use axotyped_macros::check_response_fields as __check_response_fields;
 
 /// Declare a route table as a zero-sized type implementing [`RouteTable`].
 ///
@@ -123,22 +126,10 @@ macro_rules! define_routes {
 /// Declare an API's credential lifecycle as a marker type with a `flow()`
 /// constructor for [`ApiRouter::auth_flow`](crate::ApiRouter::auth_flow).
 ///
-/// One declaration collapses every place auth facts live server-side: the
-/// routes that mint/renew the bearer (validated at `build()` — a lifecycle
-/// route marked `Private` is the circular-marking bug), the WS ticket mint,
-/// and any constants the client should have pinned (issuer, client id…).
-/// The generated client turns the declaration into session lifecycle
-/// machinery: a `TokenStore`, single-flight re-derivation on 401 with one
-/// replay, and `onSessionExpired`.
-///
-/// The lifecycle is vocabulary-free — OAuth2 authorization-code flows and
-/// lower-grade credential exchanges (session cookie → JWT) declare the same
-/// three facts. Flow *logic* (PKCE, browser sessions, storage) stays in the
-/// app; this macro carries facts.
-///
-/// Route fields take `register!(handler)` — the reference is resolved with
-/// the same name transform the router applies, so a typo is a compile error
-/// and an `.as_()` rename is caught at startup.
+/// The declaration names the routes that mint/renew the bearer, the WS
+/// ticket mint, and any constants the client should pin. Route fields take
+/// `register!(handler)` — resolved with the same name transform the router
+/// applies.
 ///
 /// # Example
 /// ```rust,ignore
@@ -172,7 +163,8 @@ macro_rules! auth_scheme {
             /// [`ApiRouter::auth_flow`](crate::ApiRouter::auth_flow).
             pub fn flow() -> $crate::AuthFlow {
                 $crate::__auth_scheme_munch!(@
-                    [$crate::AuthFlow::new(stringify!($name), $crate::__auth_kind!($kind))]
+                    p []
+                    c [$crate::AuthFlow::new(stringify!($name), $crate::__auth_kind!($kind))]
                     $($fields)*
                 )
             }
@@ -185,104 +177,127 @@ macro_rules! auth_scheme {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __auth_scheme_munch {
-    // Terminal — emit the accumulated builder chain.
-    (@ [$($acc:tt)*]) => { $($acc)* };
-    (@ [$($acc:tt)*] ,) => { $($acc)* };
-    // Field rules come in comma / trailing-comma-less pairs: an optional
-    // `$(,)?` before `$($rest:tt)*` is ambiguous (rest can eat the comma),
-    // so the separator is matched explicitly.
-    (@ [$($acc:tt)*] exchange: register!($h:path) , $($rest:tt)*) => {
-        $crate::__auth_scheme_munch!(@ [$($acc)* .bootstrap($h)] $($rest)*)
+    // Terminal.
+    (@ p [$($pr:tt)*] c [$($acc:tt)*]) => { { $($pr)* $($acc)* } };
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] ,) => { { $($pr)* $($acc)* } };
+    // Comma-separated field rules; the separator is matched explicitly.
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] exchange: register!($h:path) , $($rest:tt)*) => {
+        $crate::__auth_scheme_munch!(@ p [$($pr)*] c [$($acc)* .bootstrap($h)] $($rest)*)
     };
-    (@ [$($acc:tt)*] exchange: register!($h:path)) => {
-        $($acc)* .bootstrap($h)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] exchange: register!($h:path)) => {
+        { $($pr)* $($acc)* .bootstrap($h) }
     };
-    // `-> field`: declare the response field carrying the bearer; the
-    // generated client binds its default refresh hook to this route.
-    (@ [$($acc:tt)*] exchange: register!($h:path) -> $f:ident , $($rest:tt)*) => {
+    // `-> field`: the response field carrying the bearer; the probe
+    // requires the field on the handler's response type.
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] exchange: register!($h:path) -> $f:ident , $($rest:tt)*) => {
         $crate::__auth_scheme_munch!(@
-            [$($acc)* .bootstrap($h).token_field(stringify!($f))] $($rest)*)
+            p [$($pr)* $crate::__check_response_fields!($h $f);]
+            c [$($acc)* .bootstrap($h).token_field(stringify!($f))]
+            $($rest)*)
     };
-    (@ [$($acc:tt)*] exchange: register!($h:path) -> $f:ident) => {
-        $($acc)* .bootstrap($h).token_field(stringify!($f))
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] exchange: register!($h:path) -> $f:ident) => {
+        { $($pr)* $crate::__check_response_fields!($h $f); $($acc)* .bootstrap($h).token_field(stringify!($f)) }
     };
-    (@ [$($acc:tt)*] refresh: register!($h:path) , $($rest:tt)*) => {
-        $crate::__auth_scheme_munch!(@ [$($acc)* .refresh($h)] $($rest)*)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] refresh: register!($h:path) , $($rest:tt)*) => {
+        $crate::__auth_scheme_munch!(@ p [$($pr)*] c [$($acc)* .refresh($h)] $($rest)*)
     };
-    (@ [$($acc:tt)*] refresh: register!($h:path)) => {
-        $($acc)* .refresh($h)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] refresh: register!($h:path)) => {
+        { $($pr)* $($acc)* .refresh($h) }
     };
-    (@ [$($acc:tt)*] refresh: register!($h:path) -> $f:ident , $($rest:tt)*) => {
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] refresh: register!($h:path) -> $f:ident , $($rest:tt)*) => {
         $crate::__auth_scheme_munch!(@
-            [$($acc)* .refresh($h).token_field(stringify!($f))] $($rest)*)
+            p [$($pr)* $crate::__check_response_fields!($h $f);]
+            c [$($acc)* .refresh($h).token_field(stringify!($f))]
+            $($rest)*)
     };
-    (@ [$($acc:tt)*] refresh: register!($h:path) -> $f:ident) => {
-        $($acc)* .refresh($h).token_field(stringify!($f))
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] refresh: register!($h:path) -> $f:ident) => {
+        { $($pr)* $crate::__check_response_fields!($h $f); $($acc)* .refresh($h).token_field(stringify!($f)) }
     };
-    (@ [$($acc:tt)*] ws_ticket: register!($h:path) , $($rest:tt)*) => {
-        $crate::__auth_scheme_munch!(@ [$($acc)* .ws_ticket($h)] $($rest)*)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] ws_ticket: register!($h:path) , $($rest:tt)*) => {
+        $crate::__auth_scheme_munch!(@ p [$($pr)*] c [$($acc)* .ws_ticket($h)] $($rest)*)
     };
-    (@ [$($acc:tt)*] ws_ticket: register!($h:path)) => {
-        $($acc)* .ws_ticket($h)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] ws_ticket: register!($h:path)) => {
+        { $($pr)* $($acc)* .ws_ticket($h) }
     };
-    // OAuth2 pair form: `-> { access: a, refresh: r, expires_in: e }`
-    // (refresh/expires_in optional, fixed member order). Members munch
-    // separately; `access` is required so every path ends in a Pair decl.
-    (@ [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident , refresh: $r:ident , expires_in: $e:ident } , $($rest:tt)*) => {
-        $crate::__auth_scheme_munch!(@ [$($acc)* .bootstrap($h).token_pair(stringify!($a), Some(stringify!($r)), Some(stringify!($e)))] $($rest)*)
+    // OAuth2 pair form: `-> { access, refresh, expires_in }`
+    // (refresh/expires_in optional).
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident , refresh: $r:ident , expires_in: $e:ident } , $($rest:tt)*) => {
+        $crate::__auth_scheme_munch!(@
+            p [$($pr)* $crate::__check_response_fields!($h $a, $r, $e);]
+            c [$($acc)* .bootstrap($h).token_pair(stringify!($a), Some(stringify!($r)), Some(stringify!($e)))]
+            $($rest)*)
     };
-    (@ [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident , refresh: $r:ident , expires_in: $e:ident }) => {
-        $($acc)* .bootstrap($h).token_pair(stringify!($a), Some(stringify!($r)), Some(stringify!($e)))
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident , refresh: $r:ident , expires_in: $e:ident }) => {
+        { $($pr)* $crate::__check_response_fields!($h $a, $r, $e); $($acc)* .bootstrap($h).token_pair(stringify!($a), Some(stringify!($r)), Some(stringify!($e))) }
     };
-    (@ [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident , refresh: $r:ident } , $($rest:tt)*) => {
-        $crate::__auth_scheme_munch!(@ [$($acc)* .bootstrap($h).token_pair(stringify!($a), Some(stringify!($r)), None)] $($rest)*)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident , refresh: $r:ident } , $($rest:tt)*) => {
+        $crate::__auth_scheme_munch!(@
+            p [$($pr)* $crate::__check_response_fields!($h $a, $r);]
+            c [$($acc)* .bootstrap($h).token_pair(stringify!($a), Some(stringify!($r)), None)]
+            $($rest)*)
     };
-    (@ [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident , refresh: $r:ident }) => {
-        $($acc)* .bootstrap($h).token_pair(stringify!($a), Some(stringify!($r)), None)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident , refresh: $r:ident }) => {
+        { $($pr)* $crate::__check_response_fields!($h $a, $r); $($acc)* .bootstrap($h).token_pair(stringify!($a), Some(stringify!($r)), None) }
     };
-    (@ [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident , expires_in: $e:ident } , $($rest:tt)*) => {
-        $crate::__auth_scheme_munch!(@ [$($acc)* .bootstrap($h).token_pair(stringify!($a), None, Some(stringify!($e)))] $($rest)*)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident , expires_in: $e:ident } , $($rest:tt)*) => {
+        $crate::__auth_scheme_munch!(@
+            p [$($pr)* $crate::__check_response_fields!($h $a, $e);]
+            c [$($acc)* .bootstrap($h).token_pair(stringify!($a), None, Some(stringify!($e)))]
+            $($rest)*)
     };
-    (@ [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident , expires_in: $e:ident }) => {
-        $($acc)* .bootstrap($h).token_pair(stringify!($a), None, Some(stringify!($e)))
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident , expires_in: $e:ident }) => {
+        { $($pr)* $crate::__check_response_fields!($h $a, $e); $($acc)* .bootstrap($h).token_pair(stringify!($a), None, Some(stringify!($e))) }
     };
-    (@ [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident } , $($rest:tt)*) => {
-        $crate::__auth_scheme_munch!(@ [$($acc)* .bootstrap($h).token_pair(stringify!($a), None, None)] $($rest)*)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident } , $($rest:tt)*) => {
+        $crate::__auth_scheme_munch!(@
+            p [$($pr)* $crate::__check_response_fields!($h $a);]
+            c [$($acc)* .bootstrap($h).token_pair(stringify!($a), None, None)]
+            $($rest)*)
     };
-    (@ [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident }) => {
-        $($acc)* .bootstrap($h).token_pair(stringify!($a), None, None)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] exchange: register!($h:path) -> { access: $a:ident }) => {
+        { $($pr)* $crate::__check_response_fields!($h $a); $($acc)* .bootstrap($h).token_pair(stringify!($a), None, None) }
     };
-    (@ [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident , refresh: $r:ident , expires_in: $e:ident } , $($rest:tt)*) => {
-        $crate::__auth_scheme_munch!(@ [$($acc)* .refresh($h).token_pair(stringify!($a), Some(stringify!($r)), Some(stringify!($e)))] $($rest)*)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident , refresh: $r:ident , expires_in: $e:ident } , $($rest:tt)*) => {
+        $crate::__auth_scheme_munch!(@
+            p [$($pr)* $crate::__check_response_fields!($h $a, $r, $e);]
+            c [$($acc)* .refresh($h).token_pair(stringify!($a), Some(stringify!($r)), Some(stringify!($e)))]
+            $($rest)*)
     };
-    (@ [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident , refresh: $r:ident , expires_in: $e:ident }) => {
-        $($acc)* .refresh($h).token_pair(stringify!($a), Some(stringify!($r)), Some(stringify!($e)))
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident , refresh: $r:ident , expires_in: $e:ident }) => {
+        { $($pr)* $crate::__check_response_fields!($h $a, $r, $e); $($acc)* .refresh($h).token_pair(stringify!($a), Some(stringify!($r)), Some(stringify!($e))) }
     };
-    (@ [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident , refresh: $r:ident } , $($rest:tt)*) => {
-        $crate::__auth_scheme_munch!(@ [$($acc)* .refresh($h).token_pair(stringify!($a), Some(stringify!($r)), None)] $($rest)*)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident , refresh: $r:ident } , $($rest:tt)*) => {
+        $crate::__auth_scheme_munch!(@
+            p [$($pr)* $crate::__check_response_fields!($h $a, $r);]
+            c [$($acc)* .refresh($h).token_pair(stringify!($a), Some(stringify!($r)), None)]
+            $($rest)*)
     };
-    (@ [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident , refresh: $r:ident }) => {
-        $($acc)* .refresh($h).token_pair(stringify!($a), Some(stringify!($r)), None)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident , refresh: $r:ident }) => {
+        { $($pr)* $crate::__check_response_fields!($h $a, $r); $($acc)* .refresh($h).token_pair(stringify!($a), Some(stringify!($r)), None) }
     };
-    (@ [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident , expires_in: $e:ident } , $($rest:tt)*) => {
-        $crate::__auth_scheme_munch!(@ [$($acc)* .refresh($h).token_pair(stringify!($a), None, Some(stringify!($e)))] $($rest)*)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident , expires_in: $e:ident } , $($rest:tt)*) => {
+        $crate::__auth_scheme_munch!(@
+            p [$($pr)* $crate::__check_response_fields!($h $a, $e);]
+            c [$($acc)* .refresh($h).token_pair(stringify!($a), None, Some(stringify!($e)))]
+            $($rest)*)
     };
-    (@ [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident , expires_in: $e:ident }) => {
-        $($acc)* .refresh($h).token_pair(stringify!($a), None, Some(stringify!($e)))
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident , expires_in: $e:ident }) => {
+        { $($pr)* $crate::__check_response_fields!($h $a, $e); $($acc)* .refresh($h).token_pair(stringify!($a), None, Some(stringify!($e))) }
     };
-    (@ [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident } , $($rest:tt)*) => {
-        $crate::__auth_scheme_munch!(@ [$($acc)* .refresh($h).token_pair(stringify!($a), None, None)] $($rest)*)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident } , $($rest:tt)*) => {
+        $crate::__auth_scheme_munch!(@
+            p [$($pr)* $crate::__check_response_fields!($h $a);]
+            c [$($acc)* .refresh($h).token_pair(stringify!($a), None, None)]
+            $($rest)*)
     };
-    (@ [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident }) => {
-        $($acc)* .refresh($h).token_pair(stringify!($a), None, None)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] refresh: register!($h:path) -> { access: $a:ident }) => {
+        { $($pr)* $crate::__check_response_fields!($h $a); $($acc)* .refresh($h).token_pair(stringify!($a), None, None) }
     };
-    (@ [$($acc:tt)*] constant $key:ident : $value:expr , $($rest:tt)*) => {
-        $crate::__auth_scheme_munch!(@ [$($acc)* .constant(stringify!($key), $value)] $($rest)*)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] constant $key:ident : $value:expr , $($rest:tt)*) => {
+        $crate::__auth_scheme_munch!(@ p [$($pr)*] c [$($acc)* .constant(stringify!($key), $value)] $($rest)*)
     };
-    // `expr` fragments accept only `,`/`;`/`=>` after them, so the trailing
-    // (comma-less) form terminates inline.
-    (@ [$($acc:tt)*] constant $key:ident : $value:expr) => {
-        $($acc)* .constant(stringify!($key), $value)
+    (@ p [$($pr:tt)*] c [$($acc:tt)*] constant $key:ident : $value:expr) => {
+        { $($pr)* $($acc)* .constant(stringify!($key), $value) }
     };
 }
 
@@ -312,30 +327,15 @@ pub use ts::*;
 /// Trait generated by `#[endpoint]` to carry inferred type metadata.
 ///
 /// The proc-macro creates a companion struct (`<fn_name>__EndpointMeta`) that
-/// implements this trait. The builder calls `apply()` when constructing the
-/// route to populate the `RouteDefinition` with the extracted body/response/query types,
-/// pushing each named type through the router's [`Collector`].
-///
-/// `apply` is generic over the collector so the lean (`NoCollect`) and collecting
-/// (`TypeRegistry`) router builds monomorphize separately — keeping the ts-rs export
-/// machinery out of binaries that don't collect types.
-///
-/// You should not implement this trait manually — use `#[endpoint]` on your
-/// handler functions instead.
+/// implements this trait.
 pub trait EndpointMeta: Sized {
-    /// Type-level authorization fold: `Credential` when some parameter
-    /// authenticates or the endpoint declared itself public/permissive,
-    /// `OptionalCredential` otherwise. Set by `#[endpoint]`; the private-by-default
-    /// chain bounds registration on it (see [`AllowsRoute`](crate::AllowsRoute)).
+    /// Type-level authorization answer for the route.
     type Authorization: crate::params::AuthFlag;
 
-    /// The params-only credential fold (`Authorization` before the
-    /// endpoint's own visibility declaration folds in). Drives the
-    /// definition-site coherence check.
+    /// The params-only credential fold. Drives the definition-site check.
     type ParamCredentials: crate::params::AuthFlag;
 
-    /// Apply inferred type metadata to a route definition and register named types
-    /// for TypeScript export through `collector`.
+    /// Apply inferred type metadata to a route definition.
     fn apply<C: Collector>(def: &mut RouteDefinition, collector: &mut C);
 }
 
