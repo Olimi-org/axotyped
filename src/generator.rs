@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 use std::path::{Component, Path};
 use std::process::Command;
@@ -51,10 +51,6 @@ pub struct GeneratorConfig {
     /// CSRF header for mutating requests under [`AuthScheme::Cookie`].
     /// `None` emits no CSRF plumbing. Ignored under other schemes.
     pub csrf_header_name: Option<String>,
-    /// Ticket endpoint for `[ws][auth]` routes under Bearer (e.g. `Some("/ws/ticket")`).
-    /// Emits an async ticket handshake; when `None`, those routes have no
-    /// credential pathway and produce a diagnostic.
-    pub ws_ticket_path: Option<String>,
 }
 
 impl Default for GeneratorConfig {
@@ -69,7 +65,6 @@ impl Default for GeneratorConfig {
             default_credentials: "same-origin".into(),
             type_import_prefix: String::new(),
             format_command: None,
-            ws_ticket_path: None,
             large_int_type: "number".into(),
             auth_scheme: AuthScheme::Bearer,
             csrf_header_name: None,
@@ -80,7 +75,6 @@ impl Default for GeneratorConfig {
 impl GeneratorConfig {
     /// Returns a ts-rs [`Config`](crate::ts::Config) with matching `large_int_type`,
     /// for use with [`RouteCollection::export_types_with`](crate::RouteCollection::export_types_with).
-    #[cfg(feature = "ts-rs")]
     pub fn ts_config(&self) -> crate::ts::Config {
         crate::ts::Config::from_env().with_large_int(self.large_int_type.clone())
     }
@@ -139,6 +133,13 @@ const LARGE_INT_TYPES: &[&str] = &["u64", "i64", "u128", "i128", "usize", "isize
 
 /// Stdlib containers handled inline without TS imports.
 const CONTAINERS: &[&str] = &["Vec", "Option"];
+
+/// Names this generator injects onto the client object alongside the route
+/// methods. A route that claims one of them would be overwritten by
+/// `Object.assign`, so they are reserved by name rather than by mangling —
+/// the closed world is small enough to state, and the check that reads it
+/// lives next to the code that emits these.
+const CLIENT_HELPERS: &[&str] = &["withOptions"];
 
 /// Strips `Vec`/`Option` wrappers to the innermost type.
 #[cfg(test)]
@@ -294,91 +295,16 @@ fn compute_import_prefix(config: &GeneratorConfig) -> String {
     };
     let suffix = bind_parts[common..].join("/");
     if !suffix.is_empty() {
-        prefix.push('/');
+        if !prefix.ends_with('/') {
+            prefix.push('/');
+        }
         prefix.push_str(&suffix);
     }
     prefix
 }
 
-/// Builds a JS path expression. Literals are escaped; `{param}` becomes
-/// `${encodeURIComponent(param)}` with the same sanitization as `extract_path_params`.
-/// e.g. `/admin/users/{id}` -> `` `/admin/users/${encodeURIComponent(id)}` ``.
-fn build_path_template(path: &str) -> String {
-    if !path.contains('{') {
-        return format!("\"{}\"", escape_js_string(path));
-    }
-
-    let mut template = String::new();
-    // raw name -> emitted name, mirroring the scan order and allocation rules
-    // of `extract_path_params`
-    let mut seen: Vec<(&str, String)> = Vec::new();
-    // Names claimed by valid raw identifiers; synthetics must avoid these.
-    let taken: std::collections::BTreeSet<String> = crate::types::scan_taken_param_names(path);
-    let mut next_synthetic = 0usize;
-    let mut rest = path;
-
-    loop {
-        match rest.find('{') {
-            None => {
-                push_escaped_template_text(&mut template, rest);
-                break;
-            }
-            Some(open) => {
-                push_escaped_template_text(&mut template, &rest[..open]);
-                let after = &rest[open..];
-                match after[1..].find('}') {
-                    None => {
-                        // Unterminated brace: emit as inert literal text.
-                        push_escaped_template_text(&mut template, after);
-                        break;
-                    }
-                    Some(close_rel) => {
-                        let raw = &after[1..1 + close_rel];
-                        let safe = match seen.iter().find(|(r, _)| *r == raw) {
-                            Some((_, safe)) => safe.clone(),
-                            None => {
-                                let safe = crate::types::sanitize_param_name_with(
-                                    &taken,
-                                    &mut next_synthetic,
-                                    raw,
-                                    seen.len(),
-                                );
-                                seen.push((raw, safe.clone()));
-                                safe
-                            }
-                        };
-                        template.push_str("${encodeURIComponent(");
-                        template.push_str(&safe);
-                        template.push_str(")}");
-                        rest = &after[1 + close_rel + 1..];
-                    }
-                }
-            }
-        }
-    }
-
-    format!("`{template}`")
-}
-
-/// Escapes text for a JS template literal (backslash, backtick, `$`).
-/// Every `$` is escaped: a following `{` may arrive in a later slice when
-/// `build_path_template` splits at `{`, so a peek within this slice is not enough.
-fn push_escaped_template_text(out: &mut String, text: &str) {
-    for c in text.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '`' => out.push_str("\\`"),
-            // Escape every `$`; a following `{` may arrive in a later slice.
-            '$' => out.push_str("\\$"),
-            c => out.push(c),
-        }
-    }
-}
-
-/// Escapes text for a double-quoted JS string (control chars, separators,
-/// backticks). `$` is escaped too even though `"\\$"` equals `"$"`: callers
-/// strip the quotes and re-embed the text in template literals, where a raw
-/// `$` before `{` would become a live substitution.
+/// Escapes text for a double-quoted JS string. `$` is escaped: callers
+/// re-embed the text in template literals.
 pub(crate) fn escape_js_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -386,8 +312,7 @@ pub(crate) fn escape_js_string(text: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '`' => out.push_str("\\`"),
-            // Re-embed safety: this text may end up inside a template
-            // literal, so `$` must never survive unescaped.
+            // Template-literal safety.
             '$' => out.push_str("\\$"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
@@ -404,8 +329,7 @@ pub(crate) fn escape_js_string(text: &str) -> String {
     out
 }
 
-/// Emits a route name as an object key; quotes and escapes non-identifiers
-/// (e.g. names from `.as_(...)`).
+/// Emit a route name as an object key.
 fn emit_method_name(out: &mut String, name: &str) {
     if crate::types::is_valid_js_identifier(name) {
         out.push_str(name);
@@ -416,13 +340,151 @@ fn emit_method_name(out: &mut String, name: &str) {
     }
 }
 
-/// Generates the parameter list for a route from its path params, body,
-/// and query types. Redirect behavior is a server-side route property, so
-/// callers take no options.
+/// Property access for a *wire* field name — the key as it appears in the
+/// server's JSON, which is not always a JS identifier.
+fn wire_access(out: &mut String, field: &str) {
+    if crate::types::is_valid_js_identifier(field) {
+        out.push('.');
+        out.push_str(field);
+    } else {
+        out.push_str("[\"");
+        out.push_str(&escape_js_string(field));
+        out.push_str("\"]");
+    }
+}
+
+/// Emit the typed renewal helper a declared flow buys.
+///
+/// This is where the flow declaration's field names are actually spent:
+/// the generated file reads them off the *imported response type*, so the
+/// compiler checks every name against the type the client will parse. The
+/// runtime used to do this same extraction against a name it was handed as
+/// a string, which nothing could check.
+///
+/// What the helper does not do is decide anything — it returns a value and
+/// stops. Storing it, scheduling it, and deciding what a lapse means are
+/// the application's.
+fn refresh_helper(
+    flow: &crate::auth_flow::AuthFlow,
+    routes: &RouteCollection,
+    type_name: &str,
+    enable_groups: bool,
+) -> Option<String> {
+    // A lifecycle route that cannot be called back with no arguments has
+    // no helper to generate; the warning stream already says so.
+    if default_hook_blocker(flow, routes).is_some() {
+        return None;
+    }
+    let fields = flow.token_fields.as_ref()?;
+    let route_name = flow
+        .refresh
+        .as_deref()
+        .or_else(|| flow.bootstrap.first().map(|s| s.as_str()))?;
+    let route = routes.find_by_name(route_name)?;
+
+    let mut s = String::new();
+    // Call through the typed route method so the response keeps its type —
+    // that type is what validates the field names below.
+    // Expression-position access: `.name` for identifiers, `["name"]`
+    // otherwise — emit_method_name would quote a literal key, which is not
+    // valid after `client.`.
+    let mut call = String::from("client");
+    match &route.group {
+        // With grouping disabled the flat emitter puts every route method
+        // at the top level — the group segment only exists when it's
+        // nested, or the helper calls a property the client does not have.
+        Some(group) if enable_groups => wire_access(&mut call, group),
+        _ => {}
+    }
+    wire_access(&mut call, &route.name);
+    call.push_str("()");
+
+    match fields {
+        crate::auth_flow::TokenFields::Bearer(field) => {
+            let mut read = String::from("res");
+            wire_access(&mut read, field);
+            w!(
+                s,
+                "/** Renews the bearer via `{name}` and returns the token, or null when\n\
+                 \x20 * the response carries none. Hand it to `onUnauthorized`, or call it on\n\
+                 \x20 * your own schedule using `jwtExpiry` to decide when. */",
+                name = route.name
+            );
+            w!(
+                s,
+                "export async function refreshBearer(client: {ty}): Promise<string | null> {{",
+                ty = type_name
+            );
+            w!(s, "  const res = await {call};", call = call);
+            w!(s, "  return {read} ?? null;", read = read);
+            w!(s, "}}");
+        }
+        crate::auth_flow::TokenFields::Pair {
+            access,
+            refresh,
+            expires_in,
+        } => {
+            let mut a = String::from("res");
+            wire_access(&mut a, access);
+            // An undeclared optional member is a literal null, not a read
+            // that happens to be undefined — the return type promises null.
+            let r = match refresh.as_ref() {
+                Some(f) => {
+                    let mut acc = String::from("res");
+                    wire_access(&mut acc, f);
+                    format!("{acc} ?? null")
+                }
+                None => "null".to_string(),
+            };
+            let e = match expires_in.as_ref() {
+                Some(f) => {
+                    let mut acc = String::from("res");
+                    wire_access(&mut acc, f);
+                    format!("{acc} == null ? null : Number({acc})")
+                }
+                None => "null".to_string(),
+            };
+            w!(
+                s,
+                "/** Renews the credential via `{name}` and lifts the declared fields off\n\
+                 \x20 * the response. `refresh` and `expiresIn` are null when the server omits\n\
+                 \x20 * them — with no `expiresIn` declared you may derive one from\n\
+                 \x20 * `jwtExpiry(access)`. */",
+                name = route.name
+            );
+            w!(
+                s,
+                "export async function refreshSession(client: {ty}): Promise<{{\n\
+                 \x20 access: string; refresh: string | null; expiresIn: number | null;\n\
+                 \x20 }}> {{",
+                ty = type_name
+            );
+            w!(s, "  const res = await {call};", call = call);
+            w!(s, "  return {{");
+            w!(s, "    access: {a},", a = a);
+            w!(s, "    refresh: {r},", r = r);
+            w!(s, "    expiresIn: {e},", e = e);
+            w!(s, "  }};");
+            w!(s, "}}");
+        }
+    }
+    w!(s);
+    Some(s)
+}
+
+/// Generates the parameter list for a route.
+///
+/// Path params are emitted under collision-proof JS names: a param named
+/// `transport` would otherwise shadow the `transport: Transport` closure
+/// binding (`(transport: string) => transport.execute(...)`), `OPERATIONS`
+/// would shadow the route table, and `body` / `query` would duplicate the
+/// body/query params. [`js_param_names`] maps wire names to safe locals;
+/// this renders the local side.
 fn generate_params(route: &RouteDefinition, large_int: &str) -> String {
+    let mapping = js_param_names(route);
     let mut params = Vec::new();
-    for param in &route.path_params {
-        params.push(format!("{}: string", param.name));
+    for (_, js) in &mapping {
+        params.push(format!("{js}: string"));
     }
     if let Some(ref body_type) = route.body_type {
         params.push(format!(
@@ -439,440 +501,635 @@ fn generate_params(route: &RouteDefinition, large_int: &str) -> String {
     params.join(", ")
 }
 
-/// Generates the request options literal for a route. Fully
-/// generator-controlled: `method` is always emitted so no caller can change
-/// the verb, `permissive` is always pinned so a caller cannot soften a
-/// `Private` route into best-effort, and `allowRedirects` reflects the
-/// server-side `[allow_redirects]` route property.
-fn generate_request_options(route: &RouteDefinition) -> String {
-    let mut opts: Vec<String> = Vec::new();
-    opts.push(format!("method: \"{}\"", route.method.as_str()));
-    match route.visibility {
-        Visibility::Private => {
-            opts.push("auth: true".into());
-            opts.push("permissive: false".into());
-        }
-        Visibility::Permissive => {
-            opts.push("auth: true".into());
-            opts.push("permissive: true".into());
-        }
-        Visibility::Public => {
-            opts.push("permissive: false".into());
-        }
-    }
-    opts.push(format!("allowRedirects: {}", route.allow_redirects));
-    if route.body_type.is_some() {
-        opts.push("body".into());
-    }
-    if route.query_type.is_some() {
-        opts.push("query".into());
-    }
-    format!(", {{ {} }}", opts.join(", "))
-}
-
 // ---------------------------------------------------------------------------
 // Template constants for static TypeScript blocks
 // ---------------------------------------------------------------------------
 
-const ERROR_CLASS: &str = r#"export class __ERROR__ extends Error {
-  constructor(message: string, public status: number, public body?: unknown) {
-    super(message);
+// ---------------------------------------------------------------------------
+// Client options + shared runtime emission
+// ---------------------------------------------------------------------------
 
-    // Keep native Error behavior when transpiled to older targets:
-    // name non-enumerable, prototype chain intact, stack trace captured.
-    Object.defineProperty(this, "name", {
-      value: "__ERROR__",
-      enumerable: false,
-      configurable: true,
-    });
-    if (Object.setPrototypeOf !== undefined) {
-      Object.setPrototypeOf(this, __ERROR__.prototype);
-    }
-    if ((Error as any).captureStackTrace !== undefined) {
-      (Error as any).captureStackTrace(this, this.constructor);
-    }
-  }
-}
-"#;
-
-const INSECURE_HTTP_DOC: &str = r#"  /**
-   * Opt-in ONLY for development against a non-loopback http:// target
-   * (e.g. an Expo device hitting your LAN IP). Loopback hosts
-   * (localhost / 127.0.0.1 / ::1 / *.localhost) are always permitted over
-   * http without this flag. Never set in production — CI should assert its
-   * absence.
-   */
+const INSECURE_HTTP_DOC: &str = r#"  /** Allow non-loopback http:// targets (development only). */
   allowInsecureHttp?: boolean;
 "#;
 
-/// ClientOptions fields shared by every scheme (everything after the
-/// scheme-specific auth fields).
+/// ClientOptions fields shared by every scheme.
+///
+/// Runtime types are referenced through their `__Axo*` aliases (see the
+/// runtime import block in `generate_client`): a user DTO named e.g.
+/// `Transport` or `OperationSpec` would otherwise collide with the runtime
+/// import of the same name.
 const OPTIONS_TAIL: &str = r#"  credentials?: RequestCredentials;
   fetch?: typeof fetch;
-  onError?: (error: __ERROR__) => void;
-  /**
-   * Default RequestInit merged into every request. Useful for AbortSignals
-   * (cancellation/timeouts), cache policy, keepalive, and priority hints.
-   * Per-request values passed through a route's options take precedence.
-   */
+  onError?: (error: __AxoApiError) => void;
+  onRequest?: (op: Readonly<__AxoOperationSpec>, url: string) => void;
+  onResponse?: (op: Readonly<__AxoOperationSpec>, response: Response) => void;
   requestInit?: Omit<RequestInit, "headers" | "method" | "body"> & {
     headers?: Record<string, string>;
   };
 "#;
 
-const OPTIONS_INTERFACE_BEARER: &str = r#"export interface __OPTS__ {
-  baseUrl: string;
-  getToken?: () => Promise<string | null>;
-"#;
-
-const OPTIONS_INTERFACE_PLAIN_HEAD: &str = r#"export interface __OPTS__ {
-  baseUrl: string;
-"#;
-
-const OPTIONS_CSRF_FIELD: &str = r#"  /**
-   * Returns the anti-CSRF proof attached as the "__CSRF_NAME__" header on
-   * mutating requests (POST / PUT / PATCH / DELETE). Source it from your
-   * framework's cookie or meta-tag convention. When unset, mutating requests
-   * carry no CSRF header — rely on SameSite cookie attributes server-side.
-   */
+const OPTIONS_CSRF_FIELD: &str = r#"  /** CSRF token attached as the "__CSRF_NAME__" header on mutating requests. */
   csrfToken?: () => Promise<string | null> | string | null;
 "#;
 
-const OPTIONS_INTERFACE_NONE: &str = r#"export interface __OPTS__ {
-  baseUrl: string;
-"#;
+/// The shared client runtime, emitted beside the client file.
+pub fn generate_runtime_source() -> String {
+    include_str!("runtime.ts").replace("__RUNTIME_VERSION__", env!("CARGO_PKG_VERSION"))
+}
 
-/// Assemble the options interface for the configured auth scheme.
-fn options_interface(config: &GeneratorConfig) -> String {
-    let mut s = String::new();
+/// File stem of the runtime module.
+fn runtime_file_stem(config: &GeneratorConfig) -> String {
+    let stem = Path::new(&config.output_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("client");
+    format!("{stem}-runtime")
+}
+
+/// Path the runtime module is written to.
+fn runtime_output_path(config: &GeneratorConfig) -> std::path::PathBuf {
+    Path::new(&config.output_path)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("{}.ts", runtime_file_stem(config)))
+}
+
+/// Import specifier the client uses for the runtime module.
+fn runtime_import(config: &GeneratorConfig) -> String {
+    format!("./{}", escape_js_string(&runtime_file_stem(config)))
+}
+
+fn scheme_label(config: &GeneratorConfig) -> &'static str {
     match config.auth_scheme {
-        AuthScheme::Bearer => s.push_str(OPTIONS_INTERFACE_BEARER),
-        AuthScheme::Cookie => {
-            s.push_str(OPTIONS_INTERFACE_PLAIN_HEAD);
-            if config.csrf_header_name.is_some() {
-                s.push_str(OPTIONS_CSRF_FIELD);
+        AuthScheme::Bearer => "bearer",
+        AuthScheme::Cookie => "cookie",
+        AuthScheme::None => "none",
+    }
+}
+
+/// Assemble the ClientOptions interface. A declared flow additionally
+/// exposes `onUnauthorized`, the renewal hook the transport consults after
+/// a 401; without a flow the application renews on its own schedule and
+/// only names where the credential lives.
+fn options_interface(config: &GeneratorConfig, lifecycle: bool) -> String {
+    let mut s = String::from("export interface __OPTS__ {\n  baseUrl: string;\n");
+    match config.auth_scheme {
+        AuthScheme::Bearer => {
+            s.push_str(
+                "  /** The bearer source — where the credential lives. Consulted on every\n\
+                 \x20     credentialed call. */\n\
+                 \x20 getToken?: () => Promise<string | null> | string | null;\n",
+            );
+            if lifecycle {
+                s.push_str(
+                    "  /** Renewal policy. Called after a 401 on a required route; return the\n\
+                     \x20     credential to replay with, or null when the session cannot be\n\
+                     \x20     renewed. Throwing is treated as null. The replay rides this\n\
+                     \x20     return value — the transport never re-reads getToken to decide who\n\
+                     \x20     the caller is, so a request cannot be re-sent under a session you\n\
+                     \x20     have since replaced. */\n\
+                     \x20 onUnauthorized?: () => Promise<string | null>;\n",
+                );
             }
         }
-        AuthScheme::None => s.push_str(OPTIONS_INTERFACE_NONE),
-    }
-    s.push_str(OPTIONS_TAIL);
-    s.push_str(INSECURE_HTTP_DOC);
-    s.push_str("}\n");
-    s
-}
-
-const REQUEST_OPTIONS_TYPE: &str = "\
-/** Route call options. Fully generator-pinned per route — route methods take
-    no caller options, so these fields are never user-supplied. */
-type RequestOptions = {
-  method?: string;
-  body?: unknown;
-  query?: Record<string, unknown>;
-  auth?: boolean;
-  /** Attach credentials when available, never require them. */
-  permissive?: boolean;
-  /** Follow redirects only for credentialless calls to declaring routes. */
-  allowRedirects?: boolean;
-};
-\
-/** The `request` helper produced by `createRequest`, for the routes factory. */
-type RequestFn = <T>(path: string, opts?: RequestOptions) => Promise<T>;
-";
-
-const REQUEST_HELPER_PRE: &str = r#"function assertSecureTransport(
-  url: string,
-  opts: { allowInsecureHttp: boolean; auth: boolean; credentials: string },
-): void {
-  const { allowInsecureHttp, auth, credentials } = opts;
-  // Transport guard: credentials must only ride https. Loopback hosts are
-  // inherently local and always allowed over http; anything else requires
-  // the explicit allowInsecureHttp development opt-in. Fails closed on
-  // unparseable URLs and non-http(s) protocols.
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new Error(
-      `Client produced an unparseable URL (${JSON.stringify(url)}); refusing to send credentials.`,
-    );
-  }
-  if (parsed.protocol === "https:" || parsed.protocol === "wss:") return;
-  const h = parsed.hostname;
-  const isLoopback =
-    h === "localhost" ||
-    h.endsWith(".localhost") ||
-    h === "127.0.0.1" ||
-    h === "::1" ||
-    h === "[::1]";
-  const isInsecureScheme = parsed.protocol === "http:" || parsed.protocol === "ws:";
-  const insecureAllowed =
-    isInsecureScheme && (isLoopback || allowInsecureHttp);
-  if (!insecureAllowed) {
-    throw new Error(
-      parsed.protocol === "http:"
-        ? `Refusing to send credentials over http:// to non-loopback host "${h}". Use https:// in production; set allowInsecureHttp on the client options for LAN/device development.`
-        : `Unsupported protocol ${parsed.protocol} for credential-bearing requests.`,
-    );
-  }
-  // allowInsecureHttp permits the HTTP connection itself, but never for
-  // credential-bearing requests to non-loopback hosts. Cookies count:
-  // even with auth:false, `credentials: "include"` (or `"same-origin"`
-  // to a same-origin http target) still sends session cookies.
-  if (isInsecureScheme && !isLoopback && (auth || credentials !== "omit")) {
-    throw new Error(
-      `Refusing to send credentials over http:// to non-loopback host "${h}". Set allowInsecureHttp for the connection, but credentialed requests (auth: true or credentials !== "omit") still require https:// or a loopback host.`,
-    );
-  }
-}
-
-function createRequest(options: __OPTS__) {
-  const { baseUrl, credentials = "__CREDS__" } = options;
-  // Bind fetch to its original receiver: calling an unbound
-  // globalThis.fetch reference throws "Illegal invocation" in several
-  // browser engines.
-  const boundFetch =
-    options.fetch !== undefined ? options.fetch : globalThis.fetch.bind(globalThis);
-
-  async function request<T>(path: string, opts?: RequestOptions): Promise<T>;
-  async function request<T>(
-    path: string,
-    opts: RequestOptions | undefined,
-    rawResponse: true,
-  ): Promise<Response>;
-  async function request<T>(
-    path: string,
-    opts: RequestOptions = {},
-    rawResponse?: boolean,
-  ): Promise<T | Response> {
-    const { method = "GET", body, query, auth = false, permissive = false } = opts;
-    let url = `${baseUrl}${path}`;
-    if (query) {
-      const params = new URLSearchParams();
-      for (const [key, value] of Object.entries(query)) {
-        // Arrays expand to repeated keys (?tag=a&tag=b), the conventional
-        // encoding for list-valued parameters.
-        for (const v of Array.isArray(value) ? value : [value]) {
-          if (v !== undefined && v !== null) {
-            params.append(key, String(v));
-          }
-        }
-      }
-      const qs = params.toString();
-      if (qs) url += `?${qs}`;
-    }
-
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      ...(options.requestInit?.headers ?? {}),
-    };
-
-    // Credentials are only sent over https, to loopback hosts over http,
-    // or when the client was explicitly configured with allowInsecureHttp.
-    // allowInsecureHttp permits the HTTP connection itself, but never for
-    // credential-bearing requests (auth or cookies) to non-loopback hosts.
-    assertSecureTransport(url, { allowInsecureHttp: options.allowInsecureHttp === true, auth, credentials });
-"#;
-
-/// Auth section of the request helper for [`AuthScheme::Bearer`]: a `Private`
-/// route aborts unless a token source is configured **and** resolves — an
-/// unauthenticated request is never sent. A `Permissive` route attaches the
-/// token when one resolves and otherwise sends anonymously.
-const REQUEST_AUTH_BEARER: &str = r#"
-    // A [permissive] route attaches credentials when available but never
-    // fails for want of them; any other [auth] route requires a token.
-    if (auth) {
-      if (permissive) {
-        if (options.getToken) {
-          const token = await options.getToken();
-          if (token) headers.Authorization = `Bearer ${token}`;
-        }
-      } else {
-        if (!options.getToken) {
-          throw new Error(
-            `Route declared [auth] but options.getToken was not configured (${method} ${path})`,
-          );
-        }
-        const token = await options.getToken();
-        if (!token) {
-          throw new Error(
-            `options.getToken() returned no token for an [auth] route (${method} ${path})`,
-          );
-        }
-        headers.Authorization = `Bearer ${token}`;
-      }
-    }
-"#;
-
-/// Auth section of the request helper for [`AuthScheme::Cookie`]: browsers
-/// attach session cookies automatically, so the only way an authenticated
-/// route can go out unauthenticated is a consumer explicitly stripping them.
-/// `Permissive` routes skip the refusal — anonymous (`omit`) is a valid
-/// outcome for them.
-const REQUEST_AUTH_COOKIE: &str = r#"
-    // An [auth] route rides the browser's session cookies; refuse consumer
-    // configurations that would strip them instead of sending the request
-    // unauthenticated.
-    if (auth && !permissive && (options.credentials ?? "__CREDS__") === "omit") {
-      throw new Error(
-        `Route declared [auth] but options.credentials is "omit"; refusing to send an unauthenticated request (${method} ${path})`,
-      );
-    }
-"#;
-
-/// Anti-CSRF plumbing, appended under [`AuthScheme::Cookie`] when
-/// [`GeneratorConfig::csrf_header_name`] is set.
-const REQUEST_CSRF_BLOCK: &str = r#"
-    // Attach anti-CSRF proof on mutating requests when a token source is
-    // configured. GET/HEAD/OPTIONS are safe methods and never carry it.
-    if (!["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase())) {
-      const csrfToken = await options.csrfToken?.();
-      if (csrfToken) headers["__CSRF_NAME__"] = csrfToken;
-    }
-"#;
-
-const REQUEST_HELPER_POST: &str = r#"
-    // Only credentialless calls to routes declaring `[allow_redirects]`
-    // follow redirects; anything carrying auth or cookies refuses, since the
-    // guard sees only the initial URL and a 3xx could bounce to http://.
-    const canFollowRedirects =
-      !auth && credentials === "omit" && opts.allowRedirects === true;
-    const response = await boundFetch(url, {
-      ...options.requestInit,
-      ...(auth ? { cache: "no-store" as const } : {}),
-      redirect: canFollowRedirects ? "follow" : "error",
-      method,
-      credentials,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      let message: string;
-      let errorBody: unknown;
-      try {
-        const json = JSON.parse(text);
-        message = json.error ?? json.message ?? text;
-        errorBody = json;
-      } catch {
-        message = text;
-      }
-      const error = new __ERROR__(message, response.status, errorBody);
-      if (options.onError) options.onError(error);
-      throw error;
-    }
-
-    if (rawResponse) return response;
-
-    const text = await response.text();
-    return (text ? JSON.parse(text) : undefined) as T;
-  }
-
-  return request;
-}
-"#;
-
-/// Assemble the request helper for the configured auth scheme.
-fn request_helper(config: &GeneratorConfig) -> String {
-    let mut s = String::from(REQUEST_HELPER_PRE);
-    match config.auth_scheme {
-        AuthScheme::Bearer => s.push_str(REQUEST_AUTH_BEARER),
         AuthScheme::Cookie => {
-            s.push_str(REQUEST_AUTH_COOKIE);
             if config.csrf_header_name.is_some() {
-                s.push_str(REQUEST_CSRF_BLOCK);
+                s.push_str(&OPTIONS_CSRF_FIELD.replace(
+                    "__CSRF_NAME__",
+                    &escape_js_string(config.csrf_header_name.as_deref().unwrap_or("X-CSRF-Token")),
+                ));
             }
         }
         AuthScheme::None => {}
     }
-    s.push_str(REQUEST_HELPER_POST);
+    s.push_str(OPTIONS_TAIL);
+    s.push_str(INSECURE_HTTP_DOC);
+    s.push_str("}\n");
+    s.replace("__OPTS__", &config.options_interface_name)
+}
+
+/// Credential requirement for the OPERATIONS table.
+fn auth_mode(route: &RouteDefinition) -> &'static str {
+    match route.visibility {
+        Visibility::Private => "required",
+        Visibility::Permissive => "optional",
+        Visibility::Public => "none",
+    }
+}
+
+fn response_mode(route: &RouteDefinition) -> &'static str {
+    if route.redirect || route.response_type.is_none() {
+        "void"
+    } else {
+        "json"
+    }
+}
+
+/// Whether a WebSocket route carries both event types.
+fn has_ws_contract(route: &RouteDefinition) -> bool {
+    route.ws_send_type.is_some() && route.ws_receive_type.is_some()
+}
+
+/// Rewrites a route path for the OPERATIONS table.
+fn safe_spec_path(path: &str, params: &[crate::types::PathParam]) -> String {
+    if !path.contains('{') {
+        return escape_js_string(path);
+    }
+    let mut out = String::new();
+    let mut rest = path;
+    let mut seen: Vec<&str> = Vec::new();
+    loop {
+        match rest.find('{') {
+            None => {
+                out.push_str(&escape_js_string(rest));
+                break;
+            }
+            Some(open) => {
+                out.push_str(&escape_js_string(&rest[..open]));
+                let after = &rest[open..];
+                match after[1..].find('}') {
+                    None => {
+                        out.push_str(&escape_js_string(after));
+                        break;
+                    }
+                    Some(close_rel) => {
+                        let raw = &after[1..1 + close_rel];
+                        let idx = match seen.iter().position(|r| *r == raw) {
+                            Some(i) => i,
+                            None => {
+                                seen.push(raw);
+                                seen.len() - 1
+                            }
+                        };
+                        let safe = params.get(idx).map(|p| p.name.as_str()).unwrap_or(raw);
+                        out.push('{');
+                        out.push_str(safe);
+                        out.push('}');
+                        rest = &after[1 + close_rel + 1..];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Route name as an OPERATIONS-table key (quoted when not an identifier).
+fn op_key(key: &str) -> String {
+    if crate::types::is_valid_js_identifier(key) {
+        key.to_string()
+    } else {
+        format!("\"{}\"", escape_js_string(key))
+    }
+}
+
+/// Property reference into OPERATIONS for a table key.
+fn op_ref(key: &str) -> String {
+    if crate::types::is_valid_js_identifier(key) {
+        format!(".{key}")
+    } else {
+        format!("[\"{}\"]", escape_js_string(key))
+    }
+}
+
+/// Unique OPERATIONS-table key per route.
+fn operations_keys(routes: &RouteCollection) -> HashMap<(Option<String>, String), String> {
+    let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut map = HashMap::new();
+    for route in routes.iter() {
+        let base = match &route.group {
+            Some(group) => format!("{}.{}", group, route.name),
+            None => route.name.clone(),
+        };
+        let mut key = base.clone();
+        let mut n = 2;
+        while !used.insert(key.clone()) {
+            key = format!("{base}#{n}");
+            n += 1;
+        }
+        map.insert((route.group.clone(), route.name.clone()), key);
+    }
+    map
+}
+
+fn key_of(keys: &HashMap<(Option<String>, String), String>, route: &RouteDefinition) -> String {
+    keys.get(&(route.group.clone(), route.name.clone()))
+        .cloned()
+        .unwrap_or_else(|| route.name.clone())
+}
+
+/// JS-local names claimed by the generated route-method scope.
+///
+/// A route method closes over the factory's `transport` binding and the
+/// module-level `OPERATIONS` table, and declares `body` / `query` params of
+/// its own — a path param with any of those names would shadow or duplicate
+/// them (`/items/{transport}` used to emit `(transport: string) =>
+/// transport.execute(...)`). Wire names stay untouched; only locals are
+/// mangled, with `params: { wire: local }` mapping in [`call_args`].
+fn reserved_param_names() -> &'static [&'static str] {
+    &["transport", "TRANSPORT", "OPERATIONS", "body", "query"]
+}
+
+/// Maps each path param wire name to its JS-local name.
+///
+/// Returns `(wire_name, js_name)` pairs in path order. Names colliding with
+/// [`reserved_param_names`] (or with each other after mangling) gain trailing
+/// underscores until unique.
+fn js_param_names(route: &RouteDefinition) -> Vec<(String, String)> {
+    let reserved = reserved_param_names();
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    route
+        .path_params
+        .iter()
+        .map(|p| {
+            let wire = p.name.clone();
+            let mut candidate = wire.clone();
+            if reserved.contains(&candidate.as_str()) {
+                candidate.push('_');
+            }
+            while !used.insert(candidate.clone()) {
+                candidate.push('_');
+            }
+            (wire, candidate)
+        })
+        .collect()
+}
+
+/// The per-call argument bag a route method forwards to the executor.
+fn call_args(route: &RouteDefinition) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !route.path_params.is_empty() {
+        let mapping = js_param_names(route);
+        let names = mapping
+            .iter()
+            .map(|(wire, js)| {
+                if wire == js {
+                    js.clone()
+                } else {
+                    format!("{wire}: {js}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("params: {{ {names} }}"));
+    }
+    if route.body_type.is_some() {
+        parts.push("body".into());
+    }
+    if route.query_type.is_some() {
+        parts.push("query".into());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(", {{ {} }}", parts.join(", "))
+    }
+}
+
+/// Emit the OPERATIONS descriptor table.
+fn write_operations_table(
+    out: &mut String,
+    routes: &RouteCollection,
+    keys: &HashMap<(Option<String>, String), String>,
+    // Ticket mint descriptor parses JSON even without a response type.
+    ticket_key: Option<&str>,
+) {
+    w!(out, "/** Route table. */");
+    w!(out, "export const OPERATIONS = {{");
+    for route in routes.iter() {
+        if route.websocket && !has_ws_contract(route) {
+            continue;
+        }
+        let mut fields = vec![
+            format!("method: \"{}\"", route.method.as_str()),
+            format!(
+                "path: \"{}\"",
+                safe_spec_path(&route.path, &route.path_params)
+            ),
+        ];
+        if !route.path_params.is_empty() {
+            let names = route
+                .path_params
+                .iter()
+                .map(|p| format!("\"{}\"", p.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            fields.push(format!("params: [{names}]"));
+        }
+        fields.push(format!("auth: \"{}\"", auth_mode(route)));
+        if route.body_type.is_some() {
+            fields.push("body: \"json\"".into());
+        }
+        let key = key_of(keys, route);
+        let response = if ticket_key == Some(key.as_str()) {
+            "json"
+        } else {
+            response_mode(route)
+        };
+        fields.push(format!("response: \"{}\"", response));
+        if route.allow_redirects {
+            fields.push("allowRedirects: true".into());
+        }
+        if route.websocket {
+            fields.push("ws: true".into());
+        }
+        w!(out, "  {}: {{ {} }},", op_key(&key), fields.join(", "));
+    }
+    w!(out, "}} satisfies Record<string, __AxoOperationSpec>;");
+    w!(out);
+}
+
+/// Emit the AUTH strategy — the declaration as data. The runtime does not
+/// read it; `refreshBearer`/`refreshSession` is generated from the same
+/// fields and is the part you call. `skewMs` and `expiryFromJwt` are
+/// advisory hints for the renewal code you own.
+fn auth_strategy_const(
+    flow: &crate::auth_flow::AuthFlow,
+    routes: &RouteCollection,
+    keys: &HashMap<(Option<String>, String), String>,
+) -> String {
+    let mut s = String::new();
+    w!(
+        s,
+        "/** Credential lifecycle, as declared server-side. Read by your own renewal\n\
+         \x20 * code; `refreshBearer` below is generated from the same fields. */"
+    );
+    w!(s, "export const AUTH = {{");
+    // Lifecycle references name routes; the table keys qualify them.
+    let named = |name: &str| -> Option<String> {
+        routes
+            .find_by_name(name)
+            .map(|r| key_of(keys, r).to_string())
+    };
+    let refresh_key = flow
+        .refresh
+        .as_deref()
+        .or_else(|| flow.bootstrap.first().map(|s| s.as_str()))
+        .and_then(named);
+    let default_hook_blocked = default_hook_blocker(flow, routes).is_some();
+    match flow.kind {
+        crate::auth_flow::AuthFlowKind::StaticBearer => {
+            w!(s, "  kind: \"static_bearer\",");
+        }
+        crate::auth_flow::AuthFlowKind::Exchange => {
+            w!(s, "  kind: \"exchange\",");
+            match refresh_key {
+                Some(k) => w!(s, "  refresh: \"{}\",", escape_js_string(&k)),
+                None => w!(s, "  refresh: \"\","),
+            }
+            if !default_hook_blocked {
+                match &flow.token_fields {
+                    Some(crate::auth_flow::TokenFields::Bearer(field)) => {
+                        w!(s, "  field: \"{}\",", escape_js_string(field));
+                        w!(s, "  expiryFromJwt: true,");
+                    }
+                    _ => {}
+                }
+            }
+            w!(s, "  skewMs: 30_000,");
+        }
+        crate::auth_flow::AuthFlowKind::OAuth2 => {
+            w!(s, "  kind: \"oauth2\",");
+            match refresh_key {
+                Some(k) => w!(s, "  refresh: \"{}\",", escape_js_string(&k)),
+                None => w!(s, "  refresh: \"\","),
+            }
+            if !default_hook_blocked {
+                match &flow.token_fields {
+                    Some(crate::auth_flow::TokenFields::Pair {
+                        access,
+                        refresh,
+                        expires_in,
+                    }) => {
+                        w!(s, "  fields: {{");
+                        w!(s, "    access: \"{}\",", escape_js_string(access));
+                        if let Some(f) = refresh {
+                            w!(s, "    refresh: \"{}\",", escape_js_string(f));
+                        }
+                        if let Some(f) = expires_in {
+                            w!(s, "    expiresIn: \"{}\",", escape_js_string(f));
+                        }
+                        w!(s, "  }},");
+                    }
+                    _ => {}
+                }
+            }
+            w!(s, "  skewMs: 30_000,");
+        }
+    }
+    // Flow manifest.
+    w!(
+        s,
+        "  bootstrap: [{}],",
+        flow.bootstrap
+            .iter()
+            .filter_map(|n| named(n))
+            .map(|k| format!("\"{}\"", escape_js_string(&k)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    w!(s, "  constants: {{");
+    for (key, value) in &flow.constants {
+        w!(
+            s,
+            "    \"{}\": \"{}\",",
+            escape_js_string(&crate::builder::snake_to_camel(key)),
+            escape_js_string(value)
+        );
+    }
+    w!(s, "  }},");
+    w!(
+        s,
+        "}} as const satisfies __AxoAuthStrategy & __AxoFlowManifest;"
+    );
     s
 }
-
-const TYPED_WS_INTERFACE: &str = r#"export interface TypedWebSocket<TSend, TReceive> {
-  send(event: TSend): void;
-  onOpen(handler: () => void): void;
-  onMessage(handler: (event: TReceive) => void): void;
-  onError(handler: (event: Event) => void): void;
-  onClose(handler: (event: CloseEvent) => void): void;
-  close(code?: number, reason?: string): void;
-  readonly readyState: number;
-}
-"#;
-
-const TYPED_WS_HELPER: &str = r#"function createTypedWebSocket<TSend, TReceive>(ws: WebSocket): TypedWebSocket<TSend, TReceive> {
-  return {
-    send(event: TSend) { ws.send(JSON.stringify(event)); },
-    onOpen(handler: () => void) { ws.addEventListener("open", handler); },
-    onMessage(handler: (event: TReceive) => void) {
-      ws.addEventListener("message", (raw: MessageEvent) => {
-        handler(JSON.parse(raw.data as string) as TReceive);
-      });
-    },
-    onError(handler: (event: Event) => void) { ws.addEventListener("error", handler); },
-    onClose(handler: (event: CloseEvent) => void) { ws.addEventListener("close", handler); },
-    close(code?: number, reason?: string) { ws.close(code, reason); },
-    get readyState() { return ws.readyState; },
-  };
-}
-"#;
 
 // ---------------------------------------------------------------------------
 // Code generation
 // ---------------------------------------------------------------------------
 
-/// Generates client source, discarding diagnostics.
-/// Use [`generate_with_warnings`] to surface configuration gaps.
-pub fn generate(routes: &RouteCollection, config: &GeneratorConfig) -> String {
-    generate_with_warnings(routes, config).0
+/// Why the default refresh hook cannot bind to a flow's lifecycle route.
+enum DefaultHookBlocker {
+    NotRegistered,
+    NotPlainHttp,
+    Body,
+    PathParams,
+    Query,
+    NoResponseType,
 }
 
-/// Generates client source plus diagnostics for routes whose metadata
-/// the client cannot honor: public-declared behind an auth layer,
-/// `Private` routes with `AuthScheme::None`, or `Private` `[ws][auth]` Bearer
-/// routes without `ws_ticket_path`. `Permissive` routes degrade gracefully
-/// (anonymous is a valid outcome) and never warn. No diagnostic for Cookie
-/// WS routes.
-pub fn generate_with_warnings(
+/// Whether the declared lifecycle route is callable by the generated
+/// renewal helper — i.e. reachable with no arguments, as a typed response.
+/// [`None`] means the helper can be generated.
+fn default_hook_blocker(
+    flow: &crate::auth_flow::AuthFlow,
     routes: &RouteCollection,
-    config: &GeneratorConfig,
-) -> (String, Vec<String>) {
-    let mut warnings = Vec::new();
+) -> Option<DefaultHookBlocker> {
+    let route_name = flow
+        .refresh
+        .as_deref()
+        .or_else(|| flow.bootstrap.first().map(|s| s.as_str()));
+    match route_name.and_then(|name| routes.find_by_name(name)) {
+        None => Some(DefaultHookBlocker::NotRegistered),
+        Some(r) if r.websocket || r.redirect => Some(DefaultHookBlocker::NotPlainHttp),
+        Some(r) if r.body_type.is_some() => Some(DefaultHookBlocker::Body),
+        Some(r) if !r.path_params.is_empty() => Some(DefaultHookBlocker::PathParams),
+        Some(r) if r.query_type.is_some() => Some(DefaultHookBlocker::Query),
+        Some(r) if r.response_type.is_none() => Some(DefaultHookBlocker::NoResponseType),
+        Some(_) => None,
+    }
+}
+
+/// Generates client source.
+///
+/// Misconfigurations that would produce a broken or silently wrong client
+/// fail here instead of emitting diagnostics: generation runs on every
+/// codegen invocation, so a panic names the problem at the site that must
+/// be fixed.
+pub fn generate(routes: &RouteCollection, config: &GeneratorConfig) -> String {
+    // Validate the default refresh route.
+    if let Some(flow) = routes.auth_flow() {
+        if config.auth_scheme == AuthScheme::Bearer && flow.token_fields.is_some() {
+            let route_name = flow
+                .refresh
+                .as_deref()
+                .or_else(|| flow.bootstrap.first().map(|s| s.as_str()));
+            let remedy = "declare a callable lifecycle route or supply your own onUnauthorized";
+            match default_hook_blocker(flow, routes) {
+                None => {}
+                Some(DefaultHookBlocker::NotRegistered) => panic!(
+                    "auth flow '{}': token fields declared but their route is \
+                     not registered — no renewal helper can be generated; {remedy}.",
+                    flow.name
+                ),
+                Some(blocker) => {
+                    let r = route_name
+                        .and_then(|name| routes.find_by_name(name))
+                        .expect("route exists");
+                    panic!(
+                        "auth flow '{}': the lifecycle route '{}' {}; no renewal \
+                         helper can be generated; {remedy}.",
+                        flow.name,
+                        r.name,
+                        match blocker {
+                            DefaultHookBlocker::NotPlainHttp if r.websocket => {
+                                "is a websocket route"
+                            }
+                            DefaultHookBlocker::NotPlainHttp => {
+                                "is a redirect route"
+                            }
+                            DefaultHookBlocker::Body => {
+                                "takes a request body"
+                            }
+                            DefaultHookBlocker::PathParams => {
+                                "takes path parameters"
+                            }
+                            DefaultHookBlocker::Query => {
+                                "takes a query string"
+                            }
+                            DefaultHookBlocker::NoResponseType => {
+                                "declares no response type"
+                            }
+                            DefaultHookBlocker::NotRegistered => {
+                                unreachable!("handled above")
+                            }
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    for route in routes.iter().filter(|r| r.websocket && !has_ws_contract(r)) {
+        panic!(
+            "route '{}': [ws] without declared event types — the route would \
+             generate no client method. Call .events::<Send, Receive>() on it, \
+             or register the raw socket outside the route table.",
+            route.name
+        );
+    }
+
+    // Closed-world check. The client object is the route table plus the
+    // helpers this generator injects. Both are ours, so a route landing on
+    // an injected name is knowable right here: `Object.assign` would
+    // overwrite the property, and calling it would derive a new client
+    // instead of sending the request.
+    {
+        let mut reported: BTreeSet<(Option<String>, String)> = BTreeSet::new();
+        let mut report = |route: &RouteDefinition| {
+            // Which property actually takes the helper's name depends on the
+            // layout: grouped nesting exposes the GROUP at the top level,
+            // the flat layout exposes every route method there.
+            let (collide, property) = match &route.group {
+                Some(g) if config.enable_groups => {
+                    (CLIENT_HELPERS.contains(&g.as_str()), g.clone())
+                }
+                _ => (
+                    CLIENT_HELPERS.contains(&route.name.as_str()),
+                    route.name.clone(),
+                ),
+            };
+            if collide && reported.insert((route.group.clone(), route.name.clone())) {
+                panic!(
+                    "route '{}'{} collides with the client's built-in `{helper}` helper — the \
+                     generated property would be overwritten by it, and calling it would derive \
+                     a new client instead of sending the request. Rename with .as_().",
+                    route.name,
+                    match &route.group {
+                        None => String::new(),
+                        Some(g) => format!(" in group '{g}'"),
+                    },
+                    helper = property,
+                );
+            }
+        };
+        for route in routes.iter() {
+            report(route);
+        }
+        // The flow's synthetic `auth` namespace is emitted beside the groups.
+        if config.auth_scheme == AuthScheme::Bearer {
+            if let Some(flow) = routes.auth_flow() {
+                for name in flow
+                    .bootstrap
+                    .iter()
+                    .chain(flow.refresh.iter())
+                    .chain(flow.ws_ticket.iter())
+                {
+                    if let Some(route) = routes.find_by_name(name).filter(|r| r.group.is_none()) {
+                        report(route);
+                    }
+                }
+            }
+        }
+    }
+
     for route in routes.iter().filter(|r| r.is_credentialed()) {
         if route.declared == Visibility::Public {
-            warnings.push(format!(
-                "route '{}': declared public but sits behind an auth layer; the generated \
-                 client requires credentials for it. If the middleware is not user \
-                 authentication, register it with `.layer()` instead of `.auth_layer()`.",
+            panic!(
+                "route '{}': declared public but sits behind an auth layer.",
                 route.name
-            ));
-            continue;
+            );
         }
-        // Permissive routes work anonymously, so nothing to report — except
-        // the WS credential pathway below, which they share with public.
         if route.is_permissive() {
             continue;
         }
         match config.auth_scheme {
-            AuthScheme::None => warnings.push(format!(
-                "route '{}': declared authenticated but the client was generated with \
-                 auth_scheme \"none\"; emitted requests send no credentials.",
-                route.name
-            )),
-            AuthScheme::Bearer if route.websocket && config.ws_ticket_path.is_none() => {
-                warnings.push(format!(
-                    "route '{}': declared [ws][auth] but the generated WebSocket client has no \
-                     credential pathway (browsers cannot set headers on the WS handshake). Set \
-                     GeneratorConfig::ws_ticket_path to emit the ticket-handshake flow, otherwise \
-                     consumers will push tokens into the query string where they leak to logs.",
+            AuthScheme::Bearer
+                if route.websocket && routes.auth_flow().is_some_and(|f| f.ws_ticket.is_none()) =>
+            {
+                panic!(
+                    "route '{}': [ws][auth] without a ws_ticket mint. Declare \
+                     `ws_ticket: register!(...)` in auth_scheme!.",
                     route.name
-                ));
+                );
             }
             _ => {}
         }
     }
 
-    (generate_client(routes, config), warnings)
+    generate_client(routes, config)
 }
 
 fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String {
@@ -882,10 +1139,12 @@ fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String
     w!(out, "// Auto-generated by axotyped. Do not edit.");
     w!(out);
 
-    // Collect types used in route signatures so we can import them.
-    // The bindings directory also has a barrel index.ts (generated by
-    // export_types) that re-exports every ts-rs generated type including
-    // transitive dependencies.
+    let lifecycle = routes
+        .auth_flow()
+        .is_some_and(|f| f.kind != crate::auth_flow::AuthFlowKind::StaticBearer)
+        && config.auth_scheme == AuthScheme::Bearer;
+
+    // Collect types used in route signatures.
     let import_prefix = compute_import_prefix(config);
     let custom_types: BTreeSet<&str> = routes
         .iter()
@@ -912,62 +1171,111 @@ fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String
         w!(out);
     }
 
-    // Re-export all types from the bindings barrel so consumers can
-    // import any generated type (including transitive deps) directly from
-    // the generated package. Requires TypeScript 5.0+ (`export type *`).
     w!(out, "export type * from \"{import_prefix}\";");
 
-    // Static blocks via template substitution
-    let error_name = &config.error_class_name;
-    let opts_name = &config.options_interface_name;
-    let default_creds = &config.default_credentials;
-    let csrf_name = config.csrf_header_name.as_deref().unwrap_or("X-CSRF-Token");
+    let has_flow = routes.auth_flow().is_some();
+    let has_typed_ws = routes
+        .iter()
+        .any(|r| r.websocket && r.ws_send_type.is_some() && r.ws_receive_type.is_some());
 
-    let substitute = |template: &str| -> String {
-        template
-            .replace("__ERROR__", error_name)
-            .replace("__OPTS__", opts_name)
-            .replace("__CREDS__", &escape_js_string(default_creds))
-            .replace("__CSRF_NAME__", &escape_js_string(csrf_name))
-    };
-
-    out.push_str(&substitute(ERROR_CLASS));
-    w!(out);
-    out.push_str(&substitute(&options_interface(config)));
-    w!(out);
-    out.push_str(REQUEST_OPTIONS_TYPE);
-    w!(out);
-    out.push_str(&substitute(&request_helper(config)));
-    w!(out);
-
-    // Typed WebSocket helpers — only if any WS route exists
-    let has_ws = routes.iter().any(|r| r.websocket);
-    if has_ws {
-        out.push_str(TYPED_WS_INTERFACE);
-        w!(out);
-        out.push_str(TYPED_WS_HELPER);
-        w!(out);
+    // Runtime imports are aliased (`__Axo*`): user DTOs are imported by
+    // their plain names just above, so a response/request type named e.g.
+    // `Transport` or `OperationSpec` would otherwise produce two imports
+    // with the same local name and break TypeScript checking.
+    w!(out, "import {{");
+    w!(out, "  ApiError as __AxoApiError,");
+    w!(out, "  RUNTIME_SPEC_VERSION as __AxoRuntimeSpecVersion,");
+    w!(out, "  createTransport as __AxoCreateTransport,");
+    w!(out, "  type OperationSpec as __AxoOperationSpec,");
+    w!(out, "  type Transport as __AxoTransport,");
+    if has_flow {
+        w!(out, "  type AuthStrategy as __AxoAuthStrategy,");
+        w!(out, "  type FlowManifest as __AxoFlowManifest,");
     }
-
-    // Runtime version + factory function
-    let factory = &config.factory_name;
-    let type_name = derive_type_name(factory);
+    if has_typed_ws {
+        w!(out, "  type TypedWebSocket as __AxoTypedWebSocket,");
+    }
     w!(
         out,
-        "// Runtime semantics version — bump when generated helper behavior changes,"
+        "}} from \"{runtime}\";",
+        runtime = runtime_import(config)
     );
-    w!(out, "// so consumers can detect stale committed artifacts.");
+    w!(out);
+    w!(out, "export {{ __AxoApiError as ApiError }};");
+    if config.error_class_name != "ApiError" {
+        w!(
+            out,
+            "export {{ __AxoApiError as {err} }};",
+            err = config.error_class_name
+        );
+    }
+    // The session layer is the application's now, and these two are what it
+    // needs to write one: coalesce parallel renewals, and read the `exp`
+    // claim to decide when to renew ahead of a 401. Re-exported so they
+    // arrive with the client instead of a second import of the sibling.
+    if config.auth_scheme == AuthScheme::Bearer {
+        w!(
+            out,
+            "export {{ jwtExpiry, singleFlight }} from \"{runtime}\";",
+            runtime = runtime_import(config)
+        );
+    }
+    if has_typed_ws {
+        w!(
+            out,
+            "export type {{ __AxoTypedWebSocket as TypedWebSocket }};"
+        );
+    }
+    w!(out);
+    w!(
+        out,
+        "if (__AxoRuntimeSpecVersion !== \"{version}\")",
+        version = env!("CARGO_PKG_VERSION")
+    );
+    w!(
+        out,
+        "  throw new Error(\"client/runtime version drift — regenerate both files together\");"
+    );
+    w!(out);
     w!(
         out,
         "export const RUNTIME_VERSION = \"{version}\";",
         version = env!("CARGO_PKG_VERSION")
     );
+    let op_keys = operations_keys(routes);
+    let named_key =
+        |name: &str| -> Option<String> { routes.find_by_name(name).map(|r| key_of(&op_keys, r)) };
+    let ticket_ref = routes
+        .auth_flow()
+        .and_then(|f| f.ws_ticket.clone())
+        .and_then(|name| named_key(&name));
+
     w!(out);
-    // `{type_name}` resolves acyclically because the routes factory is a
-    // separate function; `withOptions`'s self-reference sits under an object
-    // property, which TS resolves lazily. The exported factory is emitted
-    // before the routes factory (function declarations hoist), keeping the
-    // route surface discoverable after `export function` in the file.
+    w!(out, "/** Transport policy. */");
+    match &ticket_ref {
+        Some(key) => w!(
+            out,
+            "export const TRANSPORT = {{ scheme: \"{scheme}\", wsTicket: \"{key}\" }} as const;",
+            scheme = scheme_label(config),
+            key = escape_js_string(key)
+        ),
+        None => w!(
+            out,
+            "export const TRANSPORT = {{ scheme: \"{scheme}\" }} as const;",
+            scheme = scheme_label(config)
+        ),
+    }
+    w!(out);
+    write_operations_table(&mut out, routes, &op_keys, ticket_ref.as_deref());
+    if let Some(flow) = routes.auth_flow() {
+        out.push_str(&auth_strategy_const(flow, routes, &op_keys));
+        w!(out);
+    }
+    out.push_str(&options_interface(config, lifecycle));
+    w!(out);
+    let factory = &config.factory_name;
+    let opts_name = &config.options_interface_name;
+    let type_name = derive_type_name(factory);
     w!(
         out,
         "export type {type_name} = ReturnType<typeof {factory}Routes> & {{"
@@ -978,36 +1286,55 @@ fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String
     );
     w!(out, "}};");
     w!(out);
+    if let Some(helper) = routes
+        .auth_flow()
+        .filter(|_| lifecycle)
+        .and_then(|flow| refresh_helper(flow, routes, &type_name, config.enable_groups))
+    {
+        out.push_str(&helper);
+        w!(out);
+    }
     w!(
         out,
         "export function {factory}(options: {opts_name}): {type_name} {{"
     );
-    w!(out, "  const request = createRequest(options);");
-    w!(out);
+    let csrf_field = match config.csrf_header_name.as_deref() {
+        Some(name) if config.auth_scheme == AuthScheme::Cookie => {
+            format!(", csrfHeader: \"{}\"", escape_js_string(name))
+        }
+        _ => String::new(),
+    };
+    w!(out, "  const transport = __AxoCreateTransport(");
     w!(
         out,
-        "  /** Derived client with the given options merged over this client's. */"
+        "    {{ ...options, credentials: options.credentials ?? \"{creds}\"{csrf} }},",
+        creds = escape_js_string(&config.default_credentials),
+        csrf = csrf_field
     );
+    w!(out, "    TRANSPORT,");
+    w!(out, "    OPERATIONS,");
+    w!(out, "  );");
+    w!(out);
     w!(
         out,
         "  const withOptions = (override: Partial<{opts_name}>): {type_name} =>"
     );
     w!(out, "    {factory}({{ ...options, ...override }});");
     w!(out);
-    w!(out, "  const routes = {factory}Routes(request, options);");
+    w!(out, "  const routes = {factory}Routes(transport);");
     w!(out, "  return Object.assign(routes, {{ withOptions }});");
     w!(out, "}}");
     w!(out);
     w!(
         out,
-        "function {factory}Routes(request: RequestFn, options: {opts_name}) {{"
+        "function {factory}Routes(transport: __AxoTransport) {{"
     );
     w!(out, "  return {{");
 
     if config.enable_groups {
-        generate_grouped_routes(&mut out, routes, config);
+        generate_grouped_routes(&mut out, routes, config, &op_keys);
     } else {
-        generate_flat_routes(&mut out, routes, config);
+        generate_flat_routes(&mut out, routes, config, &op_keys);
     }
 
     w!(out, "  }};");
@@ -1018,7 +1345,12 @@ fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String
 }
 
 /// Generates routes into namespace groups.
-fn generate_grouped_routes(out: &mut String, routes: &RouteCollection, config: &GeneratorConfig) {
+fn generate_grouped_routes(
+    out: &mut String,
+    routes: &RouteCollection,
+    config: &GeneratorConfig,
+    op_keys: &HashMap<(Option<String>, String), String>,
+) {
     let mut ungrouped: Vec<&RouteDefinition> = Vec::new();
     let mut groups: BTreeMap<String, Vec<&RouteDefinition>> = BTreeMap::new();
 
@@ -1029,9 +1361,41 @@ fn generate_grouped_routes(out: &mut String, routes: &RouteCollection, config: &
         }
     }
 
+    // Lifecycle routes also surface under an `auth` namespace.
+    if config.auth_scheme == AuthScheme::Bearer {
+        if let Some(flow) = routes.auth_flow() {
+            if routes
+                .routes()
+                .iter()
+                .any(|r| r.group.is_none() && r.name == "auth")
+            {
+                panic!(
+                    "route 'auth' collides with the flow's auth namespace. Rename the route with .as_()."
+                );
+            } else {
+                let entry = groups.entry("auth".to_string()).or_default();
+                for name in flow
+                    .bootstrap
+                    .iter()
+                    .chain(flow.refresh.iter())
+                    .chain(flow.ws_ticket.iter())
+                {
+                    if let Some(route) = routes.find_by_name(name) {
+                        if !entry.iter().any(|r| r.name == route.name) {
+                            entry.push(route);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for route in &ungrouped {
+        if route.websocket && !has_ws_contract(route) {
+            continue;
+        }
         write!(out, "    ").unwrap();
-        generate_route_method(out, route, 4, config);
+        generate_route_method(out, route, 4, config, op_keys);
         w!(out, ",");
     }
 
@@ -1039,12 +1403,14 @@ fn generate_grouped_routes(out: &mut String, routes: &RouteCollection, config: &
         if !ungrouped.is_empty() || groups.keys().next() != Some(group_name) {
             w!(out);
         }
-        // Group names come from free-form &str at registration time; quote and
-        // emit it as a quoted, escaped property key.
+        // Group names are quoted.
         w!(out, "    \"{}\": {{", escape_js_string(group_name));
         for route in group_routes {
+            if route.websocket && !has_ws_contract(route) {
+                continue;
+            }
             write!(out, "      ").unwrap();
-            generate_route_method(out, route, 6, config);
+            generate_route_method(out, route, 6, config, op_keys);
             w!(out, ",");
         }
         w!(out, "    }},");
@@ -1052,102 +1418,104 @@ fn generate_grouped_routes(out: &mut String, routes: &RouteCollection, config: &
 }
 
 /// Generates routes without grouping.
-fn generate_flat_routes(out: &mut String, routes: &RouteCollection, config: &GeneratorConfig) {
+///
+/// Method names share one top-level object here (unlike the grouped layout,
+/// where groups namespace them), so a duplicate name would emit an invalid
+/// object literal — or, in plain JS, silently shadow the first endpoint.
+fn generate_flat_routes(
+    out: &mut String,
+    routes: &RouteCollection,
+    config: &GeneratorConfig,
+    op_keys: &HashMap<(Option<String>, String), String>,
+) {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
     for route in routes {
+        if route.websocket && !has_ws_contract(route) {
+            continue;
+        }
+        if !seen.insert(route.name.as_str()) {
+            panic!(
+                "route '{}': duplicate method name with enable_groups = false — the \
+                 flat client would emit a duplicate key. Rename with .as_().",
+                route.name
+            );
+        }
         write!(out, "    ").unwrap();
-        generate_route_method(out, route, 4, config);
+        generate_route_method(out, route, 4, config, op_keys);
         w!(out, ",");
     }
 }
 
-/// Generates a single route method.
+/// Generates a single route method bound to an OPERATIONS descriptor.
 fn generate_route_method(
     out: &mut String,
     route: &RouteDefinition,
     indent: usize,
     config: &GeneratorConfig,
+    op_keys: &HashMap<(Option<String>, String), String>,
 ) {
     let large_int = config.large_int_type.as_str();
+    let key = op_ref(&key_of(op_keys, route));
+    let args = call_args(route);
+
     if route.websocket {
-        generate_ws_method(out, route, indent, config);
-    } else if route.redirect {
-        generate_redirect_method(out, route, indent, large_int);
-    } else {
-        let name = &route.name;
         let params = generate_params(route, large_int);
-        let path_template = build_path_template(&route.path);
+        let pad = " ".repeat(indent + 2);
+        emit_method_name(out, &route.name);
+        let send_ts = rust_type_to_ts_with(
+            route.ws_send_type.as_deref().unwrap_or("ClientEvent"),
+            large_int,
+        );
+        let recv_ts = rust_type_to_ts_with(
+            route.ws_receive_type.as_deref().unwrap_or("ServerEvent"),
+            large_int,
+        );
+        if params.is_empty() {
+            write!(
+                out,
+                ": () => transport.connect<{send_ts}, {recv_ts}>(OPERATIONS{key}{args})"
+            )
+            .unwrap();
+        } else {
+            write!(
+                out,
+                ": ({params}) =>\n{pad}transport.connect<{send_ts}, {recv_ts}>(OPERATIONS{key}{args})"
+            )
+            .unwrap();
+        }
+    } else if route.redirect {
+        let params = generate_params(route, large_int);
+        emit_method_name(out, &route.name);
+        if params.is_empty() {
+            write!(out, ": () => transport.urlFor(OPERATIONS{key}{args})").unwrap();
+        } else {
+            write!(
+                out,
+                ": ({params}) => transport.urlFor(OPERATIONS{key}{args})"
+            )
+            .unwrap();
+        }
+    } else {
+        let params = generate_params(route, large_int);
         let return_type = route
             .response_type
             .as_ref()
             .map(|t| rust_type_to_ts_with(t, large_int))
             .unwrap_or_else(|| "void".into());
-        let opts = generate_request_options(route);
-
+        emit_method_name(out, &route.name);
         if params.is_empty() {
-            emit_method_name(out, name);
-            write!(out, ": () => request<{return_type}>({path_template}{opts})").unwrap();
-        } else {
-            let pad = " ".repeat(indent + 2);
-            emit_method_name(out, name);
             write!(
                 out,
-                ": ({params}) =>\n{pad}request<{return_type}>({path_template}{opts})"
+                ": () => transport.execute<{return_type}>(OPERATIONS{key}{args})"
             )
             .unwrap();
-        }
-    }
-}
-
-/// Generates a redirect route (URL builder, not fetch).
-fn generate_redirect_method(
-    out: &mut String,
-    route: &RouteDefinition,
-    indent: usize,
-    large_int: &str,
-) {
-    let name = &route.name;
-    let path_template = build_path_template(&route.path);
-    let path_inner = &path_template[1..path_template.len() - 1];
-    let pad = " ".repeat(indent);
-    let pad2 = " ".repeat(indent + 2);
-    let pad4 = " ".repeat(indent + 4);
-
-
-    if let Some(ref query_type) = route.query_type {
-        let query_ts = rust_type_to_ts_with(query_type, large_int);
-        let mut fn_params = Vec::new();
-        for param in &route.path_params {
-            fn_params.push(format!("{}: string", param.name));
-        }
-        fn_params.push(format!("query?: {query_ts}"));
-        let all_params = fn_params.join(", ");
-
-        emit_method_name(out, name);
-        w!(out, ": ({all_params}) => {{");
-        w!(out, "{pad2}let url = `${{options.baseUrl}}{path_inner}`;");
-        w!(out, "{pad2}if (query) {{");
-        w!(out, "{pad4}const params = new URLSearchParams();");
-        w!(
-            out,
-            "{pad4}for (const [key, value] of Object.entries(query)) {{"
-        );
-        w!(
-            out,
-            "{pad4}  if (value !== undefined && value !== null) params.set(key, String(value));"
-        );
-        w!(out, "{pad4}}}");
-        w!(out, "{pad4}const qs = params.toString();");
-        w!(out, "{pad4}if (qs) url += `?${{qs}}`;");
-        w!(out, "{pad2}}}");
-        write!(out, "{pad2}return url;\n{pad}}}").unwrap();
-    } else {
-        let params = generate_params(route, large_int);
-        if params.is_empty() {
-            emit_method_name(out, name);
-            write!(out, ": () => `${{options.baseUrl}}{path_inner}`").unwrap();
         } else {
-            emit_method_name(out, name);
-            write!(out, ": ({params}) => `${{options.baseUrl}}{path_inner}`").unwrap();
+            let pad = " ".repeat(indent + 2);
+            write!(
+                out,
+                ": ({params}) =>\n{pad}transport.execute<{return_type}>(OPERATIONS{key}{args})"
+            )
+            .unwrap();
         }
     }
 }
@@ -1158,170 +1526,6 @@ fn derive_type_name(factory_name: &str) -> String {
         .strip_prefix("create")
         .unwrap_or(factory_name)
         .to_string()
-}
-
-/// Generates a WS factory returning `TypedWebSocket<S, R>` (or `WebSocket`).
-/// Bearer `[auth]` routes with `ws_ticket_path` use an async ticket handshake.
-fn generate_ws_method(
-    out: &mut String,
-    route: &RouteDefinition,
-    indent: usize,
-    config: &GeneratorConfig,
-) {
-    let name = &route.name;
-    let path_template = build_path_template(&route.path);
-    let path_inner = &path_template[1..path_template.len() - 1];
-    let pad = " ".repeat(indent);
-    let pad2 = " ".repeat(indent + 2);
-    let pad4 = " ".repeat(indent + 4);
-
-    // Ticket-handshake mode applies to `Private` routes under the Bearer
-    // scheme when configured. `Permissive` routes skip it (anonymous must
-    // work). Under Cookie, browsers attach session cookies to same-origin
-    // WS upgrades natively — no handshake needed.
-    let ticket_mode =
-        if route.visibility == Visibility::Private && config.auth_scheme == AuthScheme::Bearer {
-        config.ws_ticket_path.as_ref()
-    } else {
-        None
-    };
-
-    // Build function parameters: path params + optional query
-    let mut fn_params = Vec::new();
-    for param in &route.path_params {
-        fn_params.push(format!("{}: string", param.name));
-    }
-    if let Some(ref query_type) = route.query_type {
-        fn_params.push(format!(
-            "query?: {}",
-            rust_type_to_ts_with(query_type, config.large_int_type.as_str())
-        ));
-    }
-    let all_params = fn_params.join(", ");
-
-    // Determine return type
-    let has_types = route.ws_send_type.is_some() && route.ws_receive_type.is_some();
-    let ws_type = if has_types {
-        let large_int = config.large_int_type.as_str();
-        let send_ts = rust_type_to_ts_with(route.ws_send_type.as_ref().unwrap(), large_int);
-        let recv_ts = rust_type_to_ts_with(route.ws_receive_type.as_ref().unwrap(), large_int);
-        format!("TypedWebSocket<{send_ts}, {recv_ts}>")
-    } else {
-        "WebSocket".into()
-    };
-    let return_type = if ticket_mode.is_some() {
-        format!("Promise<{ws_type}>")
-    } else {
-        ws_type.clone()
-    };
-
-    emit_method_name(out, name);
-    w!(
-        out,
-        ": {}({all_params}): {return_type} => {{",
-        if ticket_mode.is_some() { "async " } else { "" }
-    );
-
-    // Convert http(s) to ws(s)
-    w!(
-        out,
-        "{pad2}const baseUrl = options.baseUrl.replace(/^http/, (m) => m === \"https\" ? \"wss\" : \"ws\");"
-    );
-
-    // Ticket handshake first: the long-lived credential rides the header
-    // channel; only the single-use proof it returns touches the URL below.
-    if let Some(ticket_path) = ticket_mode {
-        w!(out);
-        w!(
-            out,
-            "{pad2}// Authenticated ticket roundtrip — server must issue a single-use,"
-        );
-        w!(
-            out,
-            "{pad2}// short-TTL ticket bound to the caller and consume it on upgrade."
-        );
-        w!(
-            out,
-            "{pad2}const {{ ticket: __wsTicket }} = await request<{{ ticket: string }}>(\"{}\",",
-            escape_js_string(ticket_path)
-        );
-        w!(out, "{pad2}  {{ method: \"POST\", auth: true }},");
-        w!(out, "{pad2});");
-    }
-
-    // Build path with params
-    w!(out, "{pad2}let url = `${{baseUrl}}{path_inner}`;");
-
-    // Append query params if present
-    if route.query_type.is_some() {
-        w!(out, "{pad2}if (query) {{");
-        w!(out, "{pad4}const params = new URLSearchParams();");
-        w!(
-            out,
-            "{pad4}for (const [key, value] of Object.entries(query)) {{"
-        );
-        w!(
-            out,
-            "{pad4}  if (value !== undefined && value !== null) params.set(key, String(value));"
-        );
-        w!(out, "{pad4}}}");
-        w!(out, "{pad4}const qs = params.toString();");
-        w!(out, "{pad4}if (qs) url += `?${{qs}}`;");
-        w!(out, "{pad2}}}");
-    }
-
-    // Append the single-use ticket last so it composes with any query string
-    if ticket_mode.is_some() {
-        w!(
-            out,
-            "{pad2}url += `${{url.includes(\"?\") ? \"&\" : \"?\"}}ticket=${{encodeURIComponent(__wsTicket)}}`;"
-        );
-    }
-
-    // Cookie `Private` routes ride same-origin session cookies natively — the
-    // WebSocket API has no credentials option, so `"omit"` would silently
-    // send the upgrade unauthenticated. Refuse like the fetch path does.
-    // `Permissive` routes allow anonymous upgrades.
-    if config.auth_scheme == AuthScheme::Cookie && route.visibility == Visibility::Private {
-        w!(
-            out,
-            "{pad2}if ((options.credentials ?? \"{}\") === \"omit\") {{",
-            escape_js_string(&config.default_credentials)
-        );
-        w!(
-            out,
-            "{pad2}  throw new Error(`Route declared [ws][auth] but options.credentials is \"omit\"; refusing to send an unauthenticated upgrade ({})`);",
-            escape_js_string(&route.name)
-        );
-        w!(out, "{pad2}}}");
-    }
-
-    if has_types {
-        let large_int = config.large_int_type.as_str();
-        let send_ts = rust_type_to_ts_with(route.ws_send_type.as_ref().unwrap(), large_int);
-        let recv_ts = rust_type_to_ts_with(route.ws_receive_type.as_ref().unwrap(), large_int);
-        w!(
-            out,
-            "{pad2}assertSecureTransport(url, {{ allowInsecureHttp: options.allowInsecureHttp === true, auth: {}, credentials: options.credentials ?? \"{}\" }});",
-            route.is_credentialed(),
-            escape_js_string(&config.default_credentials)
-        );
-        w!(out, "{pad2}const ws = new WebSocket(url);");
-        w!(
-            out,
-            "{pad2}return createTypedWebSocket<{send_ts}, {recv_ts}>(ws);"
-        );
-    } else {
-        w!(
-            out,
-            "{pad2}assertSecureTransport(url, {{ allowInsecureHttp: options.allowInsecureHttp === true, auth: {}, credentials: options.credentials ?? \"{}\" }});",
-            route.is_credentialed(),
-            escape_js_string(&config.default_credentials)
-        );
-        w!(out, "{pad2}return new WebSocket(url);");
-    }
-
-    write!(out, "{pad}}}").unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -1356,23 +1560,25 @@ fn run_format_command(format_command: &str, file_path: &str) -> Result<(), std::
     Ok(())
 }
 
-/// Generate the client and write it to a file.
-///
-/// If `config.format_command` is set, the format command is run on the output file after writing.
+/// Generate the client and its runtime module, writing both files.
 pub fn generate_to_file(
     routes: &RouteCollection,
     config: &GeneratorConfig,
 ) -> Result<(), std::io::Error> {
     let content = generate(routes, config);
+    let runtime = generate_runtime_source();
 
     if let Some(parent) = Path::new(&config.output_path).parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     std::fs::write(&config.output_path, &content)?;
+    let runtime_path = runtime_output_path(config);
+    std::fs::write(&runtime_path, &runtime)?;
 
     if let Some(ref cmd) = config.format_command {
         run_format_command(cmd, &config.output_path)?;
+        run_format_command(cmd, &runtime_path.to_string_lossy())?;
     }
 
     Ok(())
@@ -1382,7 +1588,7 @@ pub fn generate_to_file(
 struct TempFile(std::path::PathBuf);
 
 impl TempFile {
-    /// Creates a unique temp file with `O_EXCL`; fails if the path exists.
+    /// Creates a unique temp file.
     fn create(prefix: &str, contents: &[u8]) -> Result<Self, std::io::Error> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1418,7 +1624,6 @@ impl TempFile {
                             "could not allocate a unique temporary file path",
                         ));
                     }
-                    // Collision (vanishingly unlikely): retry with a new name.
                 }
                 Err(e) => return Err(e),
             }
@@ -1436,47 +1641,51 @@ impl Drop for TempFile {
     }
 }
 
-/// Returns `Ok(())` if generated output matches the committed file.
-/// With `format_command`, formats a temp copy before comparing.
+/// Returns `Ok(())` if generated output matches the committed files.
 pub fn check(routes: &RouteCollection, config: &GeneratorConfig) -> Result<(), CheckError> {
     let generated = generate(routes, config);
+    let runtime_generated = generate_runtime_source();
 
-    let expected = if let Some(ref cmd) = config.format_command {
-        let temp = TempFile::create("axotyped_check", generated.as_bytes()).map_err(|e| {
-            CheckError::ReadError {
-                path: "temporary file".into(),
+    for (path, content) in [
+        (config.output_path.clone(), generated),
+        (
+            runtime_output_path(config).to_string_lossy().into_owned(),
+            runtime_generated,
+        ),
+    ] {
+        let expected = if let Some(ref cmd) = config.format_command {
+            let temp = TempFile::create("axotyped_check", content.as_bytes()).map_err(|e| {
+                CheckError::ReadError {
+                    path: "temporary file".into(),
+                    error: e,
+                }
+            })?;
+            let temp_str = temp.as_str().to_string();
+
+            run_format_command(cmd, &temp_str).map_err(|e| CheckError::FormatError {
+                command: cmd.clone(),
                 error: e,
-            }
-        })?;
-        let temp_str = temp.as_str().to_string();
+            })?;
 
-        run_format_command(cmd, &temp_str).map_err(|e| CheckError::FormatError {
-            command: cmd.clone(),
+            std::fs::read_to_string(&temp.0).map_err(|e| CheckError::ReadError {
+                path: temp_str,
+                error: e,
+            })?
+            // temp file auto-removed on drop
+        } else {
+            content
+        };
+
+        let existing = std::fs::read_to_string(&path).map_err(|e| CheckError::ReadError {
+            path: path.clone(),
             error: e,
         })?;
 
-        std::fs::read_to_string(&temp.0).map_err(|e| CheckError::ReadError {
-            path: temp_str,
-            error: e,
-        })?
-        // temp file auto-removed on drop
-    } else {
-        generated
-    };
-
-    let existing =
-        std::fs::read_to_string(&config.output_path).map_err(|e| CheckError::ReadError {
-            path: config.output_path.clone(),
-            error: e,
-        })?;
-
-    if expected != existing {
-        Err(CheckError::OutOfSync {
-            path: config.output_path.clone(),
-        })
-    } else {
-        Ok(())
+        if expected != existing {
+            return Err(CheckError::OutOfSync { path });
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1514,57 +1723,6 @@ mod tests {
     fn test_rust_type_to_ts_custom() {
         assert_eq!(rust_type_to_ts("RegisterRequest"), "RegisterRequest");
         assert_eq!(rust_type_to_ts("LoginResponse"), "LoginResponse");
-    }
-
-    #[test]
-    fn test_build_path_template_no_params() {
-        assert_eq!(build_path_template("/register"), "\"/register\"");
-        assert_eq!(build_path_template("/admin/users"), "\"/admin/users\"");
-    }
-
-    #[test]
-    fn test_build_path_template_with_params() {
-        assert_eq!(
-            build_path_template("/admin/users/{id}"),
-            "`/admin/users/${encodeURIComponent(id)}`"
-        );
-        assert_eq!(
-            build_path_template("/orgs/{org}/users/{id}"),
-            "`/orgs/${encodeURIComponent(org)}/users/${encodeURIComponent(id)}`"
-        );
-    }
-
-    #[test]
-    fn test_build_path_template_escapes_special_characters() {
-        // Backticks / ${ cannot break out of the emitted template literal:
-        assert_eq!(
-            build_path_template("/x/{id}`+alert(1)+`"),
-            "`/x/${encodeURIComponent(id)}\\`+alert(1)+\\``"
-        );
-        assert!(
-            !build_path_template("/x${evil}y").contains("${evil"),
-            "dollar-brace sequences in literal text must be escaped"
-        );
-        // Unterminated `${` must not survive as a live substitution across
-        // the slice boundary in `build_path_template` (`$` at end of one
-        // slice, `{evil` in the next). Escaped output contains `\${`, so check
-        // for the exact escaped form (`\${` contains `${` as substring).
-        assert_eq!(
-            build_path_template("/x/${evil"),
-            "`/x/\\${evil`",
-            "unterminated dollar-brace must be escaped"
-        );
-        // Double-quoted branch escapes quotes/backslashes:
-        assert_eq!(build_path_template("/a\"b"), "\"/a\\\"b\"");
-    }
-
-    #[test]
-    fn test_build_path_template_escapes_dollar_without_params() {
-        // Brace-free paths take the double-quoted branch, whose output is
-        // re-embedded in template literals after stripping the quotes — so
-        // `$` must be escaped even with no `{` in sight (`"\$"` equals `"$"`).
-        assert_eq!(build_path_template("/x$evil"), "\"/x\\$evil\"");
-        assert_eq!(build_path_template("/price$"), "\"/price\\$\"");
     }
 
     #[test]

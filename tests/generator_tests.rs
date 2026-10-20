@@ -1,6 +1,8 @@
+#[macro_use]
+mod common;
+
 use axotyped::{
-    AuthScheme, GeneratorConfig, HttpMethod, RouteCollection, RouteDefinition, Visibility,
-    api_routes, generate, generate_with_warnings,
+    AuthScheme, GeneratorConfig, HttpMethod, RouteCollection, RouteDefinition, Visibility, generate,
 };
 
 fn yauth_config() -> GeneratorConfig {
@@ -14,7 +16,6 @@ fn yauth_config() -> GeneratorConfig {
         default_credentials: "include".into(),
         type_import_prefix: "../../../../bindings".into(),
         format_command: None,
-        ws_ticket_path: None,
         large_int_type: "number".into(),
         auth_scheme: AuthScheme::Bearer,
         csrf_header_name: None,
@@ -135,23 +136,27 @@ fn generates_valid_output() {
     assert!(output.contains("import type { UserResponse }"));
     assert!(output.contains("import type { AuthorizeQuery }"));
 
-    // Error class
-    assert!(output.contains("export class YAuthError extends Error"));
+    // The configured error class is re-exported from the shared runtime
+    // (runtime import is aliased so a user DTO named `ApiError` cannot clash).
+    assert!(output.contains("export { __AxoApiError as YAuthError };"));
 
     // Options interface
     assert!(output.contains("export interface YAuthClientOptions"));
 
-    // Factory function
+    // Factory function and client type
     assert!(
         output.contains(
             "export function createYAuthClient(options: YAuthClientOptions): YAuthClient"
         )
     );
-
-    // Type export
     assert!(
         output.contains("export type YAuthClient = ReturnType<typeof createYAuthClientRoutes> & {")
     );
+
+    // The client binds to the shared runtime and asserts its version
+    // (aliased imports so user DTOs cannot clash).
+    assert!(output.contains("__AxoRuntimeSpecVersion !=="));
+    assert!(output.contains("__AxoCreateTransport"));
 }
 
 #[test]
@@ -160,9 +165,16 @@ fn generates_ungrouped_routes() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Top-level routes — fully generator-controlled options, method always enforced
-    assert!(output.contains("getSession: () => request<SessionResponse>(\"/session\", { method: \"GET\", auth: true, permissive: false, allowRedirects: false })"));
-    assert!(output.contains("logout: () => request<SuccessResponse>(\"/logout\", { method: \"POST\", auth: true, permissive: false, allowRedirects: false })"));
+    // Top-level routes bind typed signatures to their descriptors.
+    assert!(
+        output.contains("getSession: () =>"),
+        "method emitted: {output}"
+    );
+    assert!(
+        output.contains("execute<SessionResponse>(OPERATIONS.getSession)"),
+        "method executes its own descriptor: {output}"
+    );
+    assert!(output.contains("logout: () =>"));
 }
 
 #[test]
@@ -187,12 +199,12 @@ fn generates_path_params() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Path params become function args and encoded template literals
+    // Path params become typed function args; the descriptor carries the
+    // interpolation keys. Encoding itself is runtime behavior (behavioral spec).
     assert!(output.contains("getUser: (id: string)"));
-    assert!(output.contains("`/admin/users/${encodeURIComponent(id)}`"));
+    assert!(output.contains("params: [\"id\"]"));
+    assert!(output.contains("path: \"/admin/users/{id}\""));
     assert!(output.contains("banUser: (id: string, body: BanRequest)"));
-    // Options pinned by the generator, no caller spread
-    assert!(output.contains("{ method: \"GET\", auth: true, permissive: false, allowRedirects: false }"));
 }
 
 #[test]
@@ -212,10 +224,12 @@ fn generates_redirect_routes() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Redirect routes generate URL builders, not fetch calls
+    // Redirect routes are URL builders, not fetches.
     assert!(output.contains("authorize:"));
-    assert!(output.contains("options.baseUrl"));
-    // Should NOT contain request<...> for redirect routes
+    assert!(
+        output.contains("transport.urlFor(OPERATIONS[\"oauth.authorize\"]"),
+        "redirect method builds a URL: {output}"
+    );
     let authorize_section = output
         .split("authorize:")
         .nth(1)
@@ -223,7 +237,7 @@ fn generates_redirect_routes() {
         .split('}')
         .next()
         .unwrap();
-    assert!(!authorize_section.contains("request<"));
+    assert!(!authorize_section.contains("transport.execute"));
 }
 
 #[test]
@@ -232,8 +246,8 @@ fn generates_auth_flag() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Auth routes have auth: true in options
-    assert!(output.contains("auth: true"));
+    // Server-side visibility lands as the descriptor's auth mode.
+    assert!(output.contains("auth: \"required\""));
 }
 
 #[test]
@@ -242,8 +256,9 @@ fn generates_void_return_for_no_response() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // deleteUser has no response type (8 spaces indent: 6 base + 2 continuation)
-    assert!(output.contains("deleteUser: (id: string) =>\n        request<void>"));
+    // No response type: void contract in both signature and descriptor.
+    assert!(output.contains("deleteUser: (id: string)"));
+    assert!(output.contains("response: \"void\""));
 }
 
 #[test]
@@ -252,30 +267,12 @@ fn generates_request_helper() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Request helper should contain error handling
-    assert!(output.contains("function createRequest(options: YAuthClientOptions)"));
-    assert!(output.contains("new YAuthError("));
-    assert!(output.contains("credentials"));
-    assert!(output.contains("getToken"));
-}
-
-#[test]
-fn redirect_defaults_to_error_with_server_side_opt_in() {
-    let routes = sample_routes();
-    let output = generate(&routes, &yauth_config());
-
-    // Sane default: refuse redirects so 3xx can't bounce creds elsewhere.
-    // Only credentialless calls to routes declaring `[allow_redirects]` follow.
-    assert!(output.contains("const canFollowRedirects ="));
-    assert!(output.contains("!auth && credentials === \"omit\" && opts.allowRedirects === true"));
-    assert!(output.contains("redirect: canFollowRedirects ? \"follow\" : \"error\""));
-    // Default routes pin the flag off.
-    assert!(output.contains("allowRedirects: false"));
-    // Authenticated requests also bypass browser cache; auth defaults false.
-    assert!(output.contains("cache: \"no-store\""));
-    assert!(output.contains("auth = false"));
-    // Cookies count as credentials, not just auth:true.
-    assert!(output.contains("credentials !== \"omit\""));
+    // The machinery lives in the shared runtime, not the client file.
+    assert!(output.contains("from \"./generated-runtime\""));
+    let runtime = axotyped::generate_runtime_source();
+    assert!(runtime.contains("export function createTransport"));
+    assert!(runtime.contains("export class ApiError"));
+    assert!(runtime.contains("assertSecureTransport"));
 }
 
 #[test]
@@ -284,41 +281,26 @@ fn allow_redirects_flag_is_server_declared() {
         hook: POST "/hook" [public, allow_redirects] body: HookBody -> SuccessResponse;
         plain: GET "/plain" [public];
     };
-    assert!(routes.routes()[0].allow_redirects, "flag must set the route property");
+    assert!(
+        routes.routes()[0].allow_redirects,
+        "flag must set the route property"
+    );
     assert!(!routes.routes()[1].allow_redirects, "default must refuse");
 
     let output = generate(&routes, &yauth_config());
-    let lines: Vec<&str> = output.lines().collect();
-    let hook_idx = lines
-        .iter()
-        .position(|l| l.contains("hook:"))
-        .expect("hook method should be emitted");
-    let hook_call = format!("{}\n{}", lines[hook_idx], lines[hook_idx + 1]);
-    assert!(
-        hook_call.contains("allowRedirects: true"),
-        "declared route must bake follow in: {hook_call:?}"
+    let table = output
+        .split("export const OPERATIONS = {")
+        .nth(1)
+        .unwrap()
+        .split("} satisfies")
+        .next()
+        .unwrap();
+    assert_eq!(
+        table.matches("allowRedirects").count(),
+        1,
+        "only the declaring route carries the flag: {table}"
     );
-    let plain_line = output
-        .lines()
-        .find(|l| l.contains("plain:"))
-        .expect("plain method should be emitted");
-    assert!(
-        plain_line.contains("allowRedirects: false"),
-        "default route must refuse: {plain_line:?}"
-    );
-}
-
-#[test]
-fn public_cookie_route_with_insecure_http_requires_omit() {
-    use axotyped::{AuthScheme, api_routes};
-    let routes = api_routes! {
-        health: GET "/health" [public];
-    };
-    let mut config = yauth_config();
-    config.auth_scheme = AuthScheme::Cookie;
-    let output = generate(&routes, &config);
-    // Guard must see the effective credential mode, not just auth.
-    assert!(output.contains("assertSecureTransport(url, { allowInsecureHttp: options.allowInsecureHttp === true, auth, credentials })"));
+    assert!(table.contains("allowRedirects: true"));
 }
 
 #[test]
@@ -326,34 +308,17 @@ fn route_options_carry_no_caller_spread() {
     let routes = sample_routes();
     let output = generate(&routes, &yauth_config());
 
-    // Route calls are fully generator-controlled: no `...opts` spread, so
-    // neither `permissive` nor `allowRedirects` is runtime-flippable…
-    for line in output.lines().filter(|l| l.contains("request<")) {
-        assert!(
-            !line.contains("...opts"),
-            "route call must not spread caller opts: {line:?}"
-        );
-    }
-    // …route methods take no options argument at all (helper overloads
-    // excluded: only `=>` route definitions are caller-reachable)…
+    // Route methods are fully generator-controlled: they forward only the
+    // declared call arguments, never caller options.
     for line in output
         .lines()
-        .filter(|l| l.contains("request<") && l.contains("=>"))
+        .filter(|l| l.contains("transport.") && l.contains("=>"))
     {
         assert!(
-            !line.contains("opts?:"),
-            "route method must not accept caller opts: {line:?}"
+            !line.contains("opts") && !line.contains("options"),
+            "route call must not accept or spread caller options: {line:?}"
         );
     }
-    // …and the single option type documents the fields as generator-pinned.
-    assert!(
-        output.contains("never user-supplied"),
-        "option type must document generator pinning"
-    );
-    assert!(
-        !output.contains("InternalRequestOptions"),
-        "no split internal type should remain"
-    );
 }
 
 #[test]
@@ -365,52 +330,28 @@ fn permissive_flag_marks_route_best_effort_but_credentialed() {
     let feed = &routes.routes()[0];
     assert_eq!(feed.visibility, Visibility::Permissive);
     assert_eq!(feed.declared, Visibility::Permissive);
-    assert!(feed.is_credentialed(), "permissive stays credentialed for guard/cache");
+    assert!(
+        feed.is_credentialed(),
+        "permissive stays credentialed for guard/cache"
+    );
 
     let output = generate(&routes, &yauth_config());
-    // Per-route opts carry both flags; auth keeps guard/cache/redirect treatment.
-    assert!(output.contains("permissive: true"));
+    // Permissive lands as the descriptor's optional mode; public as none.
+    assert!(output.contains("auth: \"optional\""), "{output}");
+    assert!(output.contains("auth: \"none\""), "{output}");
     assert!(output.contains("feed: () =>"));
-    // Bearer best-effort branch attaches when available, never throws.
-    assert!(output.contains("if (permissive)"));
-    // Public routes carry no auth flag but still pin permissive:false.
-    let open_line = output
-        .lines()
-        .find(|l| l.contains("open:"))
-        .expect("open method should be emitted");
-    assert!(
-        !open_line.contains("auth: true") && open_line.contains("permissive: false"),
-        "public route must pin permissive:false without auth: {open_line:?}"
-    );
 }
 
 #[test]
-fn permissive_cookie_route_skips_omit_refusal() {
+fn permissive_route_generates_under_none_scheme() {
     let routes = api_routes! {
         feed: GET "/feed" [permissive] -> FeedResponse;
     };
-    let mut config = yauth_config();
-    config.auth_scheme = AuthScheme::Cookie;
-    let output = generate(&routes, &config);
-    // Anonymous (`omit`) is a valid outcome for permissive: the refusal is
-    // gated on `!permissive`.
-    assert!(
-        output.contains("if (auth && !permissive"),
-        "omit refusal must skip permissive routes, got:\n{}",
-        output
-    );
-}
-
-#[test]
-fn permissive_route_produces_no_warnings() {
-    let routes = api_routes! {
-        feed: GET "/feed" [permissive] -> FeedResponse;
-    };
-    // Under None the route degrades to anonymous — functional, nothing to report.
+    // Under None the route degrades to anonymous — functional output.
     let mut none = yauth_config();
     none.auth_scheme = AuthScheme::None;
-    let (_, warnings) = generate_with_warnings(&routes, &none);
-    assert!(warnings.is_empty(), "permissive must not warn: {warnings:?}");
+    let output = generate(&routes, &none);
+    assert!(output.contains("feed:"), "method is emitted: {output}");
 }
 
 #[test]
@@ -428,6 +369,33 @@ fn flat_mode_no_groups() {
     // All routes at top level
     assert!(output.contains("register:"));
     assert!(output.contains("listUsers:"));
+}
+
+#[test]
+#[should_panic(expected = "duplicate method name")]
+fn flat_layout_duplicate_method_names_fail_generation() {
+    // build() only rejects duplicates within one group; the flat layout
+    // puts every method at the top level, where a duplicate key is invalid
+    // (TS1117) or silently shadows the first endpoint. Same name in
+    // different groups stays fine — see same_name_in_different_groups_is_fine.
+    let mut routes = RouteCollection::new();
+    routes.push(manual_route(
+        "listUsers",
+        "/v1/users",
+        axotyped::Visibility::Private,
+        axotyped::Visibility::Private,
+    ));
+    routes.push(manual_route(
+        "listUsers",
+        "/v2/users",
+        axotyped::Visibility::Private,
+        axotyped::Visibility::Private,
+    ));
+    let config = GeneratorConfig {
+        enable_groups: false,
+        ..Default::default()
+    };
+    let _ = generate(&routes, &config);
 }
 
 #[test]
@@ -462,6 +430,44 @@ fn check_detects_out_of_sync() {
 
     // Cleanup
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- closed world: the client object is routes + injected helpers ----------
+
+#[test]
+#[should_panic(expected = "built-in")]
+fn a_route_named_after_an_injected_helper_fails_generation() {
+    // `with_options` becomes the method `withOptions`, which the factory
+    // overwrites with its own derivation helper — the endpoint would be
+    // unreachable and calling it would derive a client instead.
+    let routes = api_routes! {
+        withOptions: GET "/api-config" [public]
+            -> MessageResponse;
+    };
+    let _ = generate(&routes, &yauth_config());
+}
+
+#[test]
+#[should_panic(expected = "built-in")]
+fn a_group_named_after_an_injected_helper_fails_generation() {
+    // Group names are emitted verbatim, so a group called `withOptions`
+    // would occupy the same top-level key the factory assigns over.
+    let routes = api_routes! {
+        @group withOptions
+
+        ping: GET "/ping" [public]
+            -> MessageResponse;
+    };
+    let _ = generate(&routes, &yauth_config());
+}
+
+#[test]
+fn ordinary_route_names_do_not_collide() {
+    let output = generate(&sample_routes(), &yauth_config());
+    assert!(
+        output.contains("getSession:"),
+        "no false positives — ordinary routes emit: {output}"
+    );
 }
 
 #[test]
@@ -600,29 +606,19 @@ fn format_command_none_preserves_existing_behavior() {
 
 #[test]
 fn generates_websocket_route() {
-    let routes = sample_routes();
+    let routes = api_routes! {
+        wsConnect: GET "/ws" [ws]
+            send: ClientEvent, receive: ServerEvent;
+    };
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Should have the realtime group (quoted+escaped key)
-    assert!(output.contains("\"realtime\": {"));
-
-    // Should have TypedWebSocket interface and helper
-    assert!(output.contains("export interface TypedWebSocket<TSend, TReceive>"));
-    assert!(output.contains("function createTypedWebSocket<TSend, TReceive>"));
-
-    // Should convert http to ws
-    assert!(output.contains("options.baseUrl.replace(/^http/"));
-
-    // Should NOT use request<...> for WS routes
-    let ws_section = output
-        .split("wsUpgrade:")
-        .nth(1)
-        .unwrap()
-        .split('}')
-        .next()
-        .unwrap();
-    assert!(!ws_section.contains("request<"));
+    // Descriptor marks the WS endpoint; the method resolves through connect.
+    assert!(output.contains("ws: true"));
+    assert!(
+        output.contains("transport.connect<ClientEvent, ServerEvent>(OPERATIONS.wsConnect)"),
+        "{output}"
+    );
 }
 
 #[test]
@@ -637,8 +633,10 @@ fn generates_websocket_with_query() {
     // The WS method should accept query param
     assert!(output.contains("wsUpgrade: (query?: WsParams)"));
 
-    // Should have typed return with ClientEvent and ServerEvent
-    assert!(output.contains("TypedWebSocket<ClientEvent, ServerEvent>"));
+    // Typed connect through the descriptor.
+    assert!(output.contains(
+        "transport.connect<ClientEvent, ServerEvent>(OPERATIONS[\"realtime.wsUpgrade\"]"
+    ));
 }
 
 #[test]
@@ -650,18 +648,8 @@ fn generates_websocket_no_query() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Should still generate typed WS
-    assert!(output.contains("TypedWebSocket<ClientEvent, ServerEvent>"));
-
-    // No query param handling in the WS method itself
-    let ws_section = output
-        .split("wsConnect:")
-        .nth(1)
-        .unwrap()
-        .split('}')
-        .next()
-        .unwrap();
-    assert!(!ws_section.contains("URLSearchParams"));
+    assert!(output.contains("wsConnect: () =>"));
+    assert!(output.contains("transport.connect<ClientEvent, ServerEvent>(OPERATIONS.wsConnect)"));
 }
 
 #[test]
@@ -674,14 +662,10 @@ fn generates_websocket_with_path_params() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // Should have path param as function arg
+    // Path param as typed arg; interpolation key in the descriptor.
     assert!(output.contains("sessionWs: (sessionId: string, query?: WsParams)"));
-
-    // Should use encoded template literal for path
-    assert!(output.contains("${encodeURIComponent(sessionId)}"));
-
-    // Should return typed WS
-    assert!(output.contains("TypedWebSocket<ClientEvent, ServerEvent>"));
+    assert!(output.contains("params: [\"sessionId\"]"));
+    assert!(output.contains("path: \"/ws/{sessionId}\""));
 }
 
 #[test]
@@ -709,13 +693,9 @@ fn generates_websocket_typed_send_and_receive() {
     let config = yauth_config();
     let output = generate(&routes, &config);
 
-    // TypedWebSocket interface should have send and onMessage
-    assert!(output.contains("send(event: TSend): void"));
-    assert!(output.contains("onMessage(handler: (event: TReceive) => void): void"));
-
-    // createTypedWebSocket should use JSON.stringify/parse
-    assert!(output.contains("JSON.stringify(event)"));
-    assert!(output.contains("JSON.parse(raw.data"));
+    // The typed socket type comes from the runtime (aliased import).
+    assert!(output.contains("type TypedWebSocket as __AxoTypedWebSocket,"));
+    assert!(output.contains("transport.connect<ClientEvent, ServerEvent>(OPERATIONS.wsUpgrade"));
 }
 
 // ===========================================================================
@@ -723,16 +703,16 @@ fn generates_websocket_typed_send_and_receive() {
 // ===========================================================================
 
 #[test]
-fn default_config_is_bearer_fail_closed_with_same_origin_credentials() {
+fn default_config_is_bearer_requiring_token_with_same_origin_credentials() {
     let routes = api_routes! {
         getSession: GET "/session" [auth] -> SessionResponse;
     };
     let output = generate(&routes, &GeneratorConfig::default());
 
     assert!(output.contains("getToken?: () => Promise<string | null>"));
-    assert!(output.contains("headers.Authorization = `Bearer ${token}`"));
-    // Cookies no longer leak cross-origin by default; token clients don't need them.
-    assert!(output.contains("credentials = \"same-origin\""));
+    assert!(output.contains("scheme: \"bearer\""));
+    // The generated factory bakes the server-declared credentials default.
+    assert!(output.contains("credentials: options.credentials ?? \"same-origin\""));
 }
 
 #[test]
@@ -751,21 +731,10 @@ fn cookie_scheme_swaps_get_token_for_csrf_and_refuses_omitted_credentials() {
         !output.contains("getToken"),
         "cookie client must not emit getToken"
     );
-    assert!(
-        !output.contains("Authorization"),
-        "cookie client must not emit Authorization headers"
-    );
 
-    // Typed CSRF option + header attach on mutating requests.
+    // Typed CSRF option; the factory bakes the configured header name.
     assert!(output.contains("csrfToken?: () => Promise<string | null> | string | null"));
-    assert!(output.contains("headers[\"X-CSRF-Token\"] = csrfToken"));
-
-    // Fail-closed analog: stripping cookies from an auth route aborts the call.
-    assert!(
-        output.contains(
-            "options.credentials is \"omit\"; refusing to send an unauthenticated request"
-        )
-    );
+    assert!(output.contains("csrfHeader: \"X-CSRF-Token\""));
 }
 
 #[test]
@@ -777,9 +746,9 @@ fn cookie_scheme_without_csrf_config_emits_no_plumbing() {
     config.auth_scheme = AuthScheme::Cookie;
     let output = generate(&routes, &config);
 
-    assert!(output.contains("options.credentials is \"omit\""));
+    assert!(output.contains("scheme: \"cookie\""));
     assert!(!output.contains("csrfToken"));
-    assert!(!output.contains("X-CSRF-Token"));
+    assert!(!output.contains("csrfHeader"));
 }
 
 #[test]
@@ -790,47 +759,34 @@ fn cookie_ws_auth_rides_cookies_without_ticket_handshake() {
     };
     let mut config = yauth_config();
     config.auth_scheme = AuthScheme::Cookie;
-    let (output, warnings) = generate_with_warnings(&routes, &config);
+    let output = generate(&routes, &config);
 
     // No diagnostic: session cookies ride same-origin WS upgrades natively.
     assert!(
-        warnings.is_empty(),
-        "cookie scheme has a native WS credential pathway: {warnings:?}"
-    );
-    assert!(
-        !output.contains("__wsTicket"),
-        "cookie WS must not use ticket handshake"
-    );
-    // Fail closed: omit would silently send the upgrade unauthenticated
-    // (WS has no credentials option), so the client must refuse it.
-    assert!(
-        output.contains("options.credentials ??") && output.contains("refusing to send an unauthenticated upgrade"),
-        "cookie [ws][auth] must reject credentials omit before new WebSocket"
+        !output.contains("ticket"),
+        "cookie WS has no ticket handshake"
     );
 }
 
 #[test]
-fn none_scheme_generates_no_auth_machinery_and_warns_on_auth_routes() {
+fn none_scheme_generates_no_auth_machinery() {
     let routes = api_routes! {
         getSession: GET "/session" [auth] -> SessionResponse;
         health: GET "/health" [public] -> SuccessResponse;
     };
     let mut config = yauth_config();
     config.auth_scheme = AuthScheme::None;
-    let (output, warnings) = generate_with_warnings(&routes, &config);
+    let output = generate(&routes, &config);
 
     assert!(
         !output.contains("getToken"),
         "none client must not emit getToken"
     );
     assert!(
-        warnings.iter().any(|w| w.contains("getSession")),
-        "authenticated route under scheme none must warn, got {warnings:?}"
+        output.contains("getSession:"),
+        "methods still emit: {output}"
     );
-    assert!(
-        !warnings.iter().any(|w| w.contains("health")),
-        "public routes must not warn under scheme none"
-    );
+    assert!(output.contains("health:"));
 }
 
 // ===========================================================================
@@ -863,7 +819,8 @@ fn manual_route(
 }
 
 #[test]
-fn public_declared_but_protected_route_produces_contradiction_warning() {
+#[should_panic(expected = "behind an auth layer")]
+fn public_declared_but_protected_route_fails_generation() {
     let mut routes = RouteCollection::new();
     routes.push(manual_route(
         "hook",
@@ -871,29 +828,12 @@ fn public_declared_but_protected_route_produces_contradiction_warning() {
         axotyped::Visibility::Private,
         axotyped::Visibility::Public,
     ));
-    routes.push(manual_route(
-        "admin",
-        "/admin/users",
-        axotyped::Visibility::Private,
-        axotyped::Visibility::Private,
-    ));
 
-    let (_, warnings) = generate_with_warnings(&routes, &yauth_config());
-
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("hook") && w.contains("auth layer")),
-        "contradiction between public declaration and protection must warn, got {warnings:?}"
-    );
-    assert!(
-        !warnings.iter().any(|w| w.contains("admin")),
-        "protected-without-declaration is the expected steady state"
-    );
+    let _ = generate(&routes, &yauth_config());
 }
 
 #[test]
-fn consistently_public_or_protected_routes_never_warn_about_layering() {
+fn consistently_public_or_protected_routes_generate_cleanly() {
     let mut routes = RouteCollection::new();
     routes.push(manual_route(
         "open",
@@ -908,9 +848,102 @@ fn consistently_public_or_protected_routes_never_warn_about_layering() {
         axotyped::Visibility::Private,
     ));
 
-    let (_, warnings) = generate_with_warnings(&routes, &yauth_config());
+    let output = generate(&routes, &yauth_config());
     assert!(
-        warnings.is_empty(),
-        "consistent declarations produce no diagnostics: {warnings:?}"
+        output.contains("open:"),
+        "consistent declarations generate: {output}"
     );
+}
+
+#[test]
+fn reserved_path_param_names_do_not_shadow_client_bindings() {
+    // A path param named `transport` / `OPERATIONS` / `body` must not shadow
+    // the factory's `transport` binding, the `OPERATIONS` table, or the
+    // body/query params. Wire names stay untouched; only JS locals mangle,
+    // with `params: { wire: local }` mapping.
+    let routes = api_routes! {
+        getItem: GET "/items/{transport}" [public]
+            -> ItemResponse;
+        getOp: GET "/ops/{OPERATIONS}" [public]
+            -> ItemResponse;
+        getBody: GET "/bodies/{body}" [public]
+            -> ItemResponse;
+        getBoth: GET "/both/{transport}/{transport_}" [public]
+            -> ItemResponse;
+    };
+    let config = GeneratorConfig {
+        enable_groups: false,
+        ..Default::default()
+    };
+    let output = generate(&routes, &config);
+
+    // Mangled locals, wire-mapped call args.
+    assert!(
+        output.contains("(transport_: string)"),
+        "transport param must mangle, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("params: { transport: transport_ }"),
+        "wire name must map to the mangled local, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("(OPERATIONS_: string)"),
+        "OPERATIONS param must mangle, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("(body_: string)"),
+        "body param must mangle to avoid duplicating the body param, got:\n{}",
+        output
+    );
+    // Coexisting `transport` + `transport_` stay unique.
+    assert!(
+        output.contains("params: { transport: transport_, transport_: transport__ }"),
+        "mangled names must stay unique, got:\n{}",
+        output
+    );
+    // Wire names (OPERATIONS table) are untouched.
+    assert!(output.contains("path: \"/items/{transport}\""));
+    assert!(output.contains("params: [\"transport\"]"));
+    // No shadowing method bodies remain.
+    assert!(
+        !output.contains("(transport: string)"),
+        "shadowing signature must be gone, got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn runtime_imports_are_aliased_against_user_types() {
+    // A DTO named `Transport` must not collide with the runtime import:
+    // user types import by plain name, runtime imports are `__Axo*`-aliased.
+    let routes = api_routes! {
+        getTransport: GET "/transport" [public]
+            -> Transport;
+    };
+    let config = GeneratorConfig {
+        enable_groups: false,
+        ..Default::default()
+    };
+    let output = generate(&routes, &config);
+
+    assert!(output.contains("import type { Transport }"));
+    assert!(
+        output.contains("type Transport as __AxoTransport,"),
+        "runtime Transport import must be aliased, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("type OperationSpec as __AxoOperationSpec,"),
+        "runtime OperationSpec import must be aliased, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("\n  type Transport,\n"),
+        "bare runtime Transport import must be gone, got:\n{}",
+        output
+    );
+    assert!(output.contains("transport: __AxoTransport)"));
 }

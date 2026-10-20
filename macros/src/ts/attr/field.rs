@@ -329,8 +329,8 @@ fn contains_null_type(override_str: &str) -> bool {
             c => code.push(c),
         }
     }
-    // Split the top-level union only; `|` nested in brackets belongs to a
-    // member type, not the field's own nullability.
+    let code = strip_outer_parens(&code);
+    // Split the top-level union only.
     let chars: Vec<char> = code.chars().collect();
     let mut members: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -360,9 +360,7 @@ fn contains_null_type(override_str: &str) -> bool {
         .any(|member| strip_outer_parens(member.trim()) == "null")
 }
 
-/// Strip redundant surrounding parens (`((A | B))` → `A | B`) so a
-/// parenthesized union still reads as nullable. Only strips when the outer
-/// pair balances each other.
+/// Strip redundant surrounding parens (`((A | B))` → `A | B`).
 fn strip_outer_parens(s: &str) -> &str {
     let mut s = s.trim();
     loop {

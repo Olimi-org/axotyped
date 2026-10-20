@@ -30,6 +30,7 @@ pub(crate) fn type_as_struct(
         bound: attr.bound.clone(),
         ts_enum: None,
         is_enum: quote!(<#type_as as #crate_rename::TS>::IS_ENUM),
+        wire_fields: None,
     })
 }
 
@@ -52,5 +53,6 @@ pub(crate) fn type_as_enum(attr: &EnumAttr, ts_name: Expr, type_as: &Type) -> Re
         bound: attr.bound.clone(),
         ts_enum: None,
         is_enum: quote!(<#type_as as #crate_rename::TS>::IS_ENUM),
+        wire_fields: None,
     })
 }

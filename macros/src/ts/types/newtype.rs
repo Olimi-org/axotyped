@@ -56,5 +56,6 @@ pub(crate) fn newtype(
         } else {
             quote!(false)
         },
+        wire_fields: None,
     })
 }

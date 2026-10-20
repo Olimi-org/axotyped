@@ -33,9 +33,6 @@ pub struct PathParam {
 }
 
 /// What a route declares — and effectively is — regarding authentication.
-///
-/// Matched on directly so each state carries its own meaning instead of
-/// combining booleans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Visibility {
     /// Requires authentication. The generated client attaches credentials
@@ -44,8 +41,7 @@ pub enum Visibility {
     Private,
     /// Open. The generated client sends no credentials for the call.
     Public,
-    /// Best-effort credentials: attached when available, never required.
-    /// Anonymous calls go out as-is; the endpoint is expected to serve both.
+    /// Credentials attached when available, never required.
     Permissive,
 }
 
@@ -58,15 +54,11 @@ pub struct RouteDefinition {
     pub method: HttpMethod,
     /// Route path (e.g., `/register`, `/admin/users/{id}`).
     pub path: String,
-    /// Effective visibility after scopes and layers. Drives codegen:
-    /// `Private` requires credentials, `Permissive` attaches them
-    /// best-effort, `Public` sends none.
+    /// Effective visibility after scopes and layers.
     pub visibility: Visibility,
-    /// Declaration-site visibility (`#[endpoint(public|permissive)]`,
-    /// `[public|permissive]`, or a `group_public`/`group_permissive` scope).
-    /// Differs from `visibility` when an `auth_layer` in scope forces a
-    /// declared-public route back to `Private` (reported by
-    /// `generate_with_warnings`).
+    /// Declaration-site visibility. Differs from `visibility` when an
+    /// `auth_layer` in scope forces a declared-public route to `Private`
+    /// (client generation fails on the contradiction).
     pub declared: Visibility,
     /// Rust type name of the request body (stringified via `stringify!()`).
     pub body_type: Option<String>,
@@ -79,9 +71,7 @@ pub struct RouteDefinition {
     /// Group name for nested object structure (e.g., `emailPassword`).
     pub group: Option<String>,
     /// Whether this route may follow redirects (`[allow_redirects]`).
-    /// A route property decided server-side at generation time — never
-    /// caller-suppliable. Only takes effect for credentialless calls;
-    /// anything carrying auth or cookies still refuses.
+    /// Server-side route property. Applies to credentialless calls only.
     pub allow_redirects: bool,
     /// Whether this route is a browser redirect (not a fetch call).
     pub redirect: bool,
@@ -94,25 +84,22 @@ pub struct RouteDefinition {
 }
 
 impl RouteDefinition {
-    /// Whether calls carry credentials (`Private` or `Permissive` effective
-    /// visibility): transport guard, cache bypass, and redirect refusal apply.
+    /// Whether calls carry credentials (`Private` or `Permissive`).
     pub fn is_credentialed(&self) -> bool {
         !matches!(self.visibility, Visibility::Public)
     }
 
-    /// Whether credentials are best-effort rather than required.
+    /// Whether credentials are attached when available, never required.
     pub fn is_permissive(&self) -> bool {
         matches!(self.visibility, Visibility::Permissive)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Type collection (ts-rs feature)
+// Type collection
 // ---------------------------------------------------------------------------
 
 /// A type-erased `T::export_all(&cfg)` function pointer.
-/// Used to call ts-rs's export mechanism for types discovered during route building.
-#[cfg(feature = "ts-rs")]
 type ExportFn = fn(&crate::ts::Config) -> Result<(), crate::ts::ExportError>;
 
 /// Called when a route names type `T` for TypeScript export.
@@ -142,7 +129,6 @@ impl Collector for NoCollect {
 
 /// Collects route types for ts-rs export via `export_all()`.
 /// Deduplicates by `TypeId` so shared generic impls emit one declaration.
-#[cfg(feature = "ts-rs")]
 #[derive(Debug, Clone, Default)]
 pub struct TypeRegistry {
     /// TypeId → export_all function pointer, for deduplication and export.
@@ -151,12 +137,10 @@ pub struct TypeRegistry {
 }
 
 /// Returns true for stdlib wrappers handled inline (`Vec` as `T[]`, `Option` as `T | null`).
-#[cfg(feature = "ts-rs")]
 fn is_container_wrapper(type_name: &str) -> bool {
     type_name.contains("::vec::Vec<") || type_name.contains("::option::Option<")
 }
 
-#[cfg(feature = "ts-rs")]
 impl TypeRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -190,7 +174,6 @@ impl TypeRegistry {
     }
 }
 
-#[cfg(feature = "ts-rs")]
 impl Collector for TypeRegistry {
     fn register<T: crate::MaybeTs + 'static>(&mut self) {
         let type_name = std::any::type_name::<T>();
@@ -212,33 +195,12 @@ impl Collector for TypeRegistry {
     }
 }
 
-/// Placeholder registry when ts-rs is not enabled — no type collection.
-#[cfg(not(feature = "ts-rs"))]
-#[derive(Debug, Clone, Default)]
-pub struct TypeRegistry;
-
-#[cfg(not(feature = "ts-rs"))]
-impl TypeRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        true
-    }
-
-    pub fn len(&self) -> usize {
-        0
-    }
-
-    pub fn extend(&mut self, _other: TypeRegistry) {}
-}
-
 /// A collection of route definitions and their associated TypeScript types.
 #[derive(Debug, Clone, Default)]
 pub struct RouteCollection {
     routes: Vec<RouteDefinition>,
     types: TypeRegistry,
+    auth_flow: Option<crate::auth_flow::AuthFlow>,
 }
 
 impl RouteCollection {
@@ -248,8 +210,16 @@ impl RouteCollection {
 
     /// Builds a `RouteCollection` from routes and a type registry.
     /// Used by [`crate::ApiRouter::build`].
-    pub(crate) fn assemble(routes: Vec<RouteDefinition>, types: TypeRegistry) -> Self {
-        Self { routes, types }
+    pub(crate) fn assemble(
+        routes: Vec<RouteDefinition>,
+        types: TypeRegistry,
+        auth_flow: Option<crate::auth_flow::AuthFlow>,
+    ) -> Self {
+        Self {
+            routes,
+            types,
+            auth_flow,
+        }
     }
 
     pub fn push(&mut self, route: RouteDefinition) {
@@ -259,6 +229,36 @@ impl RouteCollection {
     pub fn extend(&mut self, other: RouteCollection) {
         self.routes.extend(other.routes);
         self.types.extend(other.types);
+        // One credential lifecycle per collection.
+        match (&self.auth_flow, other.auth_flow) {
+            (Some(existing), Some(flow)) => panic!(
+                "two auth flows declared ('{}' and '{}'); \
+                 an API has one credential lifecycle",
+                existing.name, flow.name
+            ),
+            (None, flow) => self.auth_flow = flow,
+            _ => {}
+        }
+        // Re-validate: each side was validated against its own routes only.
+        if let Some(flow) = &self.auth_flow {
+            if let Err(e) = flow.validate(&self.routes) {
+                panic!(
+                    "auth_scheme '{}': merged route table invalidates the flow: {e}",
+                    flow.name
+                );
+            }
+        }
+    }
+
+    /// The declared credential lifecycle, if the router carried an
+    /// [`auth_flow`](crate::ApiRouter::auth_flow) declaration.
+    pub fn auth_flow(&self) -> Option<&crate::auth_flow::AuthFlow> {
+        self.auth_flow.as_ref()
+    }
+
+    /// Look up a route by its client method name (first match).
+    pub(crate) fn find_by_name(&self, name: &str) -> Option<&RouteDefinition> {
+        self.routes.iter().find(|r| r.name == name)
     }
 
     pub fn routes(&self) -> &[RouteDefinition] {
@@ -270,9 +270,6 @@ impl RouteCollection {
     }
 
     /// Exports collected types and dependencies to `dir` via `export_all()`.
-    /// Call before `generate_to_file()`; replaces manual per-type exports.
-    /// Types come from `.response::<T>()`, `.body::<T>()`, `.query::<T>()`, `.events::<A, B>()`.
-    #[cfg(feature = "ts-rs")]
     pub fn export_types(&self, dir: &std::path::Path) -> Result<(), std::io::Error> {
         self.export_types_with(dir, crate::ts::Config::from_env())
     }
@@ -280,7 +277,6 @@ impl RouteCollection {
     /// Exports types with an explicit ts-rs [`Config`](crate::ts::Config).
     /// Use [`GeneratorConfig::ts_config`](crate::GeneratorConfig::ts_config) to keep
     /// binding and client integer rendering aligned.
-    #[cfg(feature = "ts-rs")]
     pub fn export_types_with(
         &self,
         dir: &std::path::Path,
@@ -371,17 +367,9 @@ impl<'a> IntoIterator for &'a RouteCollection {
 }
 
 /// Returns true if `name` can be emitted as-is in generated code.
-/// ASCII identifier check plus reserved-word rejection; rejected names
-/// become synthetic `__param_N` placeholders.
 pub fn is_valid_js_identifier(name: &str) -> bool {
-    // ECMAScript reserved words (rejected unconditionally so output is safe
-    // in strict / module / generator contexts) plus the strict-mode binding
-    // bans `arguments` and `eval`. Contextual names like `async`/`of`/`as`/
-    // `from`/`get`/`set` are legal as plain bindings and stay allowed.
+    // ECMAScript reserved words plus `arguments` / `eval`.
     const RESERVED: &[&str] = &[
-        // Reserved words (incl. `await`/`yield`/`enum`, reserved only in
-        // module / async / generator / strict contexts — rejected
-        // unconditionally so output is safe in all of them)
         "await",
         "break",
         "case",
@@ -420,9 +408,7 @@ pub fn is_valid_js_identifier(name: &str) -> bool {
         "while",
         "with",
         "yield",
-        // Future reserved words in strict mode / modules (incl. class-side
-        // `static`, `private`, `protected`, `public` — still FutureReservedWord
-        // per spec even though class syntax implements them)
+        // Future reserved words in strict mode / modules
         "implements",
         "interface",
         "let",
@@ -445,8 +431,6 @@ pub fn is_valid_js_identifier(name: &str) -> bool {
 }
 
 /// Extracts `{...}` params from a path (e.g. `/users/{id}` -> `[id]`).
-/// Repeats collapse to first occurrence; non-identifiers become `__param_N`,
-/// matching path-template generation.
 pub fn extract_path_params(path: &str) -> Vec<PathParam> {
     let raws = scan_raw_path_params(path);
 
@@ -467,7 +451,6 @@ pub fn extract_path_params(path: &str) -> Vec<PathParam> {
 }
 
 /// Returns raw `{...}` contents in first-occurrence order.
-/// An unterminated `{` ends the scan; the remainder is literal text.
 fn scan_raw_path_params(path: &str) -> Vec<&str> {
     let mut raws: Vec<&str> = Vec::new();
     let mut rest = path;
@@ -486,17 +469,7 @@ fn scan_raw_path_params(path: &str) -> Vec<&str> {
     raws
 }
 
-/// Raw names in `path` that are valid identifiers.
-pub(crate) fn scan_taken_param_names(path: &str) -> std::collections::BTreeSet<String> {
-    scan_raw_path_params(path)
-        .into_iter()
-        .filter(|raw| is_valid_js_identifier(raw))
-        .map(String::from)
-        .collect()
-}
-
-/// Maps a raw param name to its emitted name, allocating `__param_N`
-/// for invalid identifiers. Shared by param extraction and template generation.
+/// Maps a raw param name to its emitted name.
 pub(crate) fn sanitize_param_name_with(
     taken: &std::collections::BTreeSet<String>,
     next_synthetic: &mut usize,

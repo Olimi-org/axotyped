@@ -1,4 +1,7 @@
-use axotyped::{HttpMethod, api_routes};
+#[macro_use]
+mod common;
+
+use axotyped::HttpMethod;
 
 #[test]
 fn simple_get_route() {
@@ -285,15 +288,38 @@ fn public_flag_opts_out_of_auth() {
         healthCheck: GET "/health" [public];
         deleteItem: DELETE "/items/{id}";
     };
-    assert!(!routes.routes()[0].is_credentialed(), "[public] must clear auth");
-    assert!(routes.routes()[1].is_credentialed(), "unflagged routes stay private");
+    assert!(
+        !routes.routes()[0].is_credentialed(),
+        "[public] must clear auth"
+    );
+    assert!(
+        routes.routes()[1].is_credentialed(),
+        "unflagged routes stay private"
+    );
 }
 
 mod endpoint_visibility {
-    use axotyped::{ApiRouter, IntoApiRouter, Visibility, endpoint};
+    use axotyped::{ApiRouter, Visibility, endpoint};
+
+    #[derive(Clone, Copy)]
+    pub struct TestAuth;
+
+    impl axotyped::EndpointParam for TestAuth {
+        type Auth = axotyped::Credential;
+    }
+
+    impl<S: Send + Sync> axum::extract::FromRequestParts<S> for TestAuth {
+        type Rejection = std::convert::Infallible;
+        async fn from_request_parts(
+            _parts: &mut axum::http::request::Parts,
+            _state: &S,
+        ) -> Result<Self, Self::Rejection> {
+            Ok(TestAuth)
+        }
+    }
 
     #[endpoint]
-    pub async fn admin_thing() -> &'static str {
+    pub async fn admin_thing(_auth: TestAuth) -> &'static str {
         "secret"
     }
 
@@ -308,7 +334,7 @@ mod endpoint_visibility {
     }
 
     fn build(routes_def: impl FnOnce(ApiRouter<()>) -> ApiRouter<()>) -> Vec<Visibility> {
-        let (_router, routes) = routes_def(ApiRouter::<()>::new()).into_api_router().build();
+        let (_router, routes) = routes_def(ApiRouter::<()>::new()).build();
         routes.routes().iter().map(|r| r.visibility).collect()
     }
 
@@ -343,11 +369,63 @@ mod endpoint_visibility {
         let (_router, routes) = ApiRouter::<()>::new()
             .get("/feed", axotyped::register!(feed))
             .as_("feed")
-            .into_api_router()
             .build();
         let r = &routes.routes()[0];
         assert_eq!(r.visibility, Visibility::Permissive);
         assert_eq!(r.declared, Visibility::Permissive);
-        assert!(r.is_credentialed(), "permissive stays credentialed for guard/cache");
+        assert!(
+            r.is_credentialed(),
+            "permissive stays credentialed for guard/cache"
+        );
     }
+}
+
+// -- bare-name shadowing of axum built-ins -----------------------------------
+//
+// `is_ambient_extractor` assumes a bare built-in name is axum's. On a
+// credentialless declaration that assumption is type-checked: an
+// ambient-classified parameter must truly be ambient. A shadowing
+// extractor that genuinely admits anonymous callers passes; the
+// `#[credential]` shadow fails (compile_fail doctest on the params
+// module) with the same contradiction error as any custom credential
+// parameter.
+
+#[axotyped::optional_credential]
+pub struct Path;
+
+#[axotyped::endpoint(public)]
+async fn shadowed_optional_path(_p: Path) {}
+
+#[test]
+fn shadowing_built_in_name_with_optional_credential_compiles_on_public() {
+    // Compilation of `shadowed_optional_path` above IS the assertion: its
+    // `__param_assertions` ran `__truly_ambient::<Path>()`, which holds
+    // because `Auth = OptionalCredential`.
+    let _ = shadowed_optional_path;
+}
+
+// -- common axum extractors carry EndpointParam impls ------------------------
+//
+// #[endpoint] asserts EndpointParam for EVERY parameter and the orphan rule
+// bars downstream crates from adding impls for foreign types — compilation
+// of these handlers IS the assertion that the extractor set is usable at all.
+
+#[derive(serde::Deserialize, Default)]
+pub struct FormData {
+    pub name: String,
+}
+
+#[axotyped::endpoint]
+async fn submit_form(axum::Form(_form): axum::Form<FormData>) {}
+
+// (No `Result<T, E>` fixture: axum 0.8 has no Result extractor — the shape
+// cannot reach a handler signature, so it carries no EndpointParam impl.)
+
+#[axotyped::endpoint]
+async fn echo_raw(_body: String) {}
+
+#[test]
+fn common_axum_extractors_are_endpoint_params() {
+    let _ = submit_form;
+    let _ = echo_raw;
 }

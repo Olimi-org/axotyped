@@ -94,17 +94,67 @@ fn non_identifier_method_names_are_emitted_as_quoted_keys() {
     // interior double-quote is escaped, so nothing inside can close the key.
     let line = out
         .lines()
-        .find(|l| l.contains("pwn"))
+        .find(|l| l.contains("pwn") && l.contains("=>"))
         .expect("method should be emitted");
     assert!(
         line.trim_start().starts_with('"') && line.contains("\\\"; export function pwn()"),
         "interior quotes must be escaped so the name stays one inert key: {line:?}"
     );
+    // The method line is `<quoted key>: () => transport.execute<void>(OPERATIONS[<same quoted key>]),`
+    // — the key terminates at its own closing quote in both positions.
+    let closer = "\": () => transport.execute<void>(OPERATIONS[\"";
     assert!(
-        line.trim_end()
-            .ends_with("\": () => request<void>(\"/ok\", { method: \"GET\", permissive: false, allowRedirects: false }),"),
-        "the emitted key must terminate exactly at its own closing quote"
+        line.contains(closer) && line.trim_end().ends_with("\"]),"),
+        "the emitted key must terminate exactly at its own closing quote: {line:?}"
     );
+}
+
+/// A hand-built untyped WS definition (the builder path makes this
+/// unrepresentable) fails generation — no contract, no method.
+#[test]
+#[should_panic(expected = "without declared event types")]
+fn untyped_websocket_route_fails_generation() {
+    let mut routes = RouteCollection::new();
+    let mut def = route("rawSocket", "/raw");
+    def.websocket = true;
+    routes.push(def);
+    routes.push(route("health", "/health"));
+
+    let _ = generate(&routes, &GeneratorConfig::default());
+}
+
+/// The flat emitter shares the contract gate: with grouping disabled an
+/// untyped WS route still fails instead of producing a method referencing
+/// a descriptor the table skipped.
+#[test]
+#[should_panic(expected = "without declared event types")]
+fn untyped_websocket_route_fails_generation_without_grouping() {
+    let mut routes = RouteCollection::new();
+    let mut def = route("rawSocket", "/raw");
+    def.websocket = true;
+    routes.push(def);
+    routes.push(route("health", "/health"));
+
+    let config = GeneratorConfig {
+        enable_groups: false,
+        ..Default::default()
+    };
+    let _ = generate(&routes, &config);
+}
+
+/// A partial contract (send declared, receive missing) is no contract: one
+/// predicate gates generation, the descriptor table, and both emitters.
+#[test]
+#[should_panic(expected = "without declared event types")]
+fn partial_websocket_contract_fails_generation() {
+    let mut routes = RouteCollection::new();
+    let mut def = route("halfTyped", "/half");
+    def.websocket = true;
+    def.ws_send_type = Some("ClientEvent".into());
+    routes.push(def);
+    routes.push(route("health", "/health"));
+
+    let _ = generate(&routes, &GeneratorConfig::default());
 }
 
 /// Ordinary derived identifiers still emit bare (no quotes), so the common
@@ -115,4 +165,66 @@ fn identifier_method_names_stay_bare() {
     routes.push(route("listUsers", "/users"));
     let out = generate(&routes, &GeneratorConfig::default());
     assert!(out.contains("listUsers: () =>"));
+}
+
+/// The withOptions collision check follows the layout it is checking:
+/// flat emission puts every route method at the top level (a grouped route
+/// named after a helper collides; a group name creates no property), while
+/// grouped nesting exposes the group object there instead.
+#[test]
+#[should_panic(expected = "built-in")]
+fn helper_collision_in_flat_layout_fails_generation() {
+    let mut routes = RouteCollection::new();
+    let mut grouped = route("withOptions", "/derive");
+    grouped.group = Some("admin".into());
+    routes.push(grouped);
+
+    let flat = GeneratorConfig {
+        enable_groups: false,
+        ..Default::default()
+    };
+    let _ = generate(&routes, &flat);
+}
+
+#[test]
+fn helper_collision_absent_in_grouped_layout_generates() {
+    let mut routes = RouteCollection::new();
+    let mut grouped = route("withOptions", "/derive");
+    grouped.group = Some("admin".into());
+    routes.push(grouped);
+
+    let out = generate(&routes, &GeneratorConfig::default());
+    assert!(
+        out.contains("withOptions:"),
+        "grouped layout: the method nests under 'admin', no collision: {out}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "built-in")]
+fn group_named_after_helper_fails_generation() {
+    let mut routes = RouteCollection::new();
+    let mut listed = route("list", "/list");
+    listed.group = Some("withOptions".into());
+    routes.push(listed);
+
+    let _ = generate(&routes, &GeneratorConfig::default());
+}
+
+#[test]
+fn group_name_creates_no_property_in_flat_layout() {
+    let mut routes = RouteCollection::new();
+    let mut listed = route("list", "/list");
+    listed.group = Some("withOptions".into());
+    routes.push(listed);
+
+    let flat = GeneratorConfig {
+        enable_groups: false,
+        ..Default::default()
+    };
+    let out = generate(&routes, &flat);
+    assert!(
+        out.contains("list:"),
+        "flat layout: a group name creates no property, 'list' is the method: {out}"
+    );
 }

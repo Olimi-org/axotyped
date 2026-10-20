@@ -1,3 +1,63 @@
+## 0.4.0 (2026-10-07)
+
+### Breaking changes
+
+- **Every client names its credential with `getToken`.** A declared flow offers `onUnauthorized` alongside it; there is no second bearer source.
+- **`onUnauthorized` is the 401 replay hook.** Called after a 401 on a `required` bearer route; return the credential to replay with, or `null` when the session cannot be renewed. Throwing is treated as `null` — either way the server's own 401 surfaces, not the hook's error. Replay is bounded at two, and the replay credential is the hook's *return value*: the transport never re-reads `getToken` to decide who the caller is, so a request cannot be re-sent under a session the application has since replaced.
+- **Cookie routes do not replay.** Nothing an application does mid-flight changes what the browser already put in the cookie jar; a cookie 401 is terminal by construction.
+- **Proactive renewal, rotation persistence, and single-flight are the application's.** `singleFlight` and `jwtExpiry` are exported as stateless primitives for it.
+- **`-> token` now buys a generated renewal helper instead of wiring the transport.** `auth_scheme!` emits `refreshBearer(client)` (or `refreshSession(client)` for an oauth2 pair) that calls the declared route and lifts the declared fields off its response. Because the helper reads them off the *imported response type*, `tsc` checks every declared name against what the client will parse — replacing the runtime's uncheckable string-keyed extraction. `AUTH` is emitted as data for application glue; nothing in the runtime interprets it.
+- **A route or group named after a built-in client helper is reported.** `Object.assign` would overwrite the generated property, and calling it would derive a new client instead of sending the request.
+- Type export is built in; the `ts-rs` feature is gone. Drop `"ts-rs"` from features. Every type in a route contract implements `TS` (or mark the handler `#[endpoint(opaque)]` for an untyped route).
+- Every route uses `register!()` + `#[endpoint]`. Manual `.body()`/`.response()`/`.query()` overrides still apply to registered routes.
+- Every `#[endpoint]` extractor parameter declares authentication. Axum built-ins are covered by blanket impls. Custom extractors use `#[axotyped::credential]` or `#[axotyped::optional_credential]` and must be `pub`.
+- Private routes are checked at compile time. A handler without an enforcing extractor fails at the registration call. `ApiRouter` carries its scope as a type parameter (`PrivateScope` default, `PublicScope`/`PermissiveScope` in groups, `LayeredAuthScope` after `auth_layer`).
+- `public`/`permissive` endpoints taking a credential-requiring extractor do not compile. Credential-requiring handlers in `group_public`/`group_permissive` scopes do not compile.
+- The credential fold matches extractor paths. A qualified non-`axum` path folds; a bare name matching an axum built-in is treated as axum's (qualify custom extractors with colliding names). `public`/`permissive` endpoints check ambient-classified parameters at the type level (`EndpointParam<Auth = OptionalCredential>`). `ConnectInfo` covers any address type.
+- `ApiRouter::new`, `Default`, and `from_parts` accept initial scopes only. Enter `LayeredAuthScope` via `.auth_layer(...)`.
+- `IntoApiRouter` is replaced by `IntoApiRouterAny`/`RouterParts`; `ApiRouter::from_parts` is public. Group closures may end in any scope.
+- Generation writes two files: the client and a sibling `<name>-runtime.ts`. The client asserts the runtime spec version at import.
+- `[ws]` routes declare event types (`.events::<Send, Receive>()` on the builder; `send:`/`receive:` in macro form). Hand-built definitions without both types generate no client method and warn.
+- WebSocket route methods return `Promise<TypedWebSocket<S, R>>`.
+- `ApiError` is defined by the shared runtime and re-exported by the client.
+- `api_routes!` is removed from the library. `GeneratorConfig::ws_ticket_path`/`ws_ticket_method` are removed; declare `ws_ticket: register!(…)` in `auth_scheme!`.
+- Every client exposes `getToken` (sync or async forms both accepted); a declared flow adds `onUnauthorized` beside it. There is no `auth` options object.
+- `TransportOptions.csrfToken` accepts sync and async forms.
+
+### Features
+
+- `auth_scheme!` declares the credential lifecycle: `kind: oauth2 | exchange | static_bearer`, `exchange`/`refresh`/`ws_ticket` references, `constant`s. `build()` validates references, visibility rules (`exchange`/`refresh` not `Private`; `ws_ticket` `Private`), and one flow per router tree.
+- The client file carries declarations (`OPERATIONS` table, `AUTH` strategy, methods, options, factory). The runtime module carries the transport — executor, guards, replay policy, observability — and the WS handshake. It holds no credential state.
+- `AUTH` carries kind, refresh op, verbatim field names, `skewMs`, bootstrap/wsTicket/constants. `TRANSPORT` carries scheme and WS ticket wiring.
+- `-> token` (exchange) and `-> { access, refresh, expires_in }` (oauth2 members optional) generate a typed renewal helper — `refreshBearer(client)` / `refreshSession(client)` — that calls the declared route and lifts the fields off its response; `tsc` checks every declared name against the imported response type. Declared fields are also checked against `WireFields` wire names at the declaration site.
+- Routes the renewal helper cannot call (missing route, body/path/query inputs, untyped, ws/redirect) generate no helper and warn; renewal is whatever the application's `onUnauthorized` does.
+- `#[endpoint]` handlers returning `Response` skip response extraction. `#[endpoint(opaque)]` opts out of type collection entirely: no body/query/response metadata, so the DTOs need not implement `TS` and the client method is untyped.
+- `WsRouteBuilder`/`RouteBuilder` forward `layer()`/`auth_layer()` mid-chain.
+- `RouteCollection::extend` adopts a flow when absent, panics on two flows, and re-validates the surviving flow against the merged table.
+- Lifecycle references must resolve to exactly one route; ambiguous names fail `build()`.
+- Duplicate client method names within one group fail `build()`. `OPERATIONS` keys are group-qualified. A root-level route named `auth` warns and skips the synthetic `api.auth.*` alias.
+- 401 replay fires on status 401 only, on `required` routes under the bearer scheme, bounded at two replays. The replay credential is `onUnauthorized`'s return value — the transport never re-reads `getToken` mid-request, so a request cannot be re-sent under a session the application has since replaced; a hook returning the just-rejected credential does not re-send (the server's 401 surfaces). Cookie routes never replay.
+- `refreshSession` normalizes `expires_in` through `Number()`. Token field names are emitted verbatim. `AUTH.constants` keys are quoted and escaped.
+- `withOptions` derives a client over the same options object — `getToken` and `onUnauthorized` are the application's own closures, so derived clients share the credential source by construction.
+- `onRequest`/`onResponse` options receive the operation descriptor. `onResponse` receives a `response.clone()`. Throwing observers do not fail the call.
+- `Content-Type: application/json` is sent on body-carrying calls only. Credentialed requests send `cache: "no-store"`. Query arrays serialize as repeated keys for HTTP and WS.
+- `TypedWebSocket.close(code?, reason?)` forwards to the socket.
+- `compute_import_prefix` handles deeper output paths. `contains_null_type` strips outer parens. oauth2 flows without declared fields emit a field-less strategy and no renewal helper — renewal is the application's `onUnauthorized`.
+- Behavioral suite runs the runtime under `bun test` (skips when bun is absent); a second spec runs a generated client end to end.
+
+### Security hardening
+
+- Private routes without an enforcing extractor do not compile; visibility–extractor contradictions fail at the endpoint definition.
+- Credential claims sit on the enforcing types; declaration, client options, and generated code read the same flag.
+
+### Fixes
+
+- `EndpointParam` impls cover the axum extractors handlers actually take: `String` (raw text body), `Form<T>`, `http::Method`/`Uri`/`Version`, `Body`, and `NestedPath` join the blanket set, and `axum::extract::Multipart` sits behind the new `axum-multipart` feature. Without these, `#[endpoint]`'s per-parameter assertion plus the orphan rule made a form, multipart, or plain-text handler impossible to register — a local newtype was the only way around. (No `Result<T, E>` impl: axum 0.8 has no Result extractor, so the shape cannot appear in a signature.)
+- the renewal helper brackets non-identifier names (`client["email-password"]["x-refresh"]()`): it built the call with the object-literal key emitter, so a hyphenated group or `.as_()`-renamed lifecycle route produced `client."email-password".exchange()` — not valid TypeScript, the generated file did not compile.
+- the renewal helper calls the route's top-level method when grouping is disabled: with `enable_groups: false` the flat emitter puts every method at the root, so a grouped lifecycle route made `refreshBearer` reference `client.auth.me()` — a property the flat client does not have (tsc failure, runtime TypeError). The `withOptions` collision check follows the same layout: flat mode flags a grouped route named after a helper (its method is top-level) and stops flagging a group name that creates no property; the warning names the property that actually collides.
+- `TokenFields` is re-exported: `AuthFlow::token_fields` is public, but its type was unnameable downstream.
+- the `params` module docs no longer show a non-compiling empty `impl EndpointParam` (stable Rust has no associated-type defaults) or mention a `MaybeAllowed` bound that does not exist; the README renewal example no longer hands `onUnauthorized` a proactive `renew` that can return a revoked-but-unexpired token (the transport does not re-send a rejected credential, so that 401 was terminal) — forced renewal (`renewNow`) is split from the proactive check, and the snippet's imports are real.
+
 ## 0.3.0
 
 ### Breaking changes

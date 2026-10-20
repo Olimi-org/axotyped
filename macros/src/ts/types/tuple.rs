@@ -41,6 +41,7 @@ pub(crate) fn tuple(attr: &StructAttr, ts_name: Expr, fields: &FieldsUnnamed) ->
         bound: attr.bound.clone(),
         ts_enum: None,
         is_enum: quote!(false),
+        wire_fields: None,
     })
 }
 
