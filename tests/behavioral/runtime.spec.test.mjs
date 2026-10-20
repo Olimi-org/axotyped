@@ -736,6 +736,59 @@ describe("executor: observers cannot consume the transport's body", () => {
     expect(result).toEqual({ value: 42 });
   });
 
+  test("a status-only observer does not hang a successful void call", async () => {
+    const log = [];
+    let observedStatus;
+    const t = createTransport(
+      opts(seqFetch([() => new Response("ok")], log), {
+        // Deliberately never reads or cancels the clone: the void path must
+        // not wait for the observer's copy before resolving.
+        onResponse: (_op, response) => {
+          observedStatus = response.status;
+        },
+      }),
+      POLICY,
+      OPS,
+    );
+    let timer;
+    const result = await Promise.race([
+      t.execute({ method: "POST", path: "/x", auth: "none", response: "void" }),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("void call hung")), 1000);
+      }),
+    ]);
+    clearTimeout(timer);
+    expect(result).toBeUndefined();
+    expect(observedStatus).toBe(200);
+  });
+
+  test("void resolution never depends on a teed body's cancel settling", async () => {
+    // Node (undici) keeps a branch cancel pending while its clone is
+    // unread, unlike bun, so a real Response cannot pin this invariant on
+    // every runner. Model the worst case: cancel never settles.
+    const response = {
+      ok: true,
+      status: 200,
+      clone: () => ({ ok: true, status: 200 }),
+      body: { cancel: () => new Promise(() => {}) },
+      arrayBuffer: async () => new ArrayBuffer(0),
+    };
+    const t = createTransport(
+      opts(() => response, { onResponse: () => {} }),
+      POLICY,
+      OPS,
+    );
+    let timer;
+    const result = await Promise.race([
+      t.execute({ method: "POST", path: "/x", auth: "none", response: "void" }),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("void call hung")), 1000);
+      }),
+    ]);
+    clearTimeout(timer);
+    expect(result).toBeUndefined();
+  });
+
   test("a throwing observer never breaks the call", async () => {
     const boom = () => {
       throw new Error("telemetry bug");
