@@ -8,7 +8,7 @@
 - **Proactive renewal, rotation persistence, and single-flight are the application's.** `singleFlight` and `jwtExpiry` are exported as stateless primitives for it.
 - **`-> token` now buys a generated renewal helper instead of wiring the transport.** `auth_scheme!` emits `refreshBearer(client)` (or `refreshSession(client)` for an oauth2 pair) that calls the declared route and lifts the declared fields off its response. Because the helper reads them off the *imported response type*, `tsc` checks every declared name against what the client will parse — replacing the runtime's uncheckable string-keyed extraction. `AUTH` is emitted as data for application glue; nothing in the runtime interprets it.
 - **A route or group named after a built-in client helper is reported.** `Object.assign` would overwrite the generated property, and calling it would derive a new client instead of sending the request.
-- Type export is built in; the `ts-rs` feature is gone. Drop `"ts-rs"` from features. Every type in a route contract implements `TS` (or mark the route `opaque()`).
+- Type export is built in; the `ts-rs` feature is gone. Drop `"ts-rs"` from features. Every type in a route contract implements `TS` (or mark the handler `#[endpoint(opaque)]` for an untyped route).
 - Every route uses `register!()` + `#[endpoint]`. Manual `.body()`/`.response()`/`.query()` overrides still apply to registered routes.
 - Every `#[endpoint]` extractor parameter declares authentication. Axum built-ins are covered by blanket impls. Custom extractors use `#[axotyped::credential]` or `#[axotyped::optional_credential]` and must be `pub`.
 - Private routes are checked at compile time. A handler without an enforcing extractor fails at the registration call. `ApiRouter` carries its scope as a type parameter (`PrivateScope` default, `PublicScope`/`PermissiveScope` in groups, `LayeredAuthScope` after `auth_layer`).
@@ -31,7 +31,7 @@
 - `AUTH` carries kind, refresh op, verbatim field names, `skewMs`, bootstrap/wsTicket/constants. `TRANSPORT` carries scheme and WS ticket wiring.
 - `-> token` (exchange) and `-> { access, refresh, expires_in }` (oauth2 members optional) generate a typed renewal helper — `refreshBearer(client)` / `refreshSession(client)` — that calls the declared route and lifts the fields off its response; `tsc` checks every declared name against the imported response type. Declared fields are also checked against `WireFields` wire names at the declaration site.
 - Routes the renewal helper cannot call (missing route, body/path/query inputs, untyped, ws/redirect) generate no helper and warn; renewal is whatever the application's `onUnauthorized` does.
-- `#[endpoint]` handlers returning `Response` skip response extraction. `RouteBuilder::opaque()` drops body/query/response metadata.
+- `#[endpoint]` handlers returning `Response` skip response extraction. `#[endpoint(opaque)]` opts out of type collection entirely: no body/query/response metadata, so the DTOs need not implement `TS` and the client method is untyped.
 - `WsRouteBuilder`/`RouteBuilder` forward `layer()`/`auth_layer()` mid-chain.
 - `RouteCollection::extend` adopts a flow when absent, panics on two flows, and re-validates the surviving flow against the merged table.
 - Lifecycle references must resolve to exactly one route; ambiguous names fail `build()`.

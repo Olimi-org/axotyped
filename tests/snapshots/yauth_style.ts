@@ -23,20 +23,20 @@ import type { WsParams } from "../../../../bindings/WsParams";
 
 export type * from "../../../../bindings";
 import {
-  ApiError,
-  RUNTIME_SPEC_VERSION,
-  createTransport,
-  type OperationSpec,
-  type Transport,
-  type TypedWebSocket,
+  ApiError as __AxoApiError,
+  RUNTIME_SPEC_VERSION as __AxoRuntimeSpecVersion,
+  createTransport as __AxoCreateTransport,
+  type OperationSpec as __AxoOperationSpec,
+  type Transport as __AxoTransport,
+  type TypedWebSocket as __AxoTypedWebSocket,
 } from "./generated-runtime";
 
-export { ApiError };
-export { ApiError as YAuthError };
+export { __AxoApiError as ApiError };
+export { __AxoApiError as YAuthError };
 export { jwtExpiry, singleFlight } from "./generated-runtime";
-export type { TypedWebSocket };
+export type { __AxoTypedWebSocket as TypedWebSocket };
 
-if (RUNTIME_SPEC_VERSION !== "0.4.0")
+if (__AxoRuntimeSpecVersion !== "0.4.0")
   throw new Error("client/runtime version drift — regenerate both files together");
 
 export const RUNTIME_VERSION = "0.4.0";
@@ -60,7 +60,7 @@ export const OPERATIONS = {
   "oauth.authorize": { method: "GET", path: "/oauth/{provider}/authorize", params: ["provider"], auth: "required", response: "void" },
   "oauth.callback": { method: "POST", path: "/oauth/{provider}/callback", params: ["provider"], auth: "none", body: "json", response: "json" },
   "realtime.wsUpgrade": { method: "GET", path: "/ws", auth: "required", response: "void", ws: true },
-} satisfies Record<string, OperationSpec>;
+} satisfies Record<string, __AxoOperationSpec>;
 
 export interface YAuthClientOptions {
   baseUrl: string;
@@ -69,9 +69,9 @@ export interface YAuthClientOptions {
   getToken?: () => Promise<string | null> | string | null;
   credentials?: RequestCredentials;
   fetch?: typeof fetch;
-  onError?: (error: ApiError) => void;
-  onRequest?: (op: Readonly<OperationSpec>, url: string) => void;
-  onResponse?: (op: Readonly<OperationSpec>, response: Response) => void;
+  onError?: (error: __AxoApiError) => void;
+  onRequest?: (op: Readonly<__AxoOperationSpec>, url: string) => void;
+  onResponse?: (op: Readonly<__AxoOperationSpec>, response: Response) => void;
   requestInit?: Omit<RequestInit, "headers" | "method" | "body"> & {
     headers?: Record<string, string>;
   };
@@ -84,7 +84,7 @@ export type YAuthClient = ReturnType<typeof createYAuthClientRoutes> & {
 };
 
 export function createYAuthClient(options: YAuthClientOptions): YAuthClient {
-  const transport = createTransport(
+  const transport = __AxoCreateTransport(
     { ...options, credentials: options.credentials ?? "include" },
     TRANSPORT,
     OPERATIONS,
@@ -97,7 +97,7 @@ export function createYAuthClient(options: YAuthClientOptions): YAuthClient {
   return Object.assign(routes, { withOptions });
 }
 
-function createYAuthClientRoutes(transport: Transport) {
+function createYAuthClientRoutes(transport: __AxoTransport) {
   return {
     getSession: () => transport.execute<SessionResponse>(OPERATIONS.getSession),
     logout: () => transport.execute<SuccessResponse>(OPERATIONS.logout),

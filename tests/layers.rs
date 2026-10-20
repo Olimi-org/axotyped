@@ -71,9 +71,9 @@ async fn send(router: axum::Router<AppState>, path: &str) -> StatusCode {
 async fn layer_gates_only_subsequent_routes_in_scope() {
     let router = ApiRouter::<AppState>::new()
         .get("/open", register!(ok_handler))
-        
         .layer(axum::middleware::from_fn(deny_short))
-        .get("/gated", register!(ok_handler)).as_("gated")
+        .get("/gated", register!(ok_handler))
+        .as_("gated")
         .build()
         .0;
 
@@ -102,7 +102,6 @@ async fn parent_layer_applies_to_later_groups() {
     // A layer added BEFORE entering a group must reach that group's routes.
     let router = ApiRouter::<AppState>::new()
         .get("/free", register!(ok_handler))
-        
         .layer(axum::middleware::from_fn(deny_short))
         .group_prefixed("admin", |g| g.get("/thing", register!(ok_handler)))
         .build()
@@ -156,9 +155,8 @@ async fn codegen_metadata_identical_with_and_without_layers() {
     let clean = {
         let (_, c): (_, RouteCollection) = ApiRouter::<AppState>::new()
             .get("/users/{id}", register!(ok_handler))
-            
-            .post("/users/{id}", register!(ok_handler)).as_("updateUser")
-            
+            .post("/users/{id}", register!(ok_handler))
+            .as_("updateUser")
             .build();
         c
     };
@@ -166,10 +164,9 @@ async fn codegen_metadata_identical_with_and_without_layers() {
     let layered = {
         let (_, c): (_, RouteCollection) = ApiRouter::<AppState>::new()
             .get("/users/{id}", register!(ok_handler))
-            
             .layer(axum::middleware::from_fn(deny_short))
-            .post("/users/{id}", register!(ok_handler)).as_("updateUser")
-            
+            .post("/users/{id}", register!(ok_handler))
+            .as_("updateUser")
             .build();
         c
     };

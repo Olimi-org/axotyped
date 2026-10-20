@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet,  HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 use std::path::{Component, Path};
 use std::process::Command;
@@ -51,7 +51,7 @@ pub struct GeneratorConfig {
     /// CSRF header for mutating requests under [`AuthScheme::Cookie`].
     /// `None` emits no CSRF plumbing. Ignored under other schemes.
     pub csrf_header_name: Option<String>,
-    }
+}
 
 impl Default for GeneratorConfig {
     fn default() -> Self {
@@ -473,10 +473,18 @@ fn refresh_helper(
 }
 
 /// Generates the parameter list for a route.
+///
+/// Path params are emitted under collision-proof JS names: a param named
+/// `transport` would otherwise shadow the `transport: Transport` closure
+/// binding (`(transport: string) => transport.execute(...)`), `OPERATIONS`
+/// would shadow the route table, and `body` / `query` would duplicate the
+/// body/query params. [`js_param_names`] maps wire names to safe locals;
+/// this renders the local side.
 fn generate_params(route: &RouteDefinition, large_int: &str) -> String {
+    let mapping = js_param_names(route);
     let mut params = Vec::new();
-    for param in &route.path_params {
-        params.push(format!("{}: string", param.name));
+    for (_, js) in &mapping {
+        params.push(format!("{js}: string"));
     }
     if let Some(ref body_type) = route.body_type {
         params.push(format!(
@@ -506,11 +514,16 @@ const INSECURE_HTTP_DOC: &str = r#"  /** Allow non-loopback http:// targets (dev
 "#;
 
 /// ClientOptions fields shared by every scheme.
+///
+/// Runtime types are referenced through their `__Axo*` aliases (see the
+/// runtime import block in `generate_client`): a user DTO named e.g.
+/// `Transport` or `OperationSpec` would otherwise collide with the runtime
+/// import of the same name.
 const OPTIONS_TAIL: &str = r#"  credentials?: RequestCredentials;
   fetch?: typeof fetch;
-  onError?: (error: ApiError) => void;
-  onRequest?: (op: Readonly<OperationSpec>, url: string) => void;
-  onResponse?: (op: Readonly<OperationSpec>, response: Response) => void;
+  onError?: (error: __AxoApiError) => void;
+  onRequest?: (op: Readonly<__AxoOperationSpec>, url: string) => void;
+  onResponse?: (op: Readonly<__AxoOperationSpec>, response: Response) => void;
   requestInit?: Omit<RequestInit, "headers" | "method" | "body"> & {
     headers?: Record<string, string>;
   };
@@ -649,10 +662,7 @@ fn safe_spec_path(path: &str, params: &[crate::types::PathParam]) -> String {
                                 seen.len() - 1
                             }
                         };
-                        let safe = params
-                            .get(idx)
-                            .map(|p| p.name.as_str())
-                            .unwrap_or(raw);
+                        let safe = params.get(idx).map(|p| p.name.as_str()).unwrap_or(raw);
                         out.push('{');
                         out.push_str(safe);
                         out.push('}');
@@ -703,23 +713,63 @@ fn operations_keys(routes: &RouteCollection) -> HashMap<(Option<String>, String)
     map
 }
 
-fn key_of(
-    keys: &HashMap<(Option<String>, String), String>,
-    route: &RouteDefinition,
-) -> String {
+fn key_of(keys: &HashMap<(Option<String>, String), String>, route: &RouteDefinition) -> String {
     keys.get(&(route.group.clone(), route.name.clone()))
         .cloned()
         .unwrap_or_else(|| route.name.clone())
+}
+
+/// JS-local names claimed by the generated route-method scope.
+///
+/// A route method closes over the factory's `transport` binding and the
+/// module-level `OPERATIONS` table, and declares `body` / `query` params of
+/// its own — a path param with any of those names would shadow or duplicate
+/// them (`/items/{transport}` used to emit `(transport: string) =>
+/// transport.execute(...)`). Wire names stay untouched; only locals are
+/// mangled, with `params: { wire: local }` mapping in [`call_args`].
+fn reserved_param_names() -> &'static [&'static str] {
+    &["transport", "TRANSPORT", "OPERATIONS", "body", "query"]
+}
+
+/// Maps each path param wire name to its JS-local name.
+///
+/// Returns `(wire_name, js_name)` pairs in path order. Names colliding with
+/// [`reserved_param_names`] (or with each other after mangling) gain trailing
+/// underscores until unique.
+fn js_param_names(route: &RouteDefinition) -> Vec<(String, String)> {
+    let reserved = reserved_param_names();
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    route
+        .path_params
+        .iter()
+        .map(|p| {
+            let wire = p.name.clone();
+            let mut candidate = wire.clone();
+            if reserved.contains(&candidate.as_str()) {
+                candidate.push('_');
+            }
+            while !used.insert(candidate.clone()) {
+                candidate.push('_');
+            }
+            (wire, candidate)
+        })
+        .collect()
 }
 
 /// The per-call argument bag a route method forwards to the executor.
 fn call_args(route: &RouteDefinition) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !route.path_params.is_empty() {
-        let names = route
-            .path_params
+        let mapping = js_param_names(route);
+        let names = mapping
             .iter()
-            .map(|p| p.name.clone())
+            .map(|(wire, js)| {
+                if wire == js {
+                    js.clone()
+                } else {
+                    format!("{wire}: {js}")
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
         parts.push(format!("params: {{ {names} }}"));
@@ -753,7 +803,10 @@ fn write_operations_table(
         }
         let mut fields = vec![
             format!("method: \"{}\"", route.method.as_str()),
-            format!("path: \"{}\"", safe_spec_path(&route.path, &route.path_params)),
+            format!(
+                "path: \"{}\"",
+                safe_spec_path(&route.path, &route.path_params)
+            ),
         ];
         if !route.path_params.is_empty() {
             let names = route
@@ -783,7 +836,7 @@ fn write_operations_table(
         }
         w!(out, "  {}: {{ {} }},", op_key(&key), fields.join(", "));
     }
-    w!(out, "}} satisfies Record<string, OperationSpec>;");
+    w!(out, "}} satisfies Record<string, __AxoOperationSpec>;");
     w!(out);
 }
 
@@ -805,7 +858,9 @@ fn auth_strategy_const(
     w!(s, "export const AUTH = {{");
     // Lifecycle references name routes; the table keys qualify them.
     let named = |name: &str| -> Option<String> {
-        routes.find_by_name(name).map(|r| key_of(keys, r).to_string())
+        routes
+            .find_by_name(name)
+            .map(|r| key_of(keys, r).to_string())
     };
     let refresh_key = flow
         .refresh
@@ -842,7 +897,11 @@ fn auth_strategy_const(
             }
             if !default_hook_blocked {
                 match &flow.token_fields {
-                    Some(crate::auth_flow::TokenFields::Pair { access, refresh, expires_in }) => {
+                    Some(crate::auth_flow::TokenFields::Pair {
+                        access,
+                        refresh,
+                        expires_in,
+                    }) => {
                         w!(s, "  fields: {{");
                         w!(s, "    access: \"{}\",", escape_js_string(access));
                         if let Some(f) = refresh {
@@ -880,19 +939,16 @@ fn auth_strategy_const(
         );
     }
     w!(s, "  }},");
-    w!(s, "}} as const satisfies AuthStrategy & FlowManifest;");
+    w!(
+        s,
+        "}} as const satisfies __AxoAuthStrategy & __AxoFlowManifest;"
+    );
     s
 }
 
 // ---------------------------------------------------------------------------
 // Code generation
 // ---------------------------------------------------------------------------
-
-/// Generates client source, discarding diagnostics.
-/// Use [`generate_with_warnings`] to surface configuration gaps.
-pub fn generate(routes: &RouteCollection, config: &GeneratorConfig) -> String {
-    generate_with_warnings(routes, config).0
-}
 
 /// Why the default refresh hook cannot bind to a flow's lifecycle route.
 enum DefaultHookBlocker {
@@ -926,24 +982,13 @@ fn default_hook_blocker(
     }
 }
 
-/// Generates client source plus diagnostics.
-pub fn generate_with_warnings(
-    routes: &RouteCollection,
-    config: &GeneratorConfig,
-) -> (String, Vec<String>) {
-    let mut warnings = Vec::new();
-
-    if let Some(flow) = routes.auth_flow() {
-        if config.auth_scheme != AuthScheme::Bearer {
-            warnings.push(format!(
-                "auth flow '{}' is declared but the client was generated with a \
-                 non-Bearer scheme; the declaration only drives Bearer lifecycle \
-                 machinery and is ignored here.",
-                flow.name
-            ));
-        }
-    }
-
+/// Generates client source.
+///
+/// Misconfigurations that would produce a broken or silently wrong client
+/// fail here instead of emitting diagnostics: generation runs on every
+/// codegen invocation, so a panic names the problem at the site that must
+/// be fixed.
+pub fn generate(routes: &RouteCollection, config: &GeneratorConfig) -> String {
     // Validate the default refresh route.
     if let Some(flow) = routes.auth_flow() {
         if config.auth_scheme == AuthScheme::Bearer && flow.token_fields.is_some() {
@@ -951,20 +996,21 @@ pub fn generate_with_warnings(
                 .refresh
                 .as_deref()
                 .or_else(|| flow.bootstrap.first().map(|s| s.as_str()));
-            let remedy = "supply your own onUnauthorized";
+            let remedy = "declare a callable lifecycle route or supply your own onUnauthorized";
             match default_hook_blocker(flow, routes) {
                 None => {}
-                Some(DefaultHookBlocker::NotRegistered) => warnings.push(format!(
+                Some(DefaultHookBlocker::NotRegistered) => panic!(
                     "auth flow '{}': token fields declared but their route is \
-                     not registered — no renewal helper is generated; {remedy}.",
+                     not registered — no renewal helper can be generated; {remedy}.",
                     flow.name
-                )),
+                ),
                 Some(blocker) => {
                     let r = route_name
                         .and_then(|name| routes.find_by_name(name))
                         .expect("route exists");
-                    warnings.push(format!(
-                        "auth flow '{}': the lifecycle route '{}' {}; {remedy}.",
+                    panic!(
+                        "auth flow '{}': the lifecycle route '{}' {}; no renewal \
+                         helper can be generated; {remedy}.",
                         flow.name,
                         r.name,
                         match blocker {
@@ -990,17 +1036,19 @@ pub fn generate_with_warnings(
                                 unreachable!("handled above")
                             }
                         }
-                    ));
+                    );
                 }
             }
         }
     }
 
     for route in routes.iter().filter(|r| r.websocket && !has_ws_contract(r)) {
-        warnings.push(format!(
-            "route '{}': [ws] without declared event types generates no client method.",
+        panic!(
+            "route '{}': [ws] without declared event types — the route would \
+             generate no client method. Call .events::<Send, Receive>() on it, \
+             or register the raw socket outside the route table.",
             route.name
-        ));
+        );
     }
 
     // Closed-world check. The client object is the route table plus the
@@ -1018,10 +1066,13 @@ pub fn generate_with_warnings(
                 Some(g) if config.enable_groups => {
                     (CLIENT_HELPERS.contains(&g.as_str()), g.clone())
                 }
-                _ => (CLIENT_HELPERS.contains(&route.name.as_str()), route.name.clone()),
+                _ => (
+                    CLIENT_HELPERS.contains(&route.name.as_str()),
+                    route.name.clone(),
+                ),
             };
             if collide && reported.insert((route.group.clone(), route.name.clone())) {
-                warnings.push(format!(
+                panic!(
                     "route '{}'{} collides with the client's built-in `{helper}` helper — the \
                      generated property would be overwritten by it, and calling it would derive \
                      a new client instead of sending the request. Rename with .as_().",
@@ -1031,7 +1082,7 @@ pub fn generate_with_warnings(
                         Some(g) => format!(" in group '{g}'"),
                     },
                     helper = property,
-                ));
+                );
             }
         };
         for route in routes.iter() {
@@ -1056,45 +1107,32 @@ pub fn generate_with_warnings(
 
     for route in routes.iter().filter(|r| r.is_credentialed()) {
         if route.declared == Visibility::Public {
-            warnings.push(format!(
+            panic!(
                 "route '{}': declared public but sits behind an auth layer.",
                 route.name
-            ));
-            continue;
+            );
         }
         if route.is_permissive() {
             continue;
         }
         match config.auth_scheme {
-            AuthScheme::None => warnings.push(format!(
-                "route '{}': authenticated route with auth_scheme \"none\".",
-                route.name
-            )),
             AuthScheme::Bearer
-                if route.websocket
-                    && !routes
-                        .auth_flow()
-                        .is_some_and(|f| f.ws_ticket.is_some()) =>
+                if route.websocket && routes.auth_flow().is_some_and(|f| f.ws_ticket.is_none()) =>
             {
-                warnings.push(format!(
+                panic!(
                     "route '{}': [ws][auth] without a ws_ticket mint. Declare \
                      `ws_ticket: register!(...)` in auth_scheme!.",
                     route.name
-                ));
+                );
             }
             _ => {}
         }
     }
 
-    let out = generate_client(routes, config, &mut warnings);
-    (out, warnings)
+    generate_client(routes, config)
 }
 
-fn generate_client(
-    routes: &RouteCollection,
-    config: &GeneratorConfig,
-    warnings: &mut Vec<String>,
-) -> String {
+fn generate_client(routes: &RouteCollection, config: &GeneratorConfig) -> String {
     let mut out = String::new();
 
     // Header
@@ -1140,18 +1178,22 @@ fn generate_client(
         .iter()
         .any(|r| r.websocket && r.ws_send_type.is_some() && r.ws_receive_type.is_some());
 
+    // Runtime imports are aliased (`__Axo*`): user DTOs are imported by
+    // their plain names just above, so a response/request type named e.g.
+    // `Transport` or `OperationSpec` would otherwise produce two imports
+    // with the same local name and break TypeScript checking.
     w!(out, "import {{");
-    w!(out, "  ApiError,");
-    w!(out, "  RUNTIME_SPEC_VERSION,");
-    w!(out, "  createTransport,");
-    w!(out, "  type OperationSpec,");
-    w!(out, "  type Transport,");
+    w!(out, "  ApiError as __AxoApiError,");
+    w!(out, "  RUNTIME_SPEC_VERSION as __AxoRuntimeSpecVersion,");
+    w!(out, "  createTransport as __AxoCreateTransport,");
+    w!(out, "  type OperationSpec as __AxoOperationSpec,");
+    w!(out, "  type Transport as __AxoTransport,");
     if has_flow {
-        w!(out, "  type AuthStrategy,");
-        w!(out, "  type FlowManifest,");
+        w!(out, "  type AuthStrategy as __AxoAuthStrategy,");
+        w!(out, "  type FlowManifest as __AxoFlowManifest,");
     }
     if has_typed_ws {
-        w!(out, "  type TypedWebSocket,");
+        w!(out, "  type TypedWebSocket as __AxoTypedWebSocket,");
     }
     w!(
         out,
@@ -1159,11 +1201,11 @@ fn generate_client(
         runtime = runtime_import(config)
     );
     w!(out);
-    w!(out, "export {{ ApiError }};");
+    w!(out, "export {{ __AxoApiError as ApiError }};");
     if config.error_class_name != "ApiError" {
         w!(
             out,
-            "export {{ ApiError as {err} }};",
+            "export {{ __AxoApiError as {err} }};",
             err = config.error_class_name
         );
     }
@@ -1179,15 +1221,21 @@ fn generate_client(
         );
     }
     if has_typed_ws {
-        w!(out, "export type {{ TypedWebSocket }};");
+        w!(
+            out,
+            "export type {{ __AxoTypedWebSocket as TypedWebSocket }};"
+        );
     }
     w!(out);
     w!(
         out,
-        "if (RUNTIME_SPEC_VERSION !== \"{version}\")",
+        "if (__AxoRuntimeSpecVersion !== \"{version}\")",
         version = env!("CARGO_PKG_VERSION")
     );
-    w!(out, "  throw new Error(\"client/runtime version drift — regenerate both files together\");");
+    w!(
+        out,
+        "  throw new Error(\"client/runtime version drift — regenerate both files together\");"
+    );
     w!(out);
     w!(
         out,
@@ -1195,9 +1243,8 @@ fn generate_client(
         version = env!("CARGO_PKG_VERSION")
     );
     let op_keys = operations_keys(routes);
-    let named_key = |name: &str| -> Option<String> {
-        routes.find_by_name(name).map(|r| key_of(&op_keys, r))
-    };
+    let named_key =
+        |name: &str| -> Option<String> { routes.find_by_name(name).map(|r| key_of(&op_keys, r)) };
     let ticket_ref = routes
         .auth_flow()
         .and_then(|f| f.ws_ticket.clone())
@@ -1247,17 +1294,17 @@ fn generate_client(
         out.push_str(&helper);
         w!(out);
     }
-    w!(out, "export function {factory}(options: {opts_name}): {type_name} {{");
+    w!(
+        out,
+        "export function {factory}(options: {opts_name}): {type_name} {{"
+    );
     let csrf_field = match config.csrf_header_name.as_deref() {
         Some(name) if config.auth_scheme == AuthScheme::Cookie => {
             format!(", csrfHeader: \"{}\"", escape_js_string(name))
         }
         _ => String::new(),
     };
-    w!(
-        out,
-        "  const transport = createTransport("
-    );
+    w!(out, "  const transport = __AxoCreateTransport(");
     w!(
         out,
         "    {{ ...options, credentials: options.credentials ?? \"{creds}\"{csrf} }},",
@@ -1278,11 +1325,14 @@ fn generate_client(
     w!(out, "  return Object.assign(routes, {{ withOptions }});");
     w!(out, "}}");
     w!(out);
-    w!(out, "function {factory}Routes(transport: Transport) {{");
+    w!(
+        out,
+        "function {factory}Routes(transport: __AxoTransport) {{"
+    );
     w!(out, "  return {{");
 
     if config.enable_groups {
-        generate_grouped_routes(&mut out, routes, config, &op_keys, warnings);
+        generate_grouped_routes(&mut out, routes, config, &op_keys);
     } else {
         generate_flat_routes(&mut out, routes, config, &op_keys);
     }
@@ -1300,7 +1350,6 @@ fn generate_grouped_routes(
     routes: &RouteCollection,
     config: &GeneratorConfig,
     op_keys: &HashMap<(Option<String>, String), String>,
-    warnings: &mut Vec<String>,
 ) {
     let mut ungrouped: Vec<&RouteDefinition> = Vec::new();
     let mut groups: BTreeMap<String, Vec<&RouteDefinition>> = BTreeMap::new();
@@ -1315,10 +1364,13 @@ fn generate_grouped_routes(
     // Lifecycle routes also surface under an `auth` namespace.
     if config.auth_scheme == AuthScheme::Bearer {
         if let Some(flow) = routes.auth_flow() {
-            if routes.routes().iter().any(|r| r.group.is_none() && r.name == "auth") {
-                warnings.push(
+            if routes
+                .routes()
+                .iter()
+                .any(|r| r.group.is_none() && r.name == "auth")
+            {
+                panic!(
                     "route 'auth' collides with the flow's auth namespace. Rename the route with .as_()."
-                        .to_string(),
                 );
             } else {
                 let entry = groups.entry("auth".to_string()).or_default();
@@ -1366,15 +1418,27 @@ fn generate_grouped_routes(
 }
 
 /// Generates routes without grouping.
+///
+/// Method names share one top-level object here (unlike the grouped layout,
+/// where groups namespace them), so a duplicate name would emit an invalid
+/// object literal — or, in plain JS, silently shadow the first endpoint.
 fn generate_flat_routes(
     out: &mut String,
     routes: &RouteCollection,
     config: &GeneratorConfig,
     op_keys: &HashMap<(Option<String>, String), String>,
 ) {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
     for route in routes {
         if route.websocket && !has_ws_contract(route) {
             continue;
+        }
+        if !seen.insert(route.name.as_str()) {
+            panic!(
+                "route '{}': duplicate method name with enable_groups = false — the \
+                 flat client would emit a duplicate key. Rename with .as_().",
+                route.name
+            );
         }
         write!(out, "    ").unwrap();
         generate_route_method(out, route, 4, config, op_keys);
@@ -1398,8 +1462,14 @@ fn generate_route_method(
         let params = generate_params(route, large_int);
         let pad = " ".repeat(indent + 2);
         emit_method_name(out, &route.name);
-        let send_ts = rust_type_to_ts_with(route.ws_send_type.as_deref().unwrap_or("ClientEvent"), large_int);
-        let recv_ts = rust_type_to_ts_with(route.ws_receive_type.as_deref().unwrap_or("ServerEvent"), large_int);
+        let send_ts = rust_type_to_ts_with(
+            route.ws_send_type.as_deref().unwrap_or("ClientEvent"),
+            large_int,
+        );
+        let recv_ts = rust_type_to_ts_with(
+            route.ws_receive_type.as_deref().unwrap_or("ServerEvent"),
+            large_int,
+        );
         if params.is_empty() {
             write!(
                 out,
@@ -1419,7 +1489,11 @@ fn generate_route_method(
         if params.is_empty() {
             write!(out, ": () => transport.urlFor(OPERATIONS{key}{args})").unwrap();
         } else {
-            write!(out, ": ({params}) => transport.urlFor(OPERATIONS{key}{args})").unwrap();
+            write!(
+                out,
+                ": ({params}) => transport.urlFor(OPERATIONS{key}{args})"
+            )
+            .unwrap();
         }
     } else {
         let params = generate_params(route, large_int);

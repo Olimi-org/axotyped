@@ -21,8 +21,7 @@ use axotyped::{AuthScheme, GeneratorConfig};
 
 // --- fixture: an oauth2 pair flow with the full machinery -------------------
 
-#[derive(serde::Serialize)]
-#[derive(axotyped::TS)]
+#[derive(serde::Serialize, axotyped::TS)]
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
@@ -31,7 +30,11 @@ struct TokenResponse {
 
 #[axotyped::endpoint]
 async fn exchange_tokens() -> axum::Json<TokenResponse> {
-    axum::Json(TokenResponse { access_token: String::new(), refresh_token: None, expires_in: None })
+    axum::Json(TokenResponse {
+        access_token: String::new(),
+        refresh_token: None,
+        expires_in: None,
+    })
 }
 
 #[axotyped::credential]
@@ -54,8 +57,7 @@ async fn private_thing(_auth: TestAuth) {}
 
 // --- fixture: a bearer-kind flow (engine persistence) ------------------------
 
-#[derive(serde::Serialize)]
-#[derive(axotyped::TS)]
+#[derive(serde::Serialize, axotyped::TS)]
 struct MeResponse {
     authenticated: bool,
     token: Option<String>,
@@ -63,7 +65,10 @@ struct MeResponse {
 
 #[axotyped::endpoint(permissive)]
 async fn me() -> axum::Json<MeResponse> {
-    axum::Json(MeResponse { authenticated: false, token: None })
+    axum::Json(MeResponse {
+        authenticated: false,
+        token: None,
+    })
 }
 
 axotyped::auth_scheme! {

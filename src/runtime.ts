@@ -290,6 +290,31 @@ export function createTransport(
   const boundFetch =
     options.fetch !== undefined ? options.fetch : globalThis.fetch.bind(globalThis);
 
+  // Best-effort observer dispatch: the `void` callback types accept async
+  // functions, whose rejections a surrounding try/catch cannot see. Swallow
+  // both sync throws and async rejections without delaying the request —
+  // observers observe, they never break the call.
+  function notifyObserver(fn: () => unknown): void {
+    try {
+      const result = fn();
+      if (result instanceof Promise) result.catch(() => {});
+    } catch {
+      /* telemetry is not the call */
+    }
+  }
+
+  // Release a discarded response's connection for reuse. Node's fetch
+  // (undici) only returns pooled sockets once the body is consumed or
+  // cancelled; a replayed 401 or an unread `void` body would otherwise pin
+  // its connection until garbage collection.
+  async function releaseBody(response: Response): Promise<void> {
+    try {
+      await response.body?.cancel();
+    } catch {
+      /* best-effort */
+    }
+  }
+
   function interpolate(op: Readonly<OperationSpec>, args: CallArgs | undefined): string {
     if (!op.path.includes("{")) return op.path;
     const values = args?.params ?? {};
@@ -377,13 +402,9 @@ export function createTransport(
       credentials,
     });
 
-    // Best-effort observers: a throwing callback never takes the request
-    // down with it.
-    try {
-      options.onRequest?.(op, url);
-    } catch {
-      /* telemetry is not the call */
-    }
+    // Best-effort observers: a throwing (or rejecting) callback never takes
+    // the request down with it.
+    notifyObserver(() => options.onRequest?.(op, url));
 
     // Bearer actually sent with this call, so the replay path can refuse to
     // re-send the credential the server just rejected.
@@ -473,6 +494,9 @@ export function createTransport(
           fresh = null;
         }
         if (fresh !== null && fresh !== sentBearer) {
+          // The rejected response is discarded by the replay — release its
+          // connection before re-sending.
+          await releaseBody(response);
           return executeInternal<T>(op, args, {
             replays: (internal?.replays ?? 0) + 1,
             tokenOverride: fresh,
@@ -490,28 +514,23 @@ export function createTransport(
         message = text;
       }
       const error = new ApiError(message, response.status, errorBody);
-      // Best-effort: an error observer throwing must not mask the real
-      // ApiError on its way out.
-      try {
-        options.onError?.(error);
-      } catch {
-        /* telemetry is not the call */
-      }
+      // Best-effort: an error observer throwing (or rejecting) must not
+      // mask the real ApiError on its way out.
+      notifyObserver(() => options.onError?.(error));
       throw error;
     }
 
     // Observers observe, never consume, never break: hand onResponse its
     // own clone so a telemetry body read can't starve the transport's
     // parse below (the clone argument only evaluates when an observer is
-    // configured), and let a throwing observer fail alone.
-    try {
-      options.onResponse?.(op, response.clone());
-    } catch {
-      /* telemetry is not the call */
-    }
+    // configured), and let a throwing or rejecting observer fail alone.
+    notifyObserver(() => options.onResponse?.(op, response.clone()));
 
     if (op.response === "raw") return response as unknown as T;
-    if (op.response === "void") return undefined as T;
+    if (op.response === "void") {
+      await releaseBody(response);
+      return undefined as T;
+    }
     const text = await response.text();
     return (text ? JSON.parse(text) : undefined) as T;
   }

@@ -242,26 +242,23 @@ pub trait AllowsRoute<S, EH, T> {}
 impl<S, EH, T> AllowsRoute<S, EH, T> for PublicScope
 where
     EH: crate::IntoEndpointHandler<S, T>,
-    <<EH as crate::IntoEndpointHandler<S, T>>::Meta as crate::EndpointMeta>::ParamCredentials: AuthFlag<
-        Ok = NotAllowed,
-    >,
+    <<EH as crate::IntoEndpointHandler<S, T>>::Meta as crate::EndpointMeta>::ParamCredentials:
+        AuthFlag<Ok = NotAllowed>,
 {
 }
 impl<S, EH, T> AllowsRoute<S, EH, T> for PermissiveScope
 where
     EH: crate::IntoEndpointHandler<S, T>,
-    <<EH as crate::IntoEndpointHandler<S, T>>::Meta as crate::EndpointMeta>::ParamCredentials: AuthFlag<
-        Ok = NotAllowed,
-    >,
+    <<EH as crate::IntoEndpointHandler<S, T>>::Meta as crate::EndpointMeta>::ParamCredentials:
+        AuthFlag<Ok = NotAllowed>,
 {
 }
 impl<S, EH, T> AllowsRoute<S, EH, T> for LayeredAuthScope {}
 impl<S, EH, T> AllowsRoute<S, EH, T> for PrivateScope
 where
     EH: crate::IntoEndpointHandler<S, T>,
-    <<EH as crate::IntoEndpointHandler<S, T>>::Meta as crate::EndpointMeta>::Authorization: AuthFlag<
-        Ok = Allowed,
-    >,
+    <<EH as crate::IntoEndpointHandler<S, T>>::Meta as crate::EndpointMeta>::Authorization:
+        AuthFlag<Ok = Allowed>,
 {
 }
 

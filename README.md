@@ -399,9 +399,8 @@ CI: `cargo test check_ts_client` fails if the committed file is stale.
   via `ClientOptions.csrfToken`. Cross-origin `baseUrl` requires
   `credentials: "include"` (plus compatible CORS and `SameSite=None; Secure`
   cookies) — `"same-origin"` never sends cookies cross-origin.
-- **`AuthScheme::None`** — no auth machinery is generated. Authenticated
-  routes produce diagnostics from `generate_with_warnings()`, since their
-  requests will carry no credentials.
+- **`AuthScheme::None`** — no auth machinery is generated, and authenticated
+  routes' requests will carry no credentials.
 
 ### Server-derived auth metadata
 

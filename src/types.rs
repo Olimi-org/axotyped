@@ -58,7 +58,7 @@ pub struct RouteDefinition {
     pub visibility: Visibility,
     /// Declaration-site visibility. Differs from `visibility` when an
     /// `auth_layer` in scope forces a declared-public route to `Private`
-    /// (reported by `generate_with_warnings`).
+    /// (client generation fails on the contradiction).
     pub declared: Visibility,
     /// Rust type name of the request body (stringified via `stringify!()`).
     pub body_type: Option<String>,
@@ -242,7 +242,10 @@ impl RouteCollection {
         // Re-validate: each side was validated against its own routes only.
         if let Some(flow) = &self.auth_flow {
             if let Err(e) = flow.validate(&self.routes) {
-                panic!("auth_scheme '{}': merged route table invalidates the flow: {e}", flow.name);
+                panic!(
+                    "auth_scheme '{}': merged route table invalidates the flow: {e}",
+                    flow.name
+                );
             }
         }
     }

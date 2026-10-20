@@ -34,6 +34,17 @@ use syn::{FnArg, ItemFn, PathArguments, ReturnType, Type, parse_macro_input};
 /// credentials (the scope-wide alternatives are [`ApiRouter::group_public`]
 /// / `group_permissive` on the builder).
 ///
+/// # Opaque routes
+///
+/// `#[endpoint(opaque)]` opts out of TypeScript collection for the route:
+/// no `__c.register::<T>()` calls are emitted and no body/query/response
+/// types are recorded, so the handler's DTOs need not implement `TS`.
+/// The generated client treats the route as untyped (`void`). This is the
+/// declaration-site opt-out for routes the typed fetch-client must not
+/// carry a contract for — browser-navigation legs (login redirects, OAuth
+/// callbacks) and third-party webhooks. Combines with the other options,
+/// e.g. `#[endpoint(public, opaque)]`.
+///
 ///
 /// # Extracted types
 ///
@@ -46,11 +57,12 @@ use syn::{FnArg, ItemFn, PathArguments, ReturnType, Type, parse_macro_input};
 pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
 
-    // Options: `#[endpoint]`, a visibility (`public` | `permissive`), and/or
-    // `allow_redirects`. Anything else is a compile error.
+    // Options: `#[endpoint]`, a visibility (`public` | `permissive`),
+    // `allow_redirects`, and/or `opaque`. Anything else is a compile error.
     let mut is_public = false;
     let mut is_permissive = false;
     let mut allow_redirects = false;
+    let mut is_opaque = false;
     let mut expect_ident = true;
     let mut any_token = false;
     for tt in attr {
@@ -61,13 +73,12 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
                     "public" if !is_public && !is_permissive => is_public = true,
                     "permissive" if !is_public && !is_permissive => is_permissive = true,
                     "allow_redirects" if !allow_redirects => allow_redirects = true,
+                    "opaque" if !is_opaque => is_opaque = true,
                     _ => return endpoint_attr_error(),
                 }
                 expect_ident = false;
             }
-            proc_macro::TokenTree::Punct(p)
-                if p.as_char() == ',' && !expect_ident =>
-            {
+            proc_macro::TokenTree::Punct(p) if p.as_char() == ',' && !expect_ident => {
                 expect_ident = true
             }
             _ => return endpoint_attr_error(),
@@ -148,8 +159,12 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
         {}
     };
 
+    // `opaque` skips type collection entirely: neither the `type_string`
+    // recordings nor the `register::<T>()` calls (whose `TS` bound would
+    // otherwise fail the build for non-`TS` DTOs). The route generates
+    // as untyped.
     let body_register = match &body_type {
-        Some(t) => {
+        Some(t) if !is_opaque => {
             let inner = unwrap_container_types(t);
             quote! {
                 __def.body_type = Some(::axotyped::__private::type_string::<#t>());
@@ -157,11 +172,11 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #(__c.register::<#inner>();)*
             }
         }
-        None => quote! {},
+        _ => quote! {},
     };
 
     let query_register = match &query_type {
-        Some(t) => {
+        Some(t) if !is_opaque => {
             let inner = unwrap_container_types(t);
             quote! {
                 __def.query_type = Some(::axotyped::__private::type_string::<#t>());
@@ -169,11 +184,11 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #(__c.register::<#inner>();)*
             }
         }
-        None => quote! {},
+        _ => quote! {},
     };
 
     let response_register = match &response_type {
-        Some(t) => {
+        Some(t) if !is_opaque => {
             let inner = unwrap_container_types(t);
             quote! {
                 __def.response_type = Some(::axotyped::__private::type_string::<#t>());
@@ -181,7 +196,7 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #(__c.register::<#inner>();)*
             }
         }
-        None => quote! {},
+        _ => quote! {},
     };
 
     // Record declared and effective visibility; redirect-following is
@@ -249,8 +264,8 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
 fn endpoint_attr_error() -> TokenStream {
     quote! {
         compile_error!(
-            "axotyped: #[endpoint] accepts at most a visibility (`public` | `permissive`) \
-             and `allow_redirects` — e.g. #[endpoint(public, allow_redirects)]"
+            "axotyped: #[endpoint] accepts at most a visibility (`public` | `permissive`), \
+             `allow_redirects`, and `opaque` — e.g. #[endpoint(public, allow_redirects)]"
         );
     }
     .into()
@@ -521,12 +536,21 @@ fn extract_generic_from_type<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a Type
     }
 }
 
-
 /// Extractor names with `EndpointParam` blanket impls — skipped by the
 /// authorization fold. Must stay in sync with `src/params.rs`.
 const KNOWN_AMBIENT_EXTRACTORS: &[&str] = &[
-    "State", "Json", "Query", "Path", "Extension", "HeaderMap", "Request",
-    "RawQuery", "MatchedPath", "OriginalUri", "ConnectInfo", "WebSocketUpgrade",
+    "State",
+    "Json",
+    "Query",
+    "Path",
+    "Extension",
+    "HeaderMap",
+    "Request",
+    "RawQuery",
+    "MatchedPath",
+    "OriginalUri",
+    "ConnectInfo",
+    "WebSocketUpgrade",
     "Option",
 ];
 

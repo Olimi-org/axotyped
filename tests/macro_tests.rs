@@ -288,8 +288,14 @@ fn public_flag_opts_out_of_auth() {
         healthCheck: GET "/health" [public];
         deleteItem: DELETE "/items/{id}";
     };
-    assert!(!routes.routes()[0].is_credentialed(), "[public] must clear auth");
-    assert!(routes.routes()[1].is_credentialed(), "unflagged routes stay private");
+    assert!(
+        !routes.routes()[0].is_credentialed(),
+        "[public] must clear auth"
+    );
+    assert!(
+        routes.routes()[1].is_credentialed(),
+        "unflagged routes stay private"
+    );
 }
 
 mod endpoint_visibility {
@@ -363,12 +369,14 @@ mod endpoint_visibility {
         let (_router, routes) = ApiRouter::<()>::new()
             .get("/feed", axotyped::register!(feed))
             .as_("feed")
-            
             .build();
         let r = &routes.routes()[0];
         assert_eq!(r.visibility, Visibility::Permissive);
         assert_eq!(r.declared, Visibility::Permissive);
-        assert!(r.is_credentialed(), "permissive stays credentialed for guard/cache");
+        assert!(
+            r.is_credentialed(),
+            "permissive stays credentialed for guard/cache"
+        );
     }
 }
 

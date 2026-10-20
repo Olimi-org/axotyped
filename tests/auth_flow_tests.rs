@@ -109,8 +109,7 @@ fn missing_reference_fails_build() {
 }
 
 /// Input-taking ticket mint.
-#[derive(serde::Deserialize)]
-#[derive(axotyped::TS)]
+#[derive(serde::Deserialize, axotyped::TS)]
 struct TicketScopeQuery {
     _scope: String,
 }
@@ -141,7 +140,10 @@ fn ws_ticket_must_be_private() {
         .auth_flow(StaticToken::flow())
         .post("/ws/ticket", axotyped::register!(issue_ticket))
         .build();
-    assert_eq!(collection.auth_flow().unwrap().ws_ticket.as_deref(), Some("issueTicket"));
+    assert_eq!(
+        collection.auth_flow().unwrap().ws_ticket.as_deref(),
+        Some("issueTicket")
+    );
 
     // …a public mint is a credential pathway hole and fails fast. A
     // credential-requiring mint in a public group no longer compiles at
@@ -253,11 +255,23 @@ fn lifecycle_machinery_emitted_when_flow_declared() {
     assert!(out.contains("export const AUTH"), "strategy const");
     assert!(out.contains("kind: \"exchange\""), "kind label");
     assert!(out.contains("bootstrap: [\"me\"]"), "bootstrap refs");
-    assert!(out.contains("\"issuer\": \"https://sso.example.com\""), "constant (quoted key)");
-    assert!(out.contains("\"clientId\": \"client_123\""), "camelCased constant key, quoted");
+    assert!(
+        out.contains("\"issuer\": \"https://sso.example.com\""),
+        "constant (quoted key)"
+    );
+    assert!(
+        out.contains("\"clientId\": \"client_123\""),
+        "camelCased constant key, quoted"
+    );
     // The transport takes facts and a token source — no lifecycle bundle.
-    assert!(out.contains("getToken?:"), "bearer source is named by the app");
-    assert!(out.contains("onUnauthorized?:"), "renewal policy is the app's");
+    assert!(
+        out.contains("getToken?:"),
+        "bearer source is named by the app"
+    );
+    assert!(
+        out.contains("onUnauthorized?:"),
+        "renewal policy is the app's"
+    );
     // One bearer source per client: `getToken` is the only one.
     assert_eq!(
         out.matches("getToken?:").count(),
@@ -306,10 +320,16 @@ fn typed_renewal_helper_is_generated_from_declared_fields() {
         out.contains("const res = await client.exchange();"),
         "helper calls the typed route method: {out}"
     );
-    assert!(out.contains("return res.token ?? null;"), "field read: {out}");
+    assert!(
+        out.contains("return res.token ?? null;"),
+        "field read: {out}"
+    );
     // And the declaration still lands as data for app glue.
     assert!(out.contains("export const AUTH"), "strategy const");
-    assert!(out.contains("field: \"token\""), "declared field kept: {out}");
+    assert!(
+        out.contains("field: \"token\""),
+        "declared field kept: {out}"
+    );
 }
 
 /// A non-identifier wire field must not be emitted as dot access.
@@ -365,7 +385,10 @@ fn oauth2_pair_helper_lifts_every_declared_field() {
         out.contains("export async function refreshSession(client: ApiClient)"),
         "pair helper signature: {out}"
     );
-    assert!(out.contains("access: res.access_token,"), "access lift: {out}");
+    assert!(
+        out.contains("access: res.access_token,"),
+        "access lift: {out}"
+    );
     assert!(
         out.contains("refresh: res.refresh_token ?? null,"),
         "refresh normalises absent to null: {out}"
@@ -421,7 +444,10 @@ fn flow_ws_ticket_wires_the_handshake() {
         .split("} satisfies")
         .next()
         .unwrap();
-    assert!(table.contains("\"/ws/ticket\""), "ticket op in table: {table}");
+    assert!(
+        table.contains("\"/ws/ticket\""),
+        "ticket op in table: {table}"
+    );
     // The fixture's ticket route is untyped: the handshake still extracts
     // `{ticket}` from the body, so the descriptor must parse JSON.
     assert!(
@@ -435,8 +461,14 @@ fn flow_ws_ticket_wires_the_handshake() {
     // static_bearer declares no renewal: no lifecycle surface exists, so
     // getToken remains the bearer source — the one-source rule follows the
     // declaration, not the scheme.
-    assert!(out.contains("getToken?"), "static flow keeps getToken: {out}");
-    assert!(!out.contains("auth?:"), "no lifecycle surface on static_bearer");
+    assert!(
+        out.contains("getToken?"),
+        "static flow keeps getToken: {out}"
+    );
+    assert!(
+        !out.contains("auth?:"),
+        "no lifecycle surface on static_bearer"
+    );
 }
 
 #[test]
@@ -444,13 +476,10 @@ fn oauth2_without_declared_fields_still_emits_a_strategy() {
     // No `-> { ... }`: the declaration carries no field names, so no helper
     // can be generated — but the emitted AUTH must still satisfy the
     // runtime's type (fields optional).
-    let flow = axotyped::AuthFlow::new("X", axotyped::AuthFlowKind::OAuth2)
-        .bootstrap_named("me");
+    let flow = axotyped::AuthFlow::new("X", axotyped::AuthFlowKind::OAuth2).bootstrap_named("me");
     let (_router, collection) = axotyped::ApiRouter::<()>::new()
         .auth_flow(flow)
-        .group_public("auth", |g| {
-            g.get("/me", axotyped::register!(me))
-        })
+        .group_public("auth", |g| g.get("/me", axotyped::register!(me)))
         .build();
 
     let out = generate(&collection, &config());
@@ -466,21 +495,23 @@ fn no_flow_keeps_plain_bearer_emission() {
         .build();
 
     let out = generate(&collection, &config());
-    assert!(!out.contains("export const AUTH"), "no strategy without a flow");
+    assert!(
+        !out.contains("export const AUTH"),
+        "no strategy without a flow"
+    );
     assert!(out.contains("getToken?"), "plain bearer token source");
 }
 
-
 #[test]
-fn flow_under_non_bearer_scheme_warns() {
+fn flow_under_non_bearer_scheme_generates_without_lifecycle_machinery() {
     let cfg = GeneratorConfig {
         auth_scheme: AuthScheme::Cookie,
         ..Default::default()
     };
-    let (_out, warnings) = axotyped::generate_with_warnings(&flow_collection(), &cfg);
+    let out = axotyped::generate(&flow_collection(), &cfg);
     assert!(
-        warnings.iter().any(|w| w.contains("non-Bearer")),
-        "warnings: {warnings:?}"
+        !out.contains("export async function refreshBearer"),
+        "non-Bearer scheme emits no renewal helper: {out}"
     );
 }
 
@@ -488,8 +519,7 @@ fn flow_under_non_bearer_scheme_warns() {
 
 /// Response carrying the bearer — `token` is `Option<String>`: anonymous
 /// answers `null`, and the helper maps that to "no token" for the app.
-#[derive(serde::Serialize)]
-#[derive(axotyped::TS)]
+#[derive(serde::Serialize, axotyped::TS)]
 struct MeResponse {
     authenticated: bool,
     token: Option<String>,
@@ -497,11 +527,13 @@ struct MeResponse {
 
 #[axotyped::endpoint(permissive)]
 async fn me_typed() -> axum::Json<MeResponse> {
-    axum::Json(MeResponse { authenticated: false, token: None })
+    axum::Json(MeResponse {
+        authenticated: false,
+        token: None,
+    })
 }
 
-#[derive(serde::Deserialize)]
-#[derive(axotyped::TS)]
+#[derive(serde::Deserialize, axotyped::TS)]
 struct RefreshRequest {
     _refresh_token: String,
 }
@@ -511,7 +543,10 @@ struct RefreshRequest {
 async fn refresh_with_body(
     axum::extract::Json(_body): axum::extract::Json<RefreshRequest>,
 ) -> axum::Json<MeResponse> {
-    axum::Json(MeResponse { authenticated: false, token: None })
+    axum::Json(MeResponse {
+        authenticated: false,
+        token: None,
+    })
 }
 
 axotyped::auth_scheme! {
@@ -535,7 +570,10 @@ fn token_field_binds_default_refresh_hook() {
     // carries the token. Execution is covered by the behavioral spec.
     assert!(out.contains("refresh: \"meTyped\""), "refresh route key");
     assert!(out.contains("field: \"token\""), "declared field");
-    assert!(out.contains("expiryFromJwt: true"), "jwt-derived proactive expiry");
+    assert!(
+        out.contains("expiryFromJwt: true"),
+        "jwt-derived proactive expiry"
+    );
 }
 
 #[test]
@@ -551,7 +589,8 @@ fn token_field_rejected_for_oauth2() {
 }
 
 #[test]
-fn body_taking_lifecycle_route_warns_and_skips_hook() {
+#[should_panic(expected = "no renewal helper can be generated")]
+fn body_taking_lifecycle_route_fails_generation() {
     let flow = axotyped::AuthFlow::new("X", axotyped::AuthFlowKind::Exchange)
         .bootstrap_named("refreshWithBody")
         .token_field("token");
@@ -562,22 +601,7 @@ fn body_taking_lifecycle_route_warns_and_skips_hook() {
         .get("/private", axotyped::register!(private_thing))
         .build();
 
-    let (out, warnings) = axotyped::generate_with_warnings(&collection, &config());
-    assert!(
-        warnings.iter().any(|w| w.contains("request body")),
-        "warnings: {warnings:?}"
-    );
-    assert!(
-        warnings.iter().any(|w| w.contains("onUnauthorized")),
-        "warning must state the remedy: {warnings:?}"
-    );
-    // No renewal helper can be generated, so none is.
-    assert!(!out.contains("field: \""), "no extraction field: {out}");
-    assert!(
-        !out.contains("export async function refreshBearer"),
-        "no helper to bind: {out}"
-    );
-    assert!(out.contains("refresh: \"refreshWithBody\""), "mint key stays: {out}");
+    let _ = axotyped::generate(&collection, &config());
 }
 
 /// Path-parameterized refresh route.
@@ -585,33 +609,33 @@ fn body_taking_lifecycle_route_warns_and_skips_hook() {
 async fn refresh_tenant(
     axum::extract::Path(_tenant): axum::extract::Path<String>,
 ) -> axum::Json<MeResponse> {
-    axum::Json(MeResponse { authenticated: false, token: None })
+    axum::Json(MeResponse {
+        authenticated: false,
+        token: None,
+    })
 }
 
 #[test]
-fn parameterized_lifecycle_route_warns_and_skips_hook() {
+#[should_panic(expected = "no renewal helper can be generated")]
+fn parameterized_lifecycle_route_fails_generation() {
     let flow = axotyped::AuthFlow::new("X", axotyped::AuthFlowKind::Exchange)
         .bootstrap_named("refreshTenant")
         .token_field("token");
 
     let (_router, collection) = axotyped::ApiRouter::<()>::new()
         .auth_flow(flow)
-        .get("/tenants/{tenant}/refresh", axotyped::register!(refresh_tenant))
+        .get(
+            "/tenants/{tenant}/refresh",
+            axotyped::register!(refresh_tenant),
+        )
         .get("/private", axotyped::register!(private_thing))
         .build();
 
-    let (out, warnings) = axotyped::generate_with_warnings(&collection, &config());
-    assert!(
-        warnings.iter().any(|w| w.contains("path parameters")),
-        "warnings: {warnings:?}"
-    );
-    assert!(!out.contains("field: \""), "no auto hook: {out}");
+    let _ = axotyped::generate(&collection, &config());
 }
 
-
 /// Query-taking refresh route.
-#[derive(serde::Deserialize)]
-#[derive(axotyped::TS)]
+#[derive(serde::Deserialize, axotyped::TS)]
 struct TenantQuery {
     _tenant: String,
 }
@@ -620,11 +644,15 @@ struct TenantQuery {
 async fn refresh_with_query(
     axum::extract::Query(_q): axum::extract::Query<TenantQuery>,
 ) -> axum::Json<MeResponse> {
-    axum::Json(MeResponse { authenticated: false, token: None })
+    axum::Json(MeResponse {
+        authenticated: false,
+        token: None,
+    })
 }
 
 #[test]
-fn query_taking_lifecycle_route_warns_and_skips_hook() {
+#[should_panic(expected = "no renewal helper can be generated")]
+fn query_taking_lifecycle_route_fails_generation() {
     let flow = axotyped::AuthFlow::new("X", axotyped::AuthFlowKind::Exchange)
         .bootstrap_named("refreshWithQuery")
         .token_field("token");
@@ -635,12 +663,7 @@ fn query_taking_lifecycle_route_warns_and_skips_hook() {
         .get("/private", axotyped::register!(private_thing))
         .build();
 
-    let (out, warnings) = axotyped::generate_with_warnings(&collection, &config());
-    assert!(
-        warnings.iter().any(|w| w.contains("query string")),
-        "warnings: {warnings:?}"
-    );
-    assert!(!out.contains("field: \""), "no auto hook: {out}");
+    let _ = axotyped::generate(&collection, &config());
 }
 
 /// Route names are unique per group only — a lifecycle reference naming a
@@ -648,16 +671,15 @@ fn query_taking_lifecycle_route_warns_and_skips_hook() {
 #[test]
 #[should_panic(expected = "ambiguous")]
 fn ambiguous_lifecycle_reference_fails_build() {
-    let flow = axotyped::AuthFlow::new("X", axotyped::AuthFlowKind::Exchange)
-        .bootstrap_named("mint");
+    let flow =
+        axotyped::AuthFlow::new("X", axotyped::AuthFlowKind::Exchange).bootstrap_named("mint");
 
     let _ = axotyped::ApiRouter::<()>::new()
         .auth_flow(flow)
-        .group("a", |g| {
-            g.get("/mint", axotyped::register!(me)).as_("mint")
-        })
+        .group("a", |g| g.get("/mint", axotyped::register!(me)).as_("mint"))
         .group("b", |g| {
-            g.get("/other/mint", axotyped::register!(me_typed)).as_("mint")
+            g.get("/other/mint", axotyped::register!(me_typed))
+                .as_("mint")
         })
         .build();
 }
@@ -670,8 +692,7 @@ fn ambiguous_lifecycle_reference_fails_build() {
 #[test]
 #[should_panic(expected = "ambiguous")]
 fn auth_group_route_sharing_a_lifecycle_name_fails_build() {
-    let flow = axotyped::AuthFlow::new("X", axotyped::AuthFlowKind::Exchange)
-        .bootstrap_named("me");
+    let flow = axotyped::AuthFlow::new("X", axotyped::AuthFlowKind::Exchange).bootstrap_named("me");
 
     let _ = axotyped::ApiRouter::<()>::new()
         .auth_flow(flow)
@@ -682,7 +703,6 @@ fn auth_group_route_sharing_a_lifecycle_name_fails_build() {
         .build();
 }
 
-
 // -- the compile-time field probe checks the wire, not Rust visibility -------
 
 /// A response type whose fields are PRIVATE to its module: perfectly
@@ -692,15 +712,16 @@ fn auth_group_route_sharing_a_lifecycle_name_fails_build() {
 mod sealed {
     use super::*;
 
-    #[derive(serde::Serialize)]
-    #[derive(axotyped::TS)]
+    #[derive(serde::Serialize, axotyped::TS)]
     pub struct SealedTokenResponse {
         token: String,
     }
 
     #[axotyped::endpoint(permissive)]
     pub async fn sealed_mint() -> axum::Json<SealedTokenResponse> {
-        axum::Json(SealedTokenResponse { token: String::new() })
+        axum::Json(SealedTokenResponse {
+            token: String::new(),
+        })
     }
 }
 
@@ -727,8 +748,7 @@ fn flow_field_probe_reaches_private_fields_across_modules() {
     );
 }
 
-#[derive(serde::Serialize)]
-#[derive(axotyped::TS)]
+#[derive(serde::Serialize, axotyped::TS)]
 struct RenamedTokenResponse {
     #[ts(rename = "accessToken")]
     access: String,
@@ -736,7 +756,9 @@ struct RenamedTokenResponse {
 
 #[axotyped::endpoint(permissive)]
 async fn mint_renamed() -> axum::Json<RenamedTokenResponse> {
-    axum::Json(RenamedTokenResponse { access: String::new() })
+    axum::Json(RenamedTokenResponse {
+        access: String::new(),
+    })
 }
 
 axotyped::auth_scheme! {
@@ -762,11 +784,9 @@ fn flow_field_probe_checks_the_wire_name_not_the_rust_name() {
     assert!(out.contains("field: \"accessToken\""), "{out}");
 }
 
-
 // -- oauth2 pair (`-> { access, refresh, expires_in }`) ----------------------
 
-#[derive(serde::Serialize)]
-#[derive(axotyped::TS)]
+#[derive(serde::Serialize, axotyped::TS)]
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
@@ -775,7 +795,11 @@ struct TokenResponse {
 
 #[axotyped::endpoint]
 async fn exchange_tokens() -> axum::Json<TokenResponse> {
-    axum::Json(TokenResponse { access_token: String::new(), refresh_token: None, expires_in: None })
+    axum::Json(TokenResponse {
+        access_token: String::new(),
+        refresh_token: None,
+        expires_in: None,
+    })
 }
 
 axotyped::auth_scheme! {
@@ -800,7 +824,10 @@ fn oauth2_pair_builds_and_emits_session_contract() {
     // Verbatim field names — they name response fields the engine extracts.
     assert!(out.contains("kind: \"oauth2\""), "kind");
     assert!(out.contains("access: \"access_token\""), "access field");
-    assert!(out.contains("refresh: \"refresh_token\""), "rotating refresh field");
+    assert!(
+        out.contains("refresh: \"refresh_token\""),
+        "rotating refresh field"
+    );
     assert!(out.contains("expiresIn: \"expires_in\""), "expiry field");
 }
 
@@ -831,28 +858,25 @@ fn flow_conflict_between_root_and_group_fails_fast() {
         .build();
 }
 
-
 #[test]
-fn credentialed_ws_without_a_flow_ticket_warns() {
-    // No flow, no ticket: the warning names the declaration remedy —
-    // there is no config-string path anymore (one mechanism: auth_scheme!).
+#[should_panic(expected = "ws_ticket")]
+fn credentialed_ws_without_a_flow_ticket_fails_generation() {
+    // A declared flow without a ticket mint leaves the [ws][auth] route
+    // unwirable: generation fails naming the declaration remedy — there is
+    // no config-string path anymore (one mechanism: auth_scheme!).
+    // (With no flow at all, generation stays silent: the lifecycle
+    // machinery was never engaged.)
+    let flow = axotyped::AuthFlow::new("X", axotyped::AuthFlowKind::Exchange).bootstrap_named("me");
     let (_router, collection) = axotyped::ApiRouter::<()>::new()
+        .auth_flow(flow)
+        .get("/auth/me", axotyped::register!(me))
         .group("realtime", |g| {
             g.ws("/voice", axotyped::register!(voice))
                 .events::<ClientEvent, ServerEvent>()
         })
         .build();
 
-    let (_out, warnings) = axotyped::generate_with_warnings(
-        &collection,
-        &GeneratorConfig { auth_scheme: AuthScheme::Bearer, ..config() },
-    );
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("voice") && w.contains("ws_ticket: register!")),
-        "must name the declaration remedy: {warnings:?}"
-    );
+    let _ = axotyped::generate(&collection, &config());
 }
 /// With grouping disabled the renewal helper must call the route's TOP-LEVEL
 /// method — the flat emitter puts every method at the root, so a group
@@ -865,9 +889,7 @@ fn renewal_helper_calls_the_flat_method_when_groups_are_disabled() {
 
     let (_router, collection) = axotyped::ApiRouter::<()>::new()
         .auth_flow(flow)
-        .group_public("auth", |g| {
-            g.get("/me", axotyped::register!(me_typed))
-        })
+        .group_public("auth", |g| g.get("/me", axotyped::register!(me_typed)))
         .get("/private", axotyped::register!(private_thing))
         .build();
 
@@ -878,7 +900,10 @@ fn renewal_helper_calls_the_flat_method_when_groups_are_disabled() {
         out.contains("await client.meTyped()"),
         "flat helper calls the top-level method: {out}"
     );
-    assert!(!out.contains("client.auth."), "no group segment when flat: {out}");
+    assert!(
+        !out.contains("client.auth."),
+        "no group segment when flat: {out}"
+    );
 
     // And the grouped default keeps the nested call.
     let out = generate(&collection, &config());
@@ -902,7 +927,8 @@ fn renewal_helper_brackets_non_identifier_names() {
     let (_router, collection) = axotyped::ApiRouter::<()>::new()
         .auth_flow(flow)
         .group_public("email-password", |g| {
-            g.get("/refresh", axotyped::register!(me_typed)).as_("x-refresh")
+            g.get("/refresh", axotyped::register!(me_typed))
+                .as_("x-refresh")
         })
         .get("/private", axotyped::register!(private_thing))
         .build();

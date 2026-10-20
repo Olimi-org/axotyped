@@ -3,7 +3,7 @@
 
 use axotyped::{
     GeneratorConfig, HttpMethod, RouteCollection, RouteDefinition, Visibility, extract_path_params,
-    generate, generate_with_warnings,
+    generate,
 };
 
 fn route(name: &str, path: &str) -> RouteDefinition {
@@ -110,30 +110,25 @@ fn non_identifier_method_names_are_emitted_as_quoted_keys() {
 }
 
 /// A hand-built untyped WS definition (the builder path makes this
-/// unrepresentable) warns and emits no client method — no contract, no method.
+/// unrepresentable) fails generation — no contract, no method.
 #[test]
-fn untyped_websocket_route_warns_and_skips_the_client_method() {
+#[should_panic(expected = "without declared event types")]
+fn untyped_websocket_route_fails_generation() {
     let mut routes = RouteCollection::new();
     let mut def = route("rawSocket", "/raw");
     def.websocket = true;
     routes.push(def);
     routes.push(route("health", "/health"));
 
-    let (out, warnings) = generate_with_warnings(&routes, &GeneratorConfig::default());
-    assert!(
-        warnings.iter().any(|w| w.contains("rawSocket") && w.contains("generates no client method")),
-        "must warn: {warnings:?}"
-    );
-    assert!(!out.contains("rawSocket"), "no method without a contract: {out}");
-    assert!(out.contains("health:"));
+    let _ = generate(&routes, &GeneratorConfig::default());
 }
 
 /// The flat emitter shares the contract gate: with grouping disabled an
-/// untyped WS route still warns and still produces neither descriptor nor
-/// method — otherwise the method would reference a descriptor the table
-/// skipped.
+/// untyped WS route still fails instead of producing a method referencing
+/// a descriptor the table skipped.
 #[test]
-fn untyped_websocket_route_skips_the_client_method_without_grouping() {
+#[should_panic(expected = "without declared event types")]
+fn untyped_websocket_route_fails_generation_without_grouping() {
     let mut routes = RouteCollection::new();
     let mut def = route("rawSocket", "/raw");
     def.websocket = true;
@@ -144,20 +139,14 @@ fn untyped_websocket_route_skips_the_client_method_without_grouping() {
         enable_groups: false,
         ..Default::default()
     };
-    let (out, warnings) = generate_with_warnings(&routes, &config);
-    assert!(
-        warnings.iter().any(|w| w.contains("rawSocket") && w.contains("generates no client method")),
-        "must warn: {warnings:?}"
-    );
-    assert!(!out.contains("rawSocket"), "no method without a contract: {out}");
-    assert!(out.contains("health:"));
+    let _ = generate(&routes, &config);
 }
 
 /// A partial contract (send declared, receive missing) is no contract: one
-/// predicate gates the warning, the descriptor table, and both emitters,
-/// so nothing is generated and no fallback event type can leak through.
+/// predicate gates generation, the descriptor table, and both emitters.
 #[test]
-fn partial_websocket_contract_generates_nothing() {
+#[should_panic(expected = "without declared event types")]
+fn partial_websocket_contract_fails_generation() {
     let mut routes = RouteCollection::new();
     let mut def = route("halfTyped", "/half");
     def.websocket = true;
@@ -165,14 +154,7 @@ fn partial_websocket_contract_generates_nothing() {
     routes.push(def);
     routes.push(route("health", "/health"));
 
-    let (out, warnings) = generate_with_warnings(&routes, &GeneratorConfig::default());
-    assert!(
-        warnings.iter().any(|w| w.contains("halfTyped") && w.contains("generates no client method")),
-        "must warn: {warnings:?}"
-    );
-    assert!(!out.contains("halfTyped"), "no method or descriptor: {out}");
-    assert!(!out.contains("ServerEvent"), "no fallback event type: {out}");
-    assert!(out.contains("health:"));
+    let _ = generate(&routes, &GeneratorConfig::default());
 }
 
 /// Ordinary derived identifiers still emit bare (no quotes), so the common
@@ -190,7 +172,8 @@ fn identifier_method_names_stay_bare() {
 /// named after a helper collides; a group name creates no property), while
 /// grouped nesting exposes the group object there instead.
 #[test]
-fn helper_collision_check_follows_the_emitted_layout() {
+#[should_panic(expected = "built-in")]
+fn helper_collision_in_flat_layout_fails_generation() {
     let mut routes = RouteCollection::new();
     let mut grouped = route("withOptions", "/derive");
     grouped.group = Some("admin".into());
@@ -200,32 +183,48 @@ fn helper_collision_check_follows_the_emitted_layout() {
         enable_groups: false,
         ..Default::default()
     };
-    let (_, warnings) = generate_with_warnings(&routes, &flat);
-    assert!(
-        warnings.iter().any(|w| w.contains("withOptions")),
-        "flat layout: the route method itself is top-level and collides: {warnings:?}"
-    );
+    let _ = generate(&routes, &flat);
+}
 
-    let (_, warnings) = generate_with_warnings(&routes, &GeneratorConfig::default());
-    assert!(
-        !warnings.iter().any(|w| w.contains("withOptions")),
-        "grouped layout: the method nests under 'admin', no collision: {warnings:?}"
-    );
+#[test]
+fn helper_collision_absent_in_grouped_layout_generates() {
+    let mut routes = RouteCollection::new();
+    let mut grouped = route("withOptions", "/derive");
+    grouped.group = Some("admin".into());
+    routes.push(grouped);
 
+    let out = generate(&routes, &GeneratorConfig::default());
+    assert!(
+        out.contains("withOptions:"),
+        "grouped layout: the method nests under 'admin', no collision: {out}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "built-in")]
+fn group_named_after_helper_fails_generation() {
     let mut routes = RouteCollection::new();
     let mut listed = route("list", "/list");
     listed.group = Some("withOptions".into());
     routes.push(listed);
 
-    let (_, warnings) = generate_with_warnings(&routes, &GeneratorConfig::default());
-    assert!(
-        warnings.iter().any(|w| w.contains("withOptions")),
-        "grouped layout: the group object takes the helper's name: {warnings:?}"
-    );
+    let _ = generate(&routes, &GeneratorConfig::default());
+}
 
-    let (_, warnings) = generate_with_warnings(&routes, &flat);
+#[test]
+fn group_name_creates_no_property_in_flat_layout() {
+    let mut routes = RouteCollection::new();
+    let mut listed = route("list", "/list");
+    listed.group = Some("withOptions".into());
+    routes.push(listed);
+
+    let flat = GeneratorConfig {
+        enable_groups: false,
+        ..Default::default()
+    };
+    let out = generate(&routes, &flat);
     assert!(
-        !warnings.iter().any(|w| w.contains("withOptions")),
-        "flat layout: a group name creates no property, 'list' is the method: {warnings:?}"
+        out.contains("list:"),
+        "flat layout: a group name creates no property, 'list' is the method: {out}"
     );
 }

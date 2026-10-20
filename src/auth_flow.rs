@@ -207,9 +207,7 @@ impl AuthFlow {
     /// Validate the declaration against a route table.
     pub(crate) fn validate(&self, routes: &[RouteDefinition]) -> Result<(), String> {
         match self.kind {
-            AuthFlowKind::StaticBearer
-                if !self.bootstrap.is_empty() || self.refresh.is_some() =>
-            {
+            AuthFlowKind::StaticBearer if !self.bootstrap.is_empty() || self.refresh.is_some() => {
                 return Err(
                     "kind is static_bearer but bootstrap/refresh routes are declared; a \
                      static credential has no lifecycle. Use kind exchange or oauth2."
@@ -218,8 +216,7 @@ impl AuthFlow {
             }
             AuthFlowKind::OAuth2 | AuthFlowKind::Exchange if self.bootstrap.is_empty() => {
                 return Err(
-                    "kind requires at least one exchange/bootstrap route (none declared)."
-                        .into(),
+                    "kind requires at least one exchange/bootstrap route (none declared).".into(),
                 );
             }
             _ => {}
@@ -236,21 +233,19 @@ impl AuthFlow {
                 (AuthFlowKind::Exchange, TokenFields::Bearer(_)) => {}
                 (AuthFlowKind::OAuth2, TokenFields::Pair { .. }) => {}
                 (AuthFlowKind::Exchange, _) => {
-                    return Err(mismatch("use `-> field` (one bearer field)"))
+                    return Err(mismatch("use `-> field` (one bearer field)"));
                 }
                 (AuthFlowKind::OAuth2, _) => {
                     return Err(mismatch(
                         "use `-> { access, refresh, expires_in }` (pair; members optional)",
-                    ))
+                    ));
                 }
                 (AuthFlowKind::StaticBearer, _) => {
-                    return Err(mismatch("a static credential declares no token fields"))
+                    return Err(mismatch("a static credential declares no token fields"));
                 }
             }
             if self.refresh.is_none() && self.bootstrap.is_empty() {
-                return Err(
-                    "token fields declared but no lifecycle route to bind them to.".into(),
-                );
+                return Err("token fields declared but no lifecycle route to bind them to.".into());
             }
         }
 
@@ -399,7 +394,8 @@ mod tests {
 
     #[test]
     fn non_private_ws_ticket_fails() {
-        let flow = AuthFlow::new("StaticToken", AuthFlowKind::StaticBearer).ws_ticket_named("issueTicket");
+        let flow =
+            AuthFlow::new("StaticToken", AuthFlowKind::StaticBearer).ws_ticket_named("issueTicket");
         let routes = vec![route("issueTicket", Visibility::Public)];
         let err = flow.validate(&routes).unwrap_err();
         assert!(err.contains("must be Private"), "{err}");
@@ -440,16 +436,16 @@ mod tests {
     /// writes — the handshake would resolve to nothing at connect time.
     #[test]
     fn ws_ticket_naming_an_untyped_socket_fails() {
-        let flow = AuthFlow::new("StaticToken", AuthFlowKind::StaticBearer)
-            .ws_ticket_named("socket");
+        let flow =
+            AuthFlow::new("StaticToken", AuthFlowKind::StaticBearer).ws_ticket_named("socket");
         let err = flow.validate(&[socket(false)]).unwrap_err();
         assert!(err.contains("event types"), "{err}");
     }
 
     #[test]
     fn ws_ticket_naming_a_typed_socket_passes() {
-        let flow = AuthFlow::new("StaticToken", AuthFlowKind::StaticBearer)
-            .ws_ticket_named("socket");
+        let flow =
+            AuthFlow::new("StaticToken", AuthFlowKind::StaticBearer).ws_ticket_named("socket");
         assert!(flow.validate(&[socket(true)]).is_ok());
     }
 }

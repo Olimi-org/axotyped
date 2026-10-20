@@ -33,21 +33,20 @@ mod generator;
 mod types;
 #[macro_use]
 
-
 mod auth_flow;
 mod params;
 
 // Re-export public API
 pub use auth_flow::{AuthFlow, AuthFlowKind, TokenFields, endpoint_name};
-pub use params::{
-    AllowsRoute, OptionalCredential, Allowed, AssertCredentiallessDeclaration, AuthFlag, AuthOr,
-    EndpointParam, EndpointVisibilityCoherence, Credential, FlagConst, IsCoherentWithParams,
-    LayeredAuthScope, NotAllowed, PermissiveScope, PrivateScope, PublicScope, WireFields,
-    wire_field_declared,
-};
 pub use generator::{
     AuthScheme, CheckError, GeneratorConfig, check, generate, generate_runtime_source,
-    generate_to_file, generate_with_warnings,
+    generate_to_file,
+};
+pub use params::{
+    Allowed, AllowsRoute, AssertCredentiallessDeclaration, AuthFlag, AuthOr, Credential,
+    EndpointParam, EndpointVisibilityCoherence, FlagConst, IsCoherentWithParams, LayeredAuthScope,
+    NotAllowed, OptionalCredential, PermissiveScope, PrivateScope, PublicScope, WireFields,
+    wire_field_declared,
 };
 pub use types::{
     Collector, HttpMethod, NoCollect, PathParam, RouteCollection, RouteDefinition, TypeRegistry,
@@ -70,9 +69,9 @@ pub use builder::{build_typed, collect_routes};
 pub type TypedApiRouter<S = ()> = ApiRouter<S, TypeRegistry>;
 
 // Re-export the #[endpoint] attribute macro and register!() call-site macro.
-pub use axotyped_macros::{credential, endpoint, optional_credential, register};
 #[doc(hidden)]
 pub use axotyped_macros::check_response_fields as __check_response_fields;
+pub use axotyped_macros::{credential, endpoint, optional_credential, register};
 
 /// Declare a route table as a zero-sized type implementing [`RouteTable`].
 ///
@@ -306,9 +305,15 @@ macro_rules! __auth_scheme_munch {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __auth_kind {
-    (oauth2) => { $crate::AuthFlowKind::OAuth2 };
-    (exchange) => { $crate::AuthFlowKind::Exchange };
-    (static_bearer) => { $crate::AuthFlowKind::StaticBearer };
+    (oauth2) => {
+        $crate::AuthFlowKind::OAuth2
+    };
+    (exchange) => {
+        $crate::AuthFlowKind::Exchange
+    };
+    (static_bearer) => {
+        $crate::AuthFlowKind::StaticBearer
+    };
 }
 
 // ts integration: TS trait, derive macro, and all standard type impls.

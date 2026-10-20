@@ -32,7 +32,9 @@ use axum::handler::Handler;
 use axum::routing::{self, MethodRouter};
 
 use crate::types::TypeRegistry;
-use crate::types::{Collector, HttpMethod, NoCollect, RouteCollection, RouteDefinition, Visibility};
+use crate::types::{
+    Collector, HttpMethod, NoCollect, RouteCollection, RouteDefinition, Visibility,
+};
 
 // ---------------------------------------------------------------------------
 // Layer support
@@ -406,8 +408,7 @@ where
     }
 
     /// Like [`layer`](Self::layer), but marks scoped routes `Private`.
-    /// Contradictions against public declarations are reported by
-    /// [`generate_with_warnings`](crate::generate_with_warnings).
+    /// Contradictions against public declarations fail client generation.
     pub fn auth_layer<L>(mut self, layer: L) -> ApiRouter<S, C, crate::params::LayeredAuthScope>
     where
         L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
@@ -495,8 +496,13 @@ where
         self
     }
 
-    /// Merge another `ApiRouter`'s router and routes into this one.
-    pub fn merge(self, other: ApiRouter<S, C, AuthScope>) -> Self {
+    /// Merge another router's router and routes into this one.
+    ///
+    /// Accepts any scope: scope gates registration, and every route was
+    /// already checked when it was registered — merging works on
+    /// scope-erased parts. Same bound as the group closures, so a subtree
+    /// built separately under `auth_layer` merges into a root router.
+    pub fn merge<R: IntoApiRouterAny<S, C>>(self, other: R) -> Self {
         self.absorb_parts(other.into_router_parts())
     }
 
@@ -517,8 +523,11 @@ where
                     panic!(
                         "two routes share the client method name '{}'{}: {} vs {}",
                         r.name,
-                        if key.0.is_empty() { String::new() }
-                        else { format!(" in group '{}'", key.0) },
+                        if key.0.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" in group '{}'", key.0)
+                        },
                         prev_path,
                         r.path,
                     );
@@ -624,7 +633,11 @@ where
     }
 
     /// Add a WebSocket route.
-    pub fn ws<EH, T>(mut self, path: &str, ep: EH) -> WsRouteBuilder<S, C, AuthScope, crate::params::NoEvents>
+    pub fn ws<EH, T>(
+        mut self,
+        path: &str,
+        ep: EH,
+    ) -> WsRouteBuilder<S, C, AuthScope, crate::params::NoEvents>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
@@ -767,9 +780,11 @@ where
     F: FnOnce(ApiRouter<S, NoCollect>) -> R,
     R: IntoApiRouterAny<S, NoCollect>,
 {
-    ApiRouter::<S, NoCollect>::from_parts(define(ApiRouter::<S, NoCollect>::new()).into_router_parts())
-        .build()
-        .0
+    ApiRouter::<S, NoCollect>::from_parts(
+        define(ApiRouter::<S, NoCollect>::new()).into_router_parts(),
+    )
+    .build()
+    .0
 }
 
 /// Collect route types from the same route-definition function passed to
@@ -780,9 +795,11 @@ where
     F: FnOnce(ApiRouter<S, TypeRegistry>) -> R,
     R: IntoApiRouterAny<S, TypeRegistry>,
 {
-    ApiRouter::<S, TypeRegistry>::from_parts(define(ApiRouter::<S, TypeRegistry>::new()).into_router_parts())
-        .build()
-        .1
+    ApiRouter::<S, TypeRegistry>::from_parts(
+        define(ApiRouter::<S, TypeRegistry>::new()).into_router_parts(),
+    )
+    .build()
+    .1
 }
 
 /// Build both the server [`Router`] and the collected [`RouteCollection`]
@@ -793,8 +810,10 @@ where
     F: FnOnce(ApiRouter<S, TypeRegistry>) -> R,
     R: IntoApiRouterAny<S, TypeRegistry>,
 {
-    ApiRouter::<S, TypeRegistry>::from_parts(define(ApiRouter::<S, TypeRegistry>::new()).into_router_parts())
-        .build()
+    ApiRouter::<S, TypeRegistry>::from_parts(
+        define(ApiRouter::<S, TypeRegistry>::new()).into_router_parts(),
+    )
+    .build()
 }
 
 /// Trait for declaring application route tables.
@@ -825,7 +844,6 @@ pub trait RouteTable<S> {
     {
         build_typed(|r| Self::define(r))
     }
-
 }
 
 impl<S, C, AuthScope: crate::params::InitialScope> Default for ApiRouter<S, C, AuthScope>
@@ -887,15 +905,6 @@ where
     /// Mark this route as a browser redirect (URL builder, not fetch).
     pub fn redirect(mut self) -> Self {
         self.def.redirect = true;
-        self
-    }
-
-    /// Drop the route's body/query/response metadata from the generated
-    /// client.
-    pub fn opaque(mut self) -> Self {
-        self.def.body_type = None;
-        self.def.query_type = None;
-        self.def.response_type = None;
         self
     }
 
@@ -977,7 +986,11 @@ where
     }
 
     /// Add a WebSocket route.
-    pub fn ws<EH, T>(self, path: &str, ep: EH) -> WsRouteBuilder<S, C, AuthScope, crate::params::NoEvents>
+    pub fn ws<EH, T>(
+        self,
+        path: &str,
+        ep: EH,
+    ) -> WsRouteBuilder<S, C, AuthScope, crate::params::NoEvents>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,
@@ -1004,10 +1017,7 @@ where
     }
 
     /// Like [`auth_layer`](ApiRouter::auth_layer).
-    pub fn auth_layer<L>(
-        self,
-        layer: L,
-    ) -> ApiRouter<S, C, crate::params::LayeredAuthScope>
+    pub fn auth_layer<L>(self, layer: L) -> ApiRouter<S, C, crate::params::LayeredAuthScope>
     where
         L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
         L::Service: tower::Service<axum::extract::Request, Error = std::convert::Infallible>
@@ -1210,7 +1220,11 @@ where
     }
 
     /// Add a WebSocket route.
-    pub fn ws<EH, T>(self, path: &str, ep: EH) -> WsRouteBuilder<S, C, AuthScope, crate::params::NoEvents>
+    pub fn ws<EH, T>(
+        self,
+        path: &str,
+        ep: EH,
+    ) -> WsRouteBuilder<S, C, AuthScope, crate::params::NoEvents>
     where
         EH: IntoEndpointHandler<S, T>,
         EH::Handler: Handler<T, S> + 'static,

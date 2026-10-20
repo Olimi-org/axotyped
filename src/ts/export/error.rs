@@ -3,7 +3,9 @@
 pub enum ExportError {
     /// A type reached the exporter with nowhere to write. The payload names
     /// it — a diagnostic that cannot name its subject is not a diagnostic.
-    #[error("`{0}` has no export path: it is a primitive inlined into its users, or was not registered for export")]
+    #[error(
+        "`{0}` has no export path: it is a primitive inlined into its users, or was not registered for export"
+    )]
     CannotBeExported(&'static str),
     #[cfg(feature = "format")]
     #[error("an error occurred while formatting the generated typescript output")]
