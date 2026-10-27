@@ -365,6 +365,7 @@ mod tests {
             websocket: false,
             ws_send_type: None,
             ws_receive_type: None,
+            ws_binary: crate::types::WsBinaryMode::None,
         }
     }
 

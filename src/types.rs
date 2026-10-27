@@ -45,6 +45,49 @@ pub enum Visibility {
     Permissive,
 }
 
+/// Directional binary-frame capability for a WebSocket route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WsBinaryMode {
+    /// JSON text frames only (`send` / `onMessage`).
+    #[default]
+    None,
+    /// Client may send binary frames (`sendBinary`).
+    Send,
+    /// Server may send binary frames (`onBinary`, `ws.binaryType = "arraybuffer"`).
+    Receive,
+    /// Both directions support binary frames (`sendBinary` + `onBinary`).
+    Both,
+}
+
+impl WsBinaryMode {
+    /// Enable client-to-server binary frames.
+    pub const fn with_send(self) -> Self {
+        match self {
+            Self::None | Self::Send => Self::Send,
+            Self::Receive | Self::Both => Self::Both,
+        }
+    }
+
+    /// Enable server-to-client binary frames.
+    pub const fn with_receive(self) -> Self {
+        match self {
+            Self::None | Self::Receive => Self::Receive,
+            Self::Send | Self::Both => Self::Both,
+        }
+    }
+
+    /// Wire representation for `OperationSpec.wsBinary` and `TypedWebSocket`'s
+    /// `TBinary` type parameter (`None` when `Self::None`).
+    pub const fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Send => Some("send"),
+            Self::Receive => Some("receive"),
+            Self::Both => Some("both"),
+        }
+    }
+}
+
 /// Definition of a single API route.
 #[derive(Debug, Clone)]
 pub struct RouteDefinition {
@@ -81,6 +124,8 @@ pub struct RouteDefinition {
     pub ws_send_type: Option<String>,
     /// Rust type name for server-to-client events (receive direction).
     pub ws_receive_type: Option<String>,
+    /// Directional binary WebSocket frame capability (defaults to [`WsBinaryMode::None`]).
+    pub ws_binary: WsBinaryMode,
 }
 
 impl RouteDefinition {
@@ -571,6 +616,7 @@ mod tests {
             websocket: false,
             ws_send_type: None,
             ws_receive_type: None,
+            ws_binary: WsBinaryMode::None,
         });
 
         let mut b = RouteCollection::new();
@@ -590,6 +636,7 @@ mod tests {
             websocket: false,
             ws_send_type: None,
             ws_receive_type: None,
+            ws_binary: WsBinaryMode::None,
         });
 
         a.extend(b);

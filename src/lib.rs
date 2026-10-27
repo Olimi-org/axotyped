@@ -50,7 +50,7 @@ pub use params::{
 };
 pub use types::{
     Collector, HttpMethod, NoCollect, PathParam, RouteCollection, RouteDefinition, TypeRegistry,
-    Visibility, extract_path_params, is_valid_js_identifier,
+    Visibility, WsBinaryMode, extract_path_params, is_valid_js_identifier,
 };
 
 pub use builder::{

@@ -815,6 +815,7 @@ fn manual_route(
         websocket: false,
         ws_send_type: None,
         ws_receive_type: None,
+        ws_binary: axotyped::WsBinaryMode::None,
     }
 }
 

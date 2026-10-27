@@ -719,6 +719,7 @@ where
         websocket,
         ws_send_type: None,
         ws_receive_type: None,
+        ws_binary: crate::types::WsBinaryMode::None,
     }
 }
 
@@ -1137,6 +1138,26 @@ where
             def,
             _events: std::marker::PhantomData,
         }
+    }
+
+    /// Declare that the client sends binary WebSocket frames (`sendBinary`).
+    pub fn binary_send(mut self) -> Self {
+        self.def.ws_binary = self.def.ws_binary.with_send();
+        self
+    }
+
+    /// Declare that the server sends binary WebSocket frames (`onBinary`).
+    /// Sets `ws.binaryType = "arraybuffer"` on the client socket and routes
+    /// binary frames to `onBinary(handler: (data: ArrayBuffer) => void)`.
+    pub fn binary_receive(mut self) -> Self {
+        self.def.ws_binary = self.def.ws_binary.with_receive();
+        self
+    }
+
+    /// Declare bidirectional binary WebSocket frames (`sendBinary` and `onBinary`).
+    pub fn binary(mut self) -> Self {
+        self.def.ws_binary = crate::types::WsBinaryMode::Both;
+        self
     }
 
     fn done(mut self) -> ApiRouter<S, C, AuthScope>
