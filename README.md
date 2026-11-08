@@ -65,7 +65,7 @@ Handler names auto-convert to camelCase: `list_projects` → `listProjects`, `cr
 
 ```toml
 [dependencies]
-axotyped = "0.4"
+axotyped = "0.5"
 ```
 
 TypeScript type export is built in — every type named in a route contract derives `axotyped::TS`. Optional `*-impl` features add TS support for specific types (`chrono-impl`, `uuid-impl`, `serde-json-impl`, …); `serde-compat`, `no-serde-warnings`, and `format` adjust the derive and output. `axum-ws` enables WebSocket handlers.

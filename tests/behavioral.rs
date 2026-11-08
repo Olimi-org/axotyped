@@ -22,6 +22,7 @@ use axotyped::{AuthScheme, GeneratorConfig};
 // --- fixture: an oauth2 pair flow with the full machinery -------------------
 
 #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
@@ -39,6 +40,7 @@ async fn exchange_tokens() -> axum::Json<TokenResponse> {
 
 #[axotyped::credential]
 #[derive(Clone, Copy)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TestAuth;
 
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for TestAuth {
@@ -58,6 +60,7 @@ async fn private_thing(_auth: TestAuth) {}
 // --- fixture: a bearer-kind flow (engine persistence) ------------------------
 
 #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct MeResponse {
     authenticated: bool,
     token: Option<String>,

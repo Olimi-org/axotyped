@@ -15,11 +15,13 @@ use axum::response::Response;
 use tower::Service;
 
 #[derive(Clone, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct AppState;
 
 // Test identity extractor — satisfies the private chain's compile-time
 // authorization requirement (Enforced).
 #[derive(Clone, Copy)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TestAuth;
 
 impl axotyped::EndpointParam for TestAuth {
@@ -189,6 +191,7 @@ async fn codegen_metadata_identical_with_and_without_layers() {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct Identity(&'static str);
 
 /// Stands in for a global auth resolver: computes identity once, publishes it.

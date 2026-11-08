@@ -170,6 +170,8 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __def.body_type = Some(::axotyped::__private::type_string::<#t>());
                 __c.register::<#t>();
                 #(__c.register::<#inner>();)*
+                __c.register_schema::<#t>();
+                #(__c.register_schema::<#inner>();)*
             }
         }
         _ => quote! {},
@@ -182,6 +184,8 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __def.query_type = Some(::axotyped::__private::type_string::<#t>());
                 __c.register::<#t>();
                 #(__c.register::<#inner>();)*
+                __c.register_schema::<#t>();
+                #(__c.register_schema::<#inner>();)*
             }
         }
         _ => quote! {},
@@ -194,6 +198,8 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __def.response_type = Some(::axotyped::__private::type_string::<#t>());
                 __c.register::<#t>();
                 #(__c.register::<#inner>();)*
+                __c.register_schema::<#t>();
+                #(__c.register_schema::<#inner>();)*
             }
         }
         _ => quote! {},

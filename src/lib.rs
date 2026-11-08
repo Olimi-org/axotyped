@@ -316,6 +316,14 @@ macro_rules! __auth_kind {
     };
 }
 
+// OpenAPI composition: paths from route metadata + components from the
+// schema-capturing registry, under the `openapi` feature.
+#[cfg(feature = "openapi")]
+pub mod openapi;
+
+#[cfg(feature = "openapi")]
+pub use utoipa;
+
 // ts integration: TS trait, derive macro, and all standard type impls.
 // The derive macro lives in axotyped-macros
 // and generates code referencing `::axotyped` paths.

@@ -147,6 +147,12 @@ impl RouteDefinition {
 /// A type-erased `T::export_all(&cfg)` function pointer.
 type ExportFn = fn(&crate::ts::Config) -> Result<(), crate::ts::ExportError>;
 
+/// A type-erased schema-registration function pointer: pushes `T`'s component
+/// schema (name + schema, then `T::schemas` for its direct dependencies) onto
+/// `out`. The registry walk deduplicates by schema name.
+#[cfg(feature = "openapi")]
+type SchemaFn = fn(&mut Vec<(String, utoipa::openapi::RefOr<utoipa::openapi::Schema>)>);
+
 /// Called when a route names type `T` for TypeScript export.
 ///
 /// [`NoCollect`] ignores registrations; [`TypeRegistry`] collects them
@@ -154,6 +160,15 @@ type ExportFn = fn(&crate::ts::Config) -> Result<(), crate::ts::ExportError>;
 pub trait Collector: Default {
     /// Register `T`. The default is a no-op; collecting collectors override this.
     fn register<T: crate::MaybeTs + 'static>(&mut self) {}
+
+    /// Register `T`'s OpenAPI component schema. No-op without the `openapi`
+    /// feature (bound: [`MaybeTs`], satisfied wherever [`register`](Self::register)
+    /// compiles); with the feature the bound is `utoipa::ToSchema`, so a route
+    /// type without a schema fails to compile.
+    #[cfg(not(feature = "openapi"))]
+    fn register_schema<T: crate::MaybeTs + 'static>(&mut self) {}
+    #[cfg(feature = "openapi")]
+    fn register_schema<T: utoipa::ToSchema + 'static>(&mut self) {}
 
     /// Merge another collector of the same kind into this one (used by `merge` / `group_with`).
     fn merge_collection(&mut self, _other: Self) {}
@@ -172,6 +187,14 @@ impl Collector for NoCollect {
     }
 }
 
+/// Monomorphized schema capture: `T`'s own component, then `T::schemas`
+/// forwarding for its dependency closure.
+#[cfg(feature = "openapi")]
+fn schema_of<T: utoipa::ToSchema>(out: &mut Vec<(String, utoipa::openapi::RefOr<utoipa::openapi::Schema>)>) {
+    out.push((T::name().to_string(), T::schema()));
+    T::schemas(out);
+}
+
 /// Collects route types for ts-rs export via `export_all()`.
 /// Deduplicates by `TypeId` so shared generic impls emit one declaration.
 #[derive(Debug, Clone, Default)]
@@ -179,6 +202,11 @@ pub struct TypeRegistry {
     /// TypeId → export_all function pointer, for deduplication and export.
     slots: Vec<(std::any::TypeId, ExportFn)>,
     seen: std::collections::BTreeSet<std::any::TypeId>,
+    /// TypeId → schema-registration function pointer, for OpenAPI composition.
+    #[cfg(feature = "openapi")]
+    schema_slots: Vec<(std::any::TypeId, SchemaFn)>,
+    #[cfg(feature = "openapi")]
+    schema_seen: std::collections::BTreeSet<std::any::TypeId>,
 }
 
 /// Returns true for stdlib wrappers handled inline (`Vec` as `T[]`, `Option` as `T | null`).
@@ -201,6 +229,12 @@ impl TypeRegistry {
         &self.slots
     }
 
+    /// All registered schema-capture function pointers.
+    #[cfg(feature = "openapi")]
+    pub fn schema_slots(&self) -> &[(std::any::TypeId, SchemaFn)] {
+        &self.schema_slots
+    }
+
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
@@ -216,6 +250,12 @@ impl TypeRegistry {
                 self.slots.push((type_id, export_fn));
             }
         }
+        #[cfg(feature = "openapi")]
+        for (type_id, schema_fn) in other.schema_slots {
+            if self.schema_seen.insert(type_id) {
+                self.schema_slots.push((type_id, schema_fn));
+            }
+        }
     }
 }
 
@@ -228,6 +268,20 @@ impl Collector for TypeRegistry {
         let type_id = std::any::TypeId::of::<T>();
         if self.seen.insert(type_id) {
             self.slots.push((type_id, T::export_all));
+        }
+    }
+
+    #[cfg(not(feature = "openapi"))]
+    fn register_schema<T: crate::MaybeTs + 'static>(&mut self) {}
+
+    #[cfg(feature = "openapi")]
+    fn register_schema<T: utoipa::ToSchema + 'static>(&mut self) {
+        if is_container_wrapper(std::any::type_name::<T>()) {
+            return;
+        }
+        let type_id = std::any::TypeId::of::<T>();
+        if self.schema_seen.insert(type_id) {
+            self.schema_slots.push((type_id, schema_of::<T> as SchemaFn));
         }
     }
 
