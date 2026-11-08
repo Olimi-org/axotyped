@@ -32,7 +32,7 @@ pub struct PathParam {
     pub name: String,
 }
 
-/// What a route declares — and effectively is — regarding authentication.
+/// What a route declares, and what it effectively is, regarding authentication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Visibility {
     /// Requires authentication. The generated client attaches credentials
@@ -195,6 +195,12 @@ fn schema_of<T: utoipa::ToSchema>(out: &mut Vec<(String, utoipa::openapi::RefOr<
     T::schemas(out);
 }
 
+/// Dependency closure only, no self component: the wrapper composes inline in the document.
+#[cfg(feature = "openapi")]
+fn schema_deps_of<T: utoipa::ToSchema>(out: &mut Vec<(String, utoipa::openapi::RefOr<utoipa::openapi::Schema>)>) {
+    T::schemas(out);
+}
+
 /// Collects route types for ts-rs export via `export_all()`.
 /// Deduplicates by `TypeId` so shared generic impls emit one declaration.
 #[derive(Debug, Clone, Default)]
@@ -276,12 +282,19 @@ impl Collector for TypeRegistry {
 
     #[cfg(feature = "openapi")]
     fn register_schema<T: utoipa::ToSchema + 'static>(&mut self) {
-        if is_container_wrapper(std::any::type_name::<T>()) {
-            return;
-        }
         let type_id = std::any::TypeId::of::<T>();
         if self.schema_seen.insert(type_id) {
-            self.schema_slots.push((type_id, schema_of::<T> as SchemaFn));
+            // Container wrappers compose inline in the document (arrays,
+            // optionals) and cannot name their item from here. Forward the
+            // item's dependency closure only; the item type itself must be
+            // captured by a route that names it directly, or registered
+            // explicitly with [`RouteCollection::with_schema`].
+            let slot = if is_container_wrapper(std::any::type_name::<T>()) {
+                schema_deps_of::<T> as SchemaFn
+            } else {
+                schema_of::<T> as SchemaFn
+            };
+            self.schema_slots.push((type_id, slot));
         }
     }
 
@@ -305,6 +318,17 @@ pub struct RouteCollection {
 impl RouteCollection {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Capture `T`'s component schema (and its dependency closure) into the
+    /// registry. For types the route walk cannot name: an item inside a
+    /// container override (`.response::<Vec<Dto>>()` on an opaque handler),
+    /// or a standalone schema consumed outside the route surface. Skipped
+    /// routes name the types they are missing.
+    #[cfg(feature = "openapi")]
+    pub fn with_schema<T: utoipa::ToSchema + 'static>(mut self) -> Self {
+        self.types.register_schema::<T>();
+        self
     }
 
     /// Builds a `RouteCollection` from routes and a type registry.
@@ -392,16 +416,16 @@ impl RouteCollection {
 
         for (_, export_fn) in self.types.slots() {
             if let Err(e) = export_fn(&cfg) {
-                // Log but don't fail — one bad type shouldn't block generation
+                // Log and continue: one bad type does not block generation
                 eprintln!("axotyped: type export failed: {e}");
             }
         }
 
         // Write a barrel index.ts that re-exports every .ts file in the
-        // bindings directory.  ts-rs's export_all() also writes transitive
-        // dependencies (e.g. DialogLine used inside Dialog), so we scan the
-        // directory to pick up all generated types — not just the ones that
-        // appear directly in route signatures.
+        // bindings directory. ts-rs's export_all() also writes transitive
+        // dependencies (e.g. DialogLine used inside Dialog), so the scan
+        // covers every generated file, not only the types that appear
+        // directly in route signatures.
         let mut names: Vec<String> = Vec::new();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -550,7 +574,7 @@ pub fn extract_path_params(path: &str) -> Vec<PathParam> {
 }
 
 /// Returns raw `{...}` contents in first-occurrence order.
-fn scan_raw_path_params(path: &str) -> Vec<&str> {
+pub(crate) fn scan_raw_path_params(path: &str) -> Vec<&str> {
     let mut raws: Vec<&str> = Vec::new();
     let mut rest = path;
     while let Some(open) = rest.find('{') {

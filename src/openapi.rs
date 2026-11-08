@@ -28,7 +28,7 @@ use utoipa::openapi::{
     server::Server,
 };
 
-use crate::types::{HttpMethod, RouteCollection, RouteDefinition, Visibility};
+use crate::types::{HttpMethod, RouteCollection, RouteDefinition, Visibility, scan_raw_path_params};
 
 /// Name of the bearer security scheme the composed operations reference.
 pub const BEARER_SCHEME: &str = "bearerAuth";
@@ -134,10 +134,47 @@ pub fn compose_paths(
 
     let mut paths = Paths::new();
     let mut skipped = Vec::new();
-    for route in routes.routes() {
-        if route.websocket || route.redirect {
-            continue;
+
+    // Operation IDs must be unique document-wide. Route names are unique per
+    // group (the builder enforces that), so a name repeated across groups is
+    // disambiguated with its group; group-less repeats get an occurrence
+    // number. Names that are already unique keep their ID verbatim, because
+    // client generators name their methods after these.
+    let composed: Vec<&RouteDefinition> = routes
+        .routes()
+        .iter()
+        .filter(|route| !route.websocket && !route.redirect)
+        .collect();
+    let mut name_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for route in &composed {
+        *name_counts.entry(route.name.as_str()).or_default() += 1;
+    }
+    let mut name_occurrence: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut used_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut operation_id = |route: &RouteDefinition| -> String {
+        let base = if name_counts[route.name.as_str()] > 1 {
+            let seq = {
+                let seen = name_occurrence.entry(route.name.clone()).or_default();
+                *seen += 1;
+                *seen
+            };
+            match &route.group {
+                Some(group) => format!("{group}_{}", route.name),
+                None => format!("{}_{}", route.name, seq),
+            }
+        } else {
+            route.name.clone()
+        };
+        let mut id = base.clone();
+        let mut n = 2;
+        while !used_ids.insert(id.clone()) {
+            id = format!("{base}_{n}");
+            n += 1;
         }
+        id
+    };
+
+    for route in composed {
         let method = &route.method;
         let skip = |missing: String| SkippedRoute {
             method: method.as_str(),
@@ -164,7 +201,7 @@ pub fn compose_paths(
         }
 
         let mut operation = OperationBuilder::new()
-            .operation_id(Some(route.name.clone()))
+            .operation_id(Some(operation_id(route)))
             .parameters(Some(parameters));
 
         if let Some(body_type) = route.body_type.as_deref() {
@@ -184,29 +221,33 @@ pub fn compose_paths(
             }
         }
 
-        if let Some(response_type) = route.response_type.as_deref() {
-            match resolve_schema_ref(response_type, components) {
+        // Every composed operation documents its success response; the JSON
+        // body appears only when the handler names a response type. Unit and
+        // opaque handlers get a bare 200.
+        let mut responses = Responses::new();
+        match route.response_type.as_deref() {
+            Some(response_type) => match resolve_schema_ref(response_type, components) {
                 Some(schema) => {
                     let mut ok = Response::new("OK");
                     ok.content.insert("application/json".into(), json_content(schema));
-                    let mut responses = Responses::new();
                     responses.responses.insert("200".into(), RefOr::T(ok));
-                    if route.visibility == Visibility::Private {
-                        responses.responses.insert(
-                            "401".into(),
-                            RefOr::T(Response::new(
-                                "Session expired — renew and retry once",
-                            )),
-                        );
-                    }
-                    operation = operation.responses(responses);
                 }
                 None => {
                     skipped.push(skip(response_type.to_string()));
                     continue;
                 }
+            },
+            None => {
+                responses.responses.insert("200".into(), RefOr::T(Response::new("OK")));
             }
         }
+        if route.visibility == Visibility::Private {
+            responses.responses.insert(
+                "401".into(),
+                RefOr::T(Response::new("Session expired; renew and retry once.")),
+            );
+        }
+        operation = operation.responses(responses);
 
         if route.visibility == Visibility::Private {
             operation = operation.security(SecurityRequirement::new(BEARER_SCHEME, [] as [String; 0]));
@@ -215,6 +256,8 @@ pub fn compose_paths(
             operation = operation.tags(Some([group.clone()]));
         }
 
+        // Several routes share one path (POST+GET+DELETE on the same URL);
+        // each contributes its method to the same PathItem.
         let entry = paths.paths.entry(route.path.clone()).or_default();
         match oa_method {
             utoipa::openapi::path::HttpMethod::Get => entry.get = Some(operation.build()),
@@ -236,12 +279,18 @@ fn http_bearer() -> HttpAuth {
 }
 
 fn path_parameters(route: &RouteDefinition) -> Vec<utoipa::openapi::path::Parameter> {
+    // The document keeps the original path template, so parameters must carry
+    // the raw template names; the sanitized names exist only for the
+    // JavaScript client's identifiers.
+    let raw = scan_raw_path_params(&route.path);
     route
         .path_params
         .iter()
-        .map(|param| {
+        .enumerate()
+        .map(|(index, param)| {
+            let name: &str = raw.get(index).copied().unwrap_or(param.name.as_str());
             ParameterBuilder::default()
-                .name(&param.name)
+                .name(name)
                 .parameter_in(ParameterIn::Path)
                 .required(Required::True)
                 .schema(Some(RefOr::T(Schema::Object(string_schema()))))
@@ -336,8 +385,15 @@ pub fn discriminate_serde_tagged_unions(doc: &mut OpenApi) -> usize {
             continue;
         };
 
+        let taken: std::collections::HashSet<&str> = components
+            .schemas
+            .keys()
+            .chain(added.iter().map(|(name, _)| name))
+            .map(String::as_str)
+            .collect();
         let mut items = Vec::with_capacity(one_of.items.len());
         let mut mapping = BTreeMap::new();
+        let mut variants: Vec<(String, RefOr<Schema>)> = Vec::new();
         let mut complete = true;
         for branch in &one_of.items {
             let RefOr::T(Schema::Object(object)) = branch else {
@@ -348,16 +404,25 @@ pub fn discriminate_serde_tagged_unions(doc: &mut OpenApi) -> usize {
                 complete = false;
                 break;
             };
+            // `pascal_case` is not injective (`foo-bar` and `foo_bar` collide),
+            // and a generated name may match a real component. Either way the
+            // branches are not told apart, so the union stays unchanged
+            // instead of documenting the wrong payloads.
             let variant = format!("{name}{}", pascal_case(&value));
+            if variants.iter().any(|(n, _)| *n == variant) || taken.contains(variant.as_str()) {
+                complete = false;
+                break;
+            }
             let location = format!("#/components/schemas/{variant}");
             items.push(RefOr::Ref(Ref::from_schema_name(&variant)));
-            added.push((variant, branch.clone()));
+            variants.push((variant, branch.clone()));
             mapping.insert(value, location);
         }
 
         if !complete {
-            continue; // Not a taggable object; leave the union unchanged.
+            continue; // Not taggable, or the variant names would collide.
         }
+        added.extend(variants);
         let mut rewritten = one_of.clone();
         rewritten.items = items;
         rewritten.discriminator = Some(Discriminator::with_mapping(tag, mapping));

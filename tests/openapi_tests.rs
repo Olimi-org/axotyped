@@ -4,6 +4,9 @@
 #![cfg(feature = "openapi")]
 
 use axotyped::register;
+use axotyped::openapi::discriminate_serde_tagged_unions;
+use utoipa::PartialSchema as _;
+use utoipa::ToSchema as _;
 use axotyped::openapi::{OpenApiConfig, SkippedRoute};
 use axum::extract::{Json, Path, Query, State};
 use serde::{Deserialize, Serialize};
@@ -182,4 +185,182 @@ fn generic_response_types_skip_their_routes_without_dangling_refs() {
     // The walk checks query before response; JobQuery is the first missing type.
     assert_eq!(missing_type, "JobQuery");
     assert!(skipped.len() == 1, "one skip per route");
+}
+
+// ---------------------------------------------------------------------------
+// Document composition regressions
+// ---------------------------------------------------------------------------
+
+#[axotyped::endpoint]
+async fn heartbeat(State(_state): State<TestState>) {}
+
+#[axotyped::endpoint]
+async fn guarded_heartbeat(State(_state): State<TestState>, _auth: TestAuth) {}
+
+#[axotyped::endpoint(opaque)]
+async fn opaque_jobs(State(_state): State<TestState>) -> Json<Vec<JobDone>> {
+    Json(Vec::new())
+}
+
+#[axotyped::endpoint]
+async fn items_by_class(State(_state): State<TestState>, Path(_class): Path<String>) -> Json<JobDone> {
+    Json(JobDone { job_id: String::new(), attempts: 0, log: None })
+}
+
+mod a {
+    use super::*;
+    #[axotyped::endpoint]
+    pub async fn list(State(_state): State<TestState>) -> Json<Vec<JobDone>> {
+        Json(Vec::new())
+    }
+}
+
+mod b {
+    use super::*;
+    #[axotyped::endpoint]
+    pub async fn list(State(_state): State<TestState>) -> Json<Vec<JobDone>> {
+        Json(Vec::new())
+    }
+}
+
+#[test]
+fn no_body_routes_document_200_and_private_401() {
+    let routes = axotyped::collect_routes(|r| {
+        r.group_public("jobs", |g| g.get("/heartbeat", register!(heartbeat)).as_("heartbeat"))
+            .get("/guarded", register!(guarded_heartbeat))
+    });
+    let doc = routes.openapi_document(&OpenApiConfig::new("t", "0"));
+    let paths = &doc.doc.paths;
+
+    let public = paths.paths["/heartbeat"].get.as_ref().expect("public no-body op");
+    let ok = public
+        .responses
+        .responses
+        .get("200")
+        .expect("bare 200 documented for a unit handler");
+    match ok {
+        RefOr::T(response) => assert!(
+            response.content.get("application/json").is_none(),
+            "no body, no content"
+        ),
+        RefOr::Ref(_) => panic!("200 should not be a ref"),
+    }
+
+    let private = paths.paths["/guarded"].get.as_ref().expect("private no-body op");
+    assert!(
+        private.responses.responses.contains_key("401"),
+        "private no-body route keeps its 401"
+    );
+}
+
+#[test]
+fn container_override_route_composes_with_explicit_schema_registration() {
+    // Opaque handler + direct Vec override: the walk cannot name the item,
+    // so the consumer registers it explicitly.
+    let routes = axotyped::collect_routes(|r| {
+        r.group_public("jobs", |g| {
+            g.get("/jobs-opaque", register!(opaque_jobs))
+                .response::<Vec<JobDone>>()
+                .as_("jobs")
+        })
+    })
+    .with_schema::<JobDone>();
+    let doc = routes.openapi_document(&OpenApiConfig::new("t", "0"));
+    assert!(
+        doc.skipped_routes.is_empty(),
+        "Vec override route must compose once the item is registered: {:?}",
+        doc.skipped_routes
+    );
+    let op = doc.doc.paths.paths["/jobs-opaque"].get.as_ref().expect("op");
+    let response = match op.responses.responses.get("200").expect("200") {
+        RefOr::T(response) => response,
+        RefOr::Ref(_) => panic!("200 is a ref"),
+    };
+    let content = response.content.get("application/json").expect("json content");
+    let schema = match content {
+        RefOr::T(content) => content.schema.as_ref().expect("response schema"),
+        RefOr::Ref(_) => panic!("content is a bare ref"),
+    };
+    let RefOr::T(Schema::Array(_)) = schema else {
+        panic!("Vec response must compose as an array");
+    };
+    assert!(doc.doc.components.expect("components").schemas.contains_key("JobDone"));
+}
+
+#[test]
+fn colliding_variant_names_leave_the_union_undiscriminated() {
+    #[derive(Debug, Serialize, Deserialize, axotyped::TS, utoipa::ToSchema)]
+    #[serde(tag = "shape", rename_all = "snake_case")]
+    enum Mixed {
+        #[serde(rename = "foo-bar")]
+        FooBar { a: String },
+        #[serde(rename = "foo_bar")]
+        FooBar2 { b: String },
+    }
+
+    let mut doc = utoipa::openapi::OpenApi::default();
+    let mut captured: Vec<(String, RefOr<Schema>)> = Vec::new();
+    <Mixed as utoipa::ToSchema>::schemas(&mut captured);
+    // The transform reads oneOf schemas, so the union registers itself beside its variants.
+    captured.push((<Mixed as utoipa::ToSchema>::name().to_string(), <Mixed as utoipa::PartialSchema>::schema()));
+    let mut components = utoipa::openapi::schema::Components::default();
+    for (name, schema) in captured {
+        components.schemas.entry(name).or_insert(schema);
+    }
+    doc.components = Some(components);
+
+    assert_eq!(
+        discriminate_serde_tagged_unions(&mut doc),
+        0,
+        "foo-bar/foo_bar collide under pascal_case — union must stay unchanged"
+    );
+    let schemas = &doc.components.expect("components").schemas;
+    let one_of = match &schemas["Mixed"] {
+        RefOr::T(Schema::OneOf(one_of)) => one_of,
+        other => panic!("Mixed is not a oneOf (is_ref={})", matches!(other, RefOr::Ref(_))),
+    };
+    assert!(one_of.discriminator.is_none(), "no discriminator without safe names");
+}
+
+#[test]
+fn duplicate_names_across_groups_get_unique_stable_operation_ids() {
+    let routes = axotyped::collect_routes(|r| {
+        r.group_public("a", |g| g.get("/a/list", register!(a::list)).as_("list"))
+            .group_public("b", |g| g.get("/b/list", register!(b::list)).as_("list"))
+            .group_public("top", |g| g.get("/top", register!(items_by_class)).as_("top"))
+    });
+    let doc = routes.openapi_document(&OpenApiConfig::new("t", "0"));
+    let mut ids: Vec<String> = Vec::new();
+    for item in doc.doc.paths.paths.values() {
+        for op in [&item.get, &item.post, &item.put, &item.patch, &item.delete].into_iter().flatten() {
+            ids.push(op.operation_id.clone().expect("operation id"));
+        }
+    }
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(ids.len(), unique.len(), "operation ids must be unique: {ids:?}");
+    // Disambiguation is symmetric: both colliding names group-qualify, so no
+    // occurrence is privileged; unique names stay verbatim.
+    assert!(ids.contains(&"a_list".to_string()), "{ids:?}");
+    assert!(ids.contains(&"b_list".to_string()), "{ids:?}");
+    assert!(ids.contains(&"top".to_string()), "unique names stay verbatim: {ids:?}");
+}
+
+#[test]
+fn reserved_word_path_param_uses_the_template_name() {
+    let routes = axotyped::collect_routes(|r| {
+        r.group_public("jobs", |g| g.get("/items/{class}", register!(items_by_class)).as_("items"))
+    });
+    let doc = routes.openapi_document(&OpenApiConfig::new("t", "0"));
+    let op = doc.doc.paths.paths["/items/{class}"].get.as_ref().expect("op");
+    let params = op.parameters.as_ref().expect("parameters");
+    let names: Vec<&str> = params
+        .iter()
+        .filter_map(|p| match p {
+            RefOr::T(parameter) => Some(parameter.name.as_str()),
+            RefOr::Ref(_) => None,
+        })
+        .collect();
+    assert_eq!(names, ["class"], "parameter name must match the template, not the JS-safe alias");
 }
