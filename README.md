@@ -68,7 +68,7 @@ Handler names auto-convert to camelCase: `list_projects` → `listProjects`, `cr
 axotyped = "0.5"
 ```
 
-TypeScript type export is built in — every type named in a route contract derives `axotyped::TS`. Optional `*-impl` features add TS support for specific types (`chrono-impl`, `uuid-impl`, `serde-json-impl`, …); `serde-compat`, `no-serde-warnings`, and `format` adjust the derive and output. `axum-ws` enables WebSocket handlers.
+Type export is built in. Derive `axotyped::TS` on every type in a route contract. `axum-ws` enables WebSocket handlers, `openapi` adds OpenAPI composition, and `*-impl` features add specific type support.
 
 `axotyped` re-exports its TS machinery as `axotyped::TS`, so no separate type-export dependency is needed.
 
@@ -536,6 +536,68 @@ The runtime module owns the transport guard, the request executor, the bounded 4
 
 See [tests/snapshots/yauth_style.ts](tests/snapshots/yauth_style.ts) for a full
 client example and [src/runtime.ts](src/runtime.ts) for the shared machine.
+
+## OpenAPI document
+
+The same `RouteCollection` that feeds the TypeScript generator also feeds [OpenAPI](https://spec.openapis.org/oas/v3.1.0) composition. Enable the `openapi` feature:
+
+```toml
+[dependencies]
+axotyped = { version = "0.5", features = ["openapi"] }
+```
+
+With the feature enabled, every body, query, and response type must derive `utoipa::ToSchema` beside `axotyped::TS`:
+
+```rust
+#[derive(serde::Serialize, axotyped::TS, utoipa::ToSchema)]
+pub struct ProjectResponse {
+    pub id: String,
+    pub title: String,
+}
+```
+
+A body, query, or response type without the derive fails to compile.
+
+Assemble the document from the collected routes:
+
+```rust
+use axotyped::openapi::OpenApiConfig;
+
+let doc = routes.openapi_document(
+    &OpenApiConfig::new("My API", "1.0.0").server("https://api.example.com"),
+);
+let yaml = doc.to_yaml().unwrap();
+```
+
+`OpenApiConfig::new` takes the title and version. `server` sets the documented base URL; the generated client takes its base URL at construction. `OpenApiDocument` carries the utoipa `OpenApi` as `doc.doc` and skipped routes as `doc.skipped_routes`. Use `routes.compose_paths(&mut components)` to compose only the `Paths` object when you assemble a document from a hand-written component list.
+
+The composition maps route metadata onto OpenAPI as follows:
+
+| Route metadata | OpenAPI |
+|---|---|
+| Path and method | `PathItem` entry with the method operation |
+| Shared URL across methods | One `PathItem` with each method filled in |
+| `{path}` params | Required string `Parameter` |
+| Query struct | One `Parameter` per property; optionality from the schema |
+| JSON body / response | `application/json` content with a `$ref` |
+| `group(...)` | `tags` |
+| Private visibility | `bearerAuth` security requirement and a 401 response |
+| WebSocket and redirect routes | Omitted |
+
+A route whose type has no component is skipped and reported in `skipped_routes`:
+
+```rust
+use axotyped::openapi::SkippedRoute;
+
+let skipped: Vec<SkippedRoute> = doc.skipped_routes;
+for route in &skipped {
+    eprintln!("{} {}: missing {}", route.method, route.path, route.missing_type);
+}
+```
+
+The walk emits no dangling `$ref` for skipped routes. Add schema coverage to include them.
+
+Serde tagged enums come out as `oneOf` over named variant schemas plus a `discriminator`, so schema consumers can tell variants apart. A `oneOf` whose branches all carry one required single-value string-enum property is treated as a tagged enum, and that property is the tag.
 
 ## License
 
