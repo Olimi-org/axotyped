@@ -302,6 +302,7 @@ mod endpoint_visibility {
     use axotyped::{ApiRouter, Visibility, endpoint};
 
     #[derive(Clone, Copy)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     pub struct TestAuth;
 
     impl axotyped::EndpointParam for TestAuth {
@@ -411,6 +412,7 @@ fn shadowing_built_in_name_with_optional_credential_compiles_on_public() {
 // of these handlers IS the assertion that the extractor set is usable at all.
 
 #[derive(serde::Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct FormData {
     pub name: String,
 }

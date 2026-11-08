@@ -36,10 +36,10 @@ export { __AxoApiError as YAuthError };
 export { jwtExpiry, singleFlight } from "./generated-runtime";
 export type { __AxoTypedWebSocket as TypedWebSocket };
 
-if (__AxoRuntimeSpecVersion !== "0.4.0")
+if (__AxoRuntimeSpecVersion !== "0.5.0")
   throw new Error("client/runtime version drift — regenerate both files together");
 
-export const RUNTIME_VERSION = "0.4.0";
+export const RUNTIME_VERSION = "0.5.0";
 
 /** Transport policy. */
 export const TRANSPORT = { scheme: "bearer" } as const;

@@ -8,6 +8,7 @@ use axotyped::{AuthScheme, GeneratorConfig, generate};
 // Test identity extractor — satisfies the private chain's compile-time
 // authorization requirement (Credential).
 #[derive(Clone, Copy)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TestAuth;
 
 impl axotyped::EndpointParam for TestAuth {
@@ -36,10 +37,12 @@ async fn issue_ticket(_auth: TestAuth) {}
 async fn private_thing(_auth: TestAuth) {}
 
 #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct ClientEvent {
     kind: String,
 }
 #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct ServerEvent {
     kind: String,
 }
@@ -110,6 +113,7 @@ fn missing_reference_fails_build() {
 
 /// Input-taking ticket mint.
 #[derive(serde::Deserialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct TicketScopeQuery {
     _scope: String,
 }
@@ -285,6 +289,7 @@ fn lifecycle_machinery_emitted_when_flow_declared() {
 /// The renewal helper needs a response type to read fields off; a lifecycle
 /// route returning `()` gets none.
 #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct BearerResponse {
     token: String,
     expires_in: u64,
@@ -354,6 +359,7 @@ fn renewal_helper_quotes_non_identifier_wire_fields() {
 /// An oauth2 pair lifts all three declared fields, normalising the two
 /// optional ones to null rather than leaving them undefined.
 #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct PairResponse {
     access_token: String,
     refresh_token: Option<String>,
@@ -520,6 +526,7 @@ fn flow_under_non_bearer_scheme_generates_without_lifecycle_machinery() {
 /// Response carrying the bearer — `token` is `Option<String>`: anonymous
 /// answers `null`, and the helper maps that to "no token" for the app.
 #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct MeResponse {
     authenticated: bool,
     token: Option<String>,
@@ -534,6 +541,7 @@ async fn me_typed() -> axum::Json<MeResponse> {
 }
 
 #[derive(serde::Deserialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct RefreshRequest {
     _refresh_token: String,
 }
@@ -636,6 +644,7 @@ fn parameterized_lifecycle_route_fails_generation() {
 
 /// Query-taking refresh route.
 #[derive(serde::Deserialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct TenantQuery {
     _tenant: String,
 }
@@ -713,6 +722,7 @@ mod sealed {
     use super::*;
 
     #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     pub struct SealedTokenResponse {
         token: String,
     }
@@ -749,6 +759,7 @@ fn flow_field_probe_reaches_private_fields_across_modules() {
 }
 
 #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct RenamedTokenResponse {
     #[ts(rename = "accessToken")]
     access: String,
@@ -787,6 +798,7 @@ fn flow_field_probe_checks_the_wire_name_not_the_rust_name() {
 // -- oauth2 pair (`-> { access, refresh, expires_in }`) ----------------------
 
 #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,

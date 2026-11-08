@@ -3,19 +3,23 @@ use axum::extract::{Json, Path, State};
 use serde::Deserialize;
 
 #[derive(Clone, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct AppState;
 
 #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct UserResponse {
     _id: String,
 }
 
 #[derive(Deserialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct CreateUserRequest {
     _name: String,
 }
 
 #[derive(Deserialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct ListQuery {
     _limit: Option<u32>,
 }
@@ -25,6 +29,7 @@ struct ListQuery {
 // Test identity extractor — satisfies the private chain's compile-time
 // authorization requirement (Enforced), extracting as a no-op.
 #[derive(Clone, Copy)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TestAuth;
 
 impl axotyped::EndpointParam for TestAuth {
@@ -52,6 +57,7 @@ async fn open_resource(State(_s): State<AppState>) {}
 // like any other custom extractor (a bare name is assumed to be axum's).
 mod shadow {
     #[derive(Clone, Copy)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     pub struct State;
 
     impl axotyped::EndpointParam for State {
@@ -328,16 +334,19 @@ fn builder_redirect() {
 #[test]
 fn builder_websocket_typed() {
     #[derive(Deserialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     struct WsParams {
         _token: String,
     }
 
     #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     struct ClientEvent {
         _msg: String,
     }
 
     #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     struct ServerEvent {
         _reply: String,
     }
@@ -365,11 +374,13 @@ fn builder_websocket_typed() {
 #[test]
 fn builder_websocket_with_path_params() {
     #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     struct ClientEvent {
         _msg: String,
     }
 
     #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     struct ServerEvent {
         _reply: String,
     }
@@ -393,11 +404,13 @@ fn builder_websocket_with_path_params() {
 #[test]
 fn builder_websocket_with_auth() {
     #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     struct ClientEvent {
         _msg: String,
     }
 
     #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     struct ServerEvent {
         _reply: String,
     }
@@ -418,11 +431,13 @@ fn builder_websocket_with_auth() {
 #[test]
 fn builder_websocket_custom_name() {
     #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     struct ClientEvent {
         _msg: String,
     }
 
     #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     struct ServerEvent {
         _reply: String,
     }
@@ -583,10 +598,12 @@ fn routes_are_private_by_default() {
         );
     }
     #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     struct ClientEvent {
         kind: String,
     }
     #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     struct ServerEvent {
         kind: String,
     }
@@ -676,10 +693,12 @@ fn group_permissive_forwards_from_mid_chain_builders() {
     assert_eq!(routes.routes()[1].visibility, Visibility::Permissive);
 }
 #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct ClientEvent {
     kind: String,
 }
 #[derive(serde::Serialize, axotyped::TS)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct ServerEvent {
     kind: String,
 }
@@ -969,6 +988,7 @@ fn same_name_in_different_groups_is_fine() {
 
 /// Deliberately NOT `axotyped::TS` — only usable on an opaque endpoint.
 #[derive(serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct OpaqueDto {
     _token: String,
 }

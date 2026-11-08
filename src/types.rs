@@ -32,7 +32,7 @@ pub struct PathParam {
     pub name: String,
 }
 
-/// What a route declares — and effectively is — regarding authentication.
+/// What a route declares, and what it effectively is, regarding authentication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Visibility {
     /// Requires authentication. The generated client attaches credentials
@@ -43,6 +43,49 @@ pub enum Visibility {
     Public,
     /// Credentials attached when available, never required.
     Permissive,
+}
+
+/// Directional binary-frame capability for a WebSocket route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WsBinaryMode {
+    /// JSON text frames only (`send` / `onMessage`).
+    #[default]
+    None,
+    /// Client may send binary frames (`sendBinary`).
+    Send,
+    /// Server may send binary frames (`onBinary`, `ws.binaryType = "arraybuffer"`).
+    Receive,
+    /// Both directions support binary frames (`sendBinary` + `onBinary`).
+    Both,
+}
+
+impl WsBinaryMode {
+    /// Enable client-to-server binary frames.
+    pub const fn with_send(self) -> Self {
+        match self {
+            Self::None | Self::Send => Self::Send,
+            Self::Receive | Self::Both => Self::Both,
+        }
+    }
+
+    /// Enable server-to-client binary frames.
+    pub const fn with_receive(self) -> Self {
+        match self {
+            Self::None | Self::Receive => Self::Receive,
+            Self::Send | Self::Both => Self::Both,
+        }
+    }
+
+    /// Wire representation for `OperationSpec.wsBinary` and `TypedWebSocket`'s
+    /// `TBinary` type parameter (`None` when `Self::None`).
+    pub const fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Send => Some("send"),
+            Self::Receive => Some("receive"),
+            Self::Both => Some("both"),
+        }
+    }
 }
 
 /// Definition of a single API route.
@@ -81,6 +124,8 @@ pub struct RouteDefinition {
     pub ws_send_type: Option<String>,
     /// Rust type name for server-to-client events (receive direction).
     pub ws_receive_type: Option<String>,
+    /// Directional binary WebSocket frame capability (defaults to [`WsBinaryMode::None`]).
+    pub ws_binary: WsBinaryMode,
 }
 
 impl RouteDefinition {
@@ -102,6 +147,12 @@ impl RouteDefinition {
 /// A type-erased `T::export_all(&cfg)` function pointer.
 type ExportFn = fn(&crate::ts::Config) -> Result<(), crate::ts::ExportError>;
 
+/// A type-erased schema-registration function pointer: pushes `T`'s component
+/// schema (name + schema, then `T::schemas` for its direct dependencies) onto
+/// `out`. The registry walk deduplicates by schema name.
+#[cfg(feature = "openapi")]
+type SchemaFn = fn(&mut Vec<(String, utoipa::openapi::RefOr<utoipa::openapi::Schema>)>);
+
 /// Called when a route names type `T` for TypeScript export.
 ///
 /// [`NoCollect`] ignores registrations; [`TypeRegistry`] collects them
@@ -109,6 +160,15 @@ type ExportFn = fn(&crate::ts::Config) -> Result<(), crate::ts::ExportError>;
 pub trait Collector: Default {
     /// Register `T`. The default is a no-op; collecting collectors override this.
     fn register<T: crate::MaybeTs + 'static>(&mut self) {}
+
+    /// Register `T`'s OpenAPI component schema. No-op without the `openapi`
+    /// feature (bound: [`MaybeTs`], satisfied wherever [`register`](Self::register)
+    /// compiles); with the feature the bound is `utoipa::ToSchema`, so a route
+    /// type without a schema fails to compile.
+    #[cfg(not(feature = "openapi"))]
+    fn register_schema<T: crate::MaybeTs + 'static>(&mut self) {}
+    #[cfg(feature = "openapi")]
+    fn register_schema<T: utoipa::ToSchema + 'static>(&mut self) {}
 
     /// Merge another collector of the same kind into this one (used by `merge` / `group_with`).
     fn merge_collection(&mut self, _other: Self) {}
@@ -127,6 +187,20 @@ impl Collector for NoCollect {
     }
 }
 
+/// Monomorphized schema capture: `T`'s own component, then `T::schemas`
+/// forwarding for its dependency closure.
+#[cfg(feature = "openapi")]
+fn schema_of<T: utoipa::ToSchema>(out: &mut Vec<(String, utoipa::openapi::RefOr<utoipa::openapi::Schema>)>) {
+    out.push((T::name().to_string(), T::schema()));
+    T::schemas(out);
+}
+
+/// Dependency closure only, no self component: the wrapper composes inline in the document.
+#[cfg(feature = "openapi")]
+fn schema_deps_of<T: utoipa::ToSchema>(out: &mut Vec<(String, utoipa::openapi::RefOr<utoipa::openapi::Schema>)>) {
+    T::schemas(out);
+}
+
 /// Collects route types for ts-rs export via `export_all()`.
 /// Deduplicates by `TypeId` so shared generic impls emit one declaration.
 #[derive(Debug, Clone, Default)]
@@ -134,6 +208,11 @@ pub struct TypeRegistry {
     /// TypeId → export_all function pointer, for deduplication and export.
     slots: Vec<(std::any::TypeId, ExportFn)>,
     seen: std::collections::BTreeSet<std::any::TypeId>,
+    /// TypeId → schema-registration function pointer, for OpenAPI composition.
+    #[cfg(feature = "openapi")]
+    schema_slots: Vec<(std::any::TypeId, SchemaFn)>,
+    #[cfg(feature = "openapi")]
+    schema_seen: std::collections::BTreeSet<std::any::TypeId>,
 }
 
 /// Returns true for stdlib wrappers handled inline (`Vec` as `T[]`, `Option` as `T | null`).
@@ -156,6 +235,12 @@ impl TypeRegistry {
         &self.slots
     }
 
+    /// All registered schema-capture function pointers.
+    #[cfg(feature = "openapi")]
+    pub fn schema_slots(&self) -> &[(std::any::TypeId, SchemaFn)] {
+        &self.schema_slots
+    }
+
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
@@ -171,6 +256,12 @@ impl TypeRegistry {
                 self.slots.push((type_id, export_fn));
             }
         }
+        #[cfg(feature = "openapi")]
+        for (type_id, schema_fn) in other.schema_slots {
+            if self.schema_seen.insert(type_id) {
+                self.schema_slots.push((type_id, schema_fn));
+            }
+        }
     }
 }
 
@@ -183,6 +274,27 @@ impl Collector for TypeRegistry {
         let type_id = std::any::TypeId::of::<T>();
         if self.seen.insert(type_id) {
             self.slots.push((type_id, T::export_all));
+        }
+    }
+
+    #[cfg(not(feature = "openapi"))]
+    fn register_schema<T: crate::MaybeTs + 'static>(&mut self) {}
+
+    #[cfg(feature = "openapi")]
+    fn register_schema<T: utoipa::ToSchema + 'static>(&mut self) {
+        let type_id = std::any::TypeId::of::<T>();
+        if self.schema_seen.insert(type_id) {
+            // Container wrappers compose inline in the document (arrays,
+            // optionals) and cannot name their item from here. Forward the
+            // item's dependency closure only; the item type itself must be
+            // captured by a route that names it directly, or registered
+            // explicitly with [`RouteCollection::with_schema`].
+            let slot = if is_container_wrapper(std::any::type_name::<T>()) {
+                schema_deps_of::<T> as SchemaFn
+            } else {
+                schema_of::<T> as SchemaFn
+            };
+            self.schema_slots.push((type_id, slot));
         }
     }
 
@@ -206,6 +318,17 @@ pub struct RouteCollection {
 impl RouteCollection {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Capture `T`'s component schema (and its dependency closure) into the
+    /// registry. For types the route walk cannot name: an item inside a
+    /// container override (`.response::<Vec<Dto>>()` on an opaque handler),
+    /// or a standalone schema consumed outside the route surface. Skipped
+    /// routes name the types they are missing.
+    #[cfg(feature = "openapi")]
+    pub fn with_schema<T: utoipa::ToSchema + 'static>(mut self) -> Self {
+        self.types.register_schema::<T>();
+        self
     }
 
     /// Builds a `RouteCollection` from routes and a type registry.
@@ -293,16 +416,16 @@ impl RouteCollection {
 
         for (_, export_fn) in self.types.slots() {
             if let Err(e) = export_fn(&cfg) {
-                // Log but don't fail — one bad type shouldn't block generation
+                // Log and continue: one bad type does not block generation
                 eprintln!("axotyped: type export failed: {e}");
             }
         }
 
         // Write a barrel index.ts that re-exports every .ts file in the
-        // bindings directory.  ts-rs's export_all() also writes transitive
-        // dependencies (e.g. DialogLine used inside Dialog), so we scan the
-        // directory to pick up all generated types — not just the ones that
-        // appear directly in route signatures.
+        // bindings directory. ts-rs's export_all() also writes transitive
+        // dependencies (e.g. DialogLine used inside Dialog), so the scan
+        // covers every generated file, not only the types that appear
+        // directly in route signatures.
         let mut names: Vec<String> = Vec::new();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -451,7 +574,7 @@ pub fn extract_path_params(path: &str) -> Vec<PathParam> {
 }
 
 /// Returns raw `{...}` contents in first-occurrence order.
-fn scan_raw_path_params(path: &str) -> Vec<&str> {
+pub(crate) fn scan_raw_path_params(path: &str) -> Vec<&str> {
     let mut raws: Vec<&str> = Vec::new();
     let mut rest = path;
     while let Some(open) = rest.find('{') {
@@ -571,6 +694,7 @@ mod tests {
             websocket: false,
             ws_send_type: None,
             ws_receive_type: None,
+            ws_binary: WsBinaryMode::None,
         });
 
         let mut b = RouteCollection::new();
@@ -590,6 +714,7 @@ mod tests {
             websocket: false,
             ws_send_type: None,
             ws_receive_type: None,
+            ws_binary: WsBinaryMode::None,
         });
 
         a.extend(b);

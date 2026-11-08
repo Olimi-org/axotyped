@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "axotyped"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Olimi-org/axotyped"
@@ -22,6 +22,11 @@ axum-ws = ["axum/ws"]
 
 # Blanket `EndpointParam` impl for `axum::extract::Multipart`.
 axum-multipart = ["axum/multipart"]
+
+# --- OpenAPI document composition (utoipa-based) ---
+# Schema capture requires ToSchema impls on every route-referenced type;
+# without the feature the same registrations are no-ops bounded by MaybeTs.
+openapi = ["dep:utoipa", "dep:serde_json"]
 
 # --- ts-rs serde integration ---
 serde-compat = ["axotyped-macros/serde-compat"]
@@ -55,6 +60,8 @@ tower = { version = "0.5", default-features = false }
 
 # ts machinery deps
 thiserror = { version = "2" }
+# OpenAPI document model for the `openapi` feature (paths + components).
+utoipa = { version = "6", default-features = false, features = ["yaml", "macros", "chrono"], optional = true }
 serde_json = { version = "1", optional = true }
 
 # ts-rs optional integrations
@@ -77,6 +84,8 @@ dprint-plugin-typescript = { version = "= 0.95", optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
+# Only under `openapi`: cfg_attr derives in the integration tests.
+utoipa = { version = "6", default-features = false, features = ["macros"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }

@@ -1,3 +1,12 @@
+## 0.5.0 (2026-11-08)
+
+### Features
+
+- OpenAPI document composition under the `openapi` feature (utoipa document model). `RouteCollection::openapi_document(&OpenApiConfig)` assembles paths from route metadata and components from the schema-capturing registry; `compose_paths` composes only the `Paths` object for consumers assembling a document themselves. Private routes carry a bearer security requirement (`bearerAuth`) and a 401 response; groups become tags; shared URLs merge into one `PathItem`. With the feature enabled, every route-referenced type must implement `utoipa::ToSchema`, so a type without a schema fails to compile.
+- Serde tagged enums are discriminated in the composed document: inline `oneOf` branches sharing exactly one required single-value string tag are hoisted to named variant components with a `discriminator` mapping. Detection is shape-driven.
+- Routes referencing a type with no component are skipped and reported as `SkippedRoute { method, path, missing_type }` instead of emitting a dangling `$ref`.
+- WebSocket typed binary payloads: `WsRouteBuilder::binary_send()` / `binary_receive()` / `binary()` declare `WsBinaryMode` (`send`/`receive`/`both`); the generated client threads it through `OPERATIONS.wsBinary` and `TypedWebSocket<TSend, TReceive, TBinary>`, exposing `sendBinary(data)` and `onBinary(handler)` with `ws.binaryType = "arraybuffer"` on receive-enabled routes. Default stays JSON text frames only.
+
 ## 0.4.0 (2026-10-07)
 
 ### Breaking changes

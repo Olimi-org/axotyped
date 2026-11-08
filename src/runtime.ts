@@ -38,6 +38,12 @@ export type AuthMode = "none" | "optional" | "required";
 /** Success-body contract declared server-side per route. */
 export type ResponseMode = "json" | "void" | "raw";
 
+/** Directional binary-frame capability for a WebSocket route. */
+export type WsBinaryMode = "none" | "send" | "receive" | "both";
+
+/** Binary payload accepted by `sendBinary` on binary-send WebSocket routes. */
+export type BinaryPayload = ArrayBuffer | ArrayBufferView | Blob;
+
 /**
  * One route as data. Everything the transport does is derived from these
  * fields: `cache: "no-store"` follows from `auth !== "none"`, redirect
@@ -57,6 +63,8 @@ export interface OperationSpec {
   readonly allowRedirects?: boolean;
   /** Present when the route is a WebSocket endpoint. */
   readonly ws?: boolean;
+  /** Directional binary-frame support declared on a WebSocket endpoint. */
+  readonly wsBinary?: "send" | "receive" | "both";
 }
 
 /** Per-call arguments; the route method's signature types each field. */
@@ -143,11 +151,15 @@ export interface Transport {
   urlFor(op: Readonly<OperationSpec>, args?: CallArgs): string;
   /** WebSocket connect. Runs the ticket handshake when configured. Event
     *  types are part of the route contract; every WS method uses the typed
-    *  JSON-codec wrapper. */
-  connect<TSend = unknown, TReceive = unknown>(
+    *  JSON-codec wrapper, plus directional binary methods when declared. */
+  connect<
+    TSend = unknown,
+    TReceive = unknown,
+    TBinary extends WsBinaryMode = "none",
+  >(
     op: Readonly<OperationSpec>,
     args?: CallArgs,
-  ): Promise<TypedWebSocket<TSend, TReceive>>;
+  ): Promise<TypedWebSocket<TSend, TReceive, TBinary>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +264,7 @@ export type TransportScheme = "bearer" | "cookie" | "none";
 /** Render a key for an error message, escaping quotes and control
  *  characters. */
 function escapeKeyForMessage(key: string): string {
-  return key.replace(/[\\" -]/g, "�");
+  return key.replace(/[\\\"\x00-\x1f\x7f]/g, "�");
 }
 
 /** WebSocket ticket configuration. It applies with or without a declared
@@ -538,8 +550,13 @@ export function createTransport(
     execute: <T>(op: Readonly<OperationSpec>, args?: CallArgs) =>
       executeInternal<T>(op, args),
     urlFor: (op, args) => buildUrl(op, args),
-    connect: <TSend, TReceive>(op: Readonly<OperationSpec>, args?: CallArgs) =>
-      connectWs<TSend, TReceive>(op, args) as Promise<TypedWebSocket<TSend, TReceive>>,
+    connect: <TSend, TReceive, TBinary extends WsBinaryMode = "none">(
+      op: Readonly<OperationSpec>,
+      args?: CallArgs,
+    ) =>
+      connectWs<TSend, TReceive>(op, args) as unknown as Promise<
+        TypedWebSocket<TSend, TReceive, TBinary>
+      >,
   };
 
   async function connectWs<TSend, TReceive>(
@@ -583,7 +600,7 @@ export function createTransport(
       auth: op.auth !== "none",
       credentials,
     });
-    return createTypedWebSocket<TSend, TReceive>(new WebSocket(url));
+    return createTypedWebSocket<TSend, TReceive>(new WebSocket(url), op.wsBinary);
   }
 
   return transport;
@@ -593,7 +610,8 @@ export function createTransport(
 // Typed WebSocket
 // ---------------------------------------------------------------------------
 
-export interface TypedWebSocket<TSend, TReceive> {
+/** JSON-frame surface shared by every typed WebSocket wrapper. */
+export interface TypedWebSocketBase<TSend, TReceive> {
   send(event: TSend): void;
   /** Subscribe to socket events. Registering twice adds two listeners;
    *  each is called. */
@@ -607,20 +625,77 @@ export interface TypedWebSocket<TSend, TReceive> {
   readonly readyState: number;
 }
 
+/** Added to the wrapper when the route declares client-to-server binary
+ *  frames (`binary_send` / `binary`). */
+export interface BinarySendMethods {
+  /** Send one binary frame verbatim — no JSON envelope is applied. */
+  sendBinary(data: BinaryPayload): void;
+}
+
+/** Added to the wrapper when the route declares server-to-client binary
+ *  frames (`binary_receive` / `binary`). */
+export interface BinaryReceiveMethods {
+  /** Subscribe to binary frames. Each frame is delivered as the raw
+   *  ArrayBuffer (the socket's `binaryType` is forced to `"arraybuffer"`)
+   *  and never mixed into `onMessage`'s JSON codec. Registering twice adds
+   *  two listeners; each is called. */
+  onBinary(handler: (data: ArrayBuffer) => void): void;
+}
+
+/** The typed WebSocket wrapper. The JSON event surface is identical for
+ *  every route; binary methods appear only when the route's declared
+ *  `wsBinary` mode asks for them. */
+export type TypedWebSocket<
+  TSend,
+  TReceive,
+  TBinary extends WsBinaryMode = "none",
+> = TBinary extends "both"
+  ? TypedWebSocketBase<TSend, TReceive> & BinarySendMethods & BinaryReceiveMethods
+  : TBinary extends "send"
+    ? TypedWebSocketBase<TSend, TReceive> & BinarySendMethods
+    : TBinary extends "receive"
+      ? TypedWebSocketBase<TSend, TReceive> & BinaryReceiveMethods
+      : TypedWebSocketBase<TSend, TReceive>;
+
 export function createTypedWebSocket<TSend, TReceive>(
   ws: WebSocket,
-): TypedWebSocket<TSend, TReceive> {
-  return {
+  binary: "send" | "receive" | "both" | "none" = "none",
+): TypedWebSocketBase<TSend, TReceive> {
+  // Buffer incoming frames as ArrayBuffers on receive routes: Blob (the
+  // default) cannot be handed to native zero-copy, and the declared
+  // contract is an ArrayBuffer. JSON-only routes never receive binary
+  // frames, so their binaryType stays untouched.
+  if (binary === "receive" || binary === "both") {
+    ws.binaryType = "arraybuffer";
+  }
+
+  const handlers = {
     send: (event: TSend) => ws.send(JSON.stringify(event)),
+    // Cast to BufferSource: DOM typings disagree across TS versions on
+    // whether ArrayBufferView may back a SharedArrayBuffer; every
+    // BinaryPayload variant is sendable at runtime.
+    sendBinary: (data: BinaryPayload) => ws.send(data as BufferSource),
     // addEventListener (not onX property assignment) so multiple
     // subscribers all fire instead of silently replacing each other.
     onOpen: (handler: () => void) => {
       ws.addEventListener("open", () => handler());
     },
     onMessage: (handler: (event: TReceive) => void) => {
-      ws.addEventListener("message", (raw) =>
-        handler(JSON.parse((raw as MessageEvent).data as string) as TReceive),
-      );
+      ws.addEventListener("message", (raw) => {
+        const data = (raw as MessageEvent).data;
+        // Text frames carry the JSON event codec. Binary frames belong to
+        // the route's binary contract (onBinary); a JSON-only route drops
+        // them rather than parsing garbage.
+        if (typeof data !== "string") return;
+        handler(JSON.parse(data) as TReceive);
+      });
+    },
+    onBinary: (handler: (data: ArrayBuffer) => void) => {
+      ws.addEventListener("message", (raw) => {
+        const data = (raw as MessageEvent).data;
+        if (typeof data === "string") return;
+        handler(data as ArrayBuffer);
+      });
     },
     onError: (handler: (event: unknown) => void) => {
       ws.addEventListener("error", (event) => handler(event));
@@ -639,4 +714,8 @@ export function createTypedWebSocket<TSend, TReceive>(
       return ws.readyState;
     },
   };
+  // Binary methods are always implemented; the route's declared `wsBinary`
+  // mode decides — via the `TypedWebSocket` conditional type at `connect` —
+  // whether callers may see and call them.
+  return handlers as TypedWebSocketBase<TSend, TReceive>;
 }

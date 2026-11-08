@@ -833,6 +833,9 @@ fn write_operations_table(
         }
         if route.websocket {
             fields.push("ws: true".into());
+            if let Some(mode) = route.ws_binary.as_str() {
+                fields.push(format!("wsBinary: \"{mode}\""));
+            }
         }
         w!(out, "  {}: {{ {} }},", op_key(&key), fields.join(", "));
     }
@@ -1470,16 +1473,20 @@ fn generate_route_method(
             route.ws_receive_type.as_deref().unwrap_or("ServerEvent"),
             large_int,
         );
+        let type_args = match route.ws_binary.as_str() {
+            Some(mode) => format!("{send_ts}, {recv_ts}, \"{mode}\""),
+            None => format!("{send_ts}, {recv_ts}"),
+        };
         if params.is_empty() {
             write!(
                 out,
-                ": () => transport.connect<{send_ts}, {recv_ts}>(OPERATIONS{key}{args})"
+                ": () => transport.connect<{type_args}>(OPERATIONS{key}{args})"
             )
             .unwrap();
         } else {
             write!(
                 out,
-                ": ({params}) =>\n{pad}transport.connect<{send_ts}, {recv_ts}>(OPERATIONS{key}{args})"
+                ": ({params}) =>\n{pad}transport.connect<{type_args}>(OPERATIONS{key}{args})"
             )
             .unwrap();
         }

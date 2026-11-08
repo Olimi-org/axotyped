@@ -698,6 +698,43 @@ fn generates_websocket_typed_send_and_receive() {
     assert!(output.contains("transport.connect<ClientEvent, ServerEvent>(OPERATIONS.wsUpgrade"));
 }
 
+#[test]
+fn generates_websocket_binary_modes() {
+    let routes = api_routes! {
+        sendOnly: GET "/send" [ws, binary_send]
+            send: ClientEvent, receive: ServerEvent;
+        receiveOnly: GET "/receive" [ws, binary_receive]
+            send: ClientEvent, receive: ServerEvent;
+        bothWays: GET "/both" [ws, binary]
+            send: ClientEvent, receive: ServerEvent;
+        jsonOnly: GET "/json" [ws]
+            send: ClientEvent, receive: ServerEvent;
+    };
+    let config = yauth_config();
+    let output = generate(&routes, &config);
+
+    // Descriptor carries the declared direction; JS-only routes omit it.
+    assert!(output.contains("wsBinary: \"send\""), "{output}");
+    assert!(output.contains("wsBinary: \"receive\""), "{output}");
+    assert!(output.contains("wsBinary: \"both\""), "{output}");
+    assert!(
+        output.contains("transport.connect<ClientEvent, ServerEvent, \"send\">(OPERATIONS.sendOnly)"),
+        "{output}"
+    );
+    assert!(
+        output.contains("transport.connect<ClientEvent, ServerEvent, \"receive\">(OPERATIONS.receiveOnly)"),
+        "{output}"
+    );
+    assert!(
+        output.contains("transport.connect<ClientEvent, ServerEvent, \"both\">(OPERATIONS.bothWays)"),
+        "{output}"
+    );
+    assert!(
+        output.contains("transport.connect<ClientEvent, ServerEvent>(OPERATIONS.jsonOnly)"),
+        "{output}"
+    );
+}
+
 // ===========================================================================
 // Auth scheme dimension (bearer | cookie | none)
 // ===========================================================================
@@ -815,6 +852,7 @@ fn manual_route(
         websocket: false,
         ws_send_type: None,
         ws_receive_type: None,
+        ws_binary: axotyped::WsBinaryMode::None,
     }
 }
 

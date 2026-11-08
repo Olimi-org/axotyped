@@ -716,6 +716,44 @@ describe("transport: WebSocket", () => {
       [],
     ]);
   });
+
+  test("sendBinary frames go verbatim, receive sets arraybuffer, directions stay separate", () => {
+    const stub = stubSocket();
+    const socket = createTypedWebSocket(stub, "both");
+    expect(stub.binaryType).toBe("arraybuffer");
+
+    const payload = new Uint8Array([1, 2, 3]);
+    socket.sendBinary(payload.buffer);
+    expect(stub.sent[0]).toBe(payload.buffer);
+
+    const json = [];
+    const binary = [];
+    socket.onMessage((e) => json.push(e));
+    socket.onBinary((d) => binary.push(d));
+    stub.emit("message", { data: '{"kind":"ping"}' });
+    const bytes = new Uint8Array([4, 5]);
+    stub.emit("message", { data: bytes.buffer });
+    expect(json).toEqual([{ kind: "ping" }]);
+    expect(binary).toEqual([bytes.buffer]);
+  });
+
+  test("send-only sockets leave binaryType untouched", () => {
+    const stub = stubSocket();
+    const socket = createTypedWebSocket(stub, "send");
+    expect(stub.binaryType).toBeUndefined();
+    socket.sendBinary(new Uint8Array([9]).buffer);
+    expect(stub.sent[0]).toBeInstanceOf(ArrayBuffer);
+  });
+
+  test("json-only sockets drop binary frames instead of parsing garbage", () => {
+    const stub = stubSocket();
+    const socket = createTypedWebSocket(stub);
+    expect(stub.binaryType).toBeUndefined();
+    const json = [];
+    socket.onMessage((e) => json.push(e));
+    stub.emit("message", { data: new Uint8Array([7]).buffer });
+    expect(json).toEqual([]);
+  });
 });
 
 describe("executor: observers cannot consume the transport's body", () => {

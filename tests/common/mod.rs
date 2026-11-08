@@ -56,6 +56,7 @@ macro_rules! api_routes {
             websocket: true,
             ws_send_type: api_routes!(@opt_type $so $(<$si>)?),
             ws_receive_type: api_routes!(@opt_type $ro2 $(<$ri2>)?),
+            ws_binary: api_routes!(@ws_binary $([$($flag),*])?),
         });
         api_routes!(@collect $collection, @group_ctx $group, $($rest)*);
     };
@@ -86,6 +87,7 @@ macro_rules! api_routes {
             websocket: api_routes!(@has_ws_flag $([$($flag),*])?),
             ws_send_type: None,
             ws_receive_type: None,
+            ws_binary: api_routes!(@ws_binary $([$($flag),*])?),
         });
         api_routes!(@collect $collection, @group_ctx $group, $($rest)*);
     };
@@ -151,6 +153,23 @@ macro_rules! api_routes {
     (@check_ws_flag ws $(, $rest:ident)*) => { true };
     (@check_ws_flag $other:ident $(, $rest:ident)*) => {
         api_routes!(@check_ws_flag $($rest),*)
+    };
+
+    // WebSocket binary mode helper
+    (@ws_binary) => { ::axotyped::WsBinaryMode::None };
+    (@ws_binary [$($flag:ident),*]) => {
+        if api_routes!(@has_flag binary [$($flag),*])
+            || (api_routes!(@has_flag binary_send [$($flag),*])
+                && api_routes!(@has_flag binary_receive [$($flag),*]))
+        {
+            ::axotyped::WsBinaryMode::Both
+        } else if api_routes!(@has_flag binary_send [$($flag),*]) {
+            ::axotyped::WsBinaryMode::Send
+        } else if api_routes!(@has_flag binary_receive [$($flag),*]) {
+            ::axotyped::WsBinaryMode::Receive
+        } else {
+            ::axotyped::WsBinaryMode::None
+        }
     };
 
     // Optional type helpers — handles plain idents and Generic<Inner>

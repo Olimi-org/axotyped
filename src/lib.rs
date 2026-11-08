@@ -50,7 +50,7 @@ pub use params::{
 };
 pub use types::{
     Collector, HttpMethod, NoCollect, PathParam, RouteCollection, RouteDefinition, TypeRegistry,
-    Visibility, extract_path_params, is_valid_js_identifier,
+    Visibility, WsBinaryMode, extract_path_params, is_valid_js_identifier,
 };
 
 pub use builder::{
@@ -315,6 +315,14 @@ macro_rules! __auth_kind {
         $crate::AuthFlowKind::StaticBearer
     };
 }
+
+// OpenAPI composition: paths from route metadata + components from the
+// schema-capturing registry, under the `openapi` feature.
+#[cfg(feature = "openapi")]
+pub mod openapi;
+
+#[cfg(feature = "openapi")]
+pub use utoipa;
 
 // ts integration: TS trait, derive macro, and all standard type impls.
 // The derive macro lives in axotyped-macros

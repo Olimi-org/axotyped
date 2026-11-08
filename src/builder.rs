@@ -719,6 +719,7 @@ where
         websocket,
         ws_send_type: None,
         ws_receive_type: None,
+        ws_binary: crate::types::WsBinaryMode::None,
     }
 }
 
@@ -873,32 +874,67 @@ where
     C: Collector,
 {
     /// Set the request body type.
+    #[cfg(not(feature = "openapi"))]
     pub fn body<T: MaybeTs + 'static>(mut self) -> Self {
         self.def.body_type = Some(type_string::<T>());
         self.parent.collector.register::<T>();
         self
     }
+#[cfg(feature = "openapi")]
+    pub fn body<T: MaybeTs + utoipa::ToSchema + 'static>(mut self) -> Self {
+        self.def.body_type = Some(type_string::<T>());
+        self.parent.collector.register::<T>();
+        self.parent.collector.register_schema::<T>();
+        self
+    }
 
     /// Set the response type.
+    #[cfg(not(feature = "openapi"))]
     pub fn response<T: MaybeTs + 'static>(mut self) -> Self {
         self.def.response_type = Some(type_string::<T>());
         self.parent.collector.register::<T>();
         self
     }
+#[cfg(feature = "openapi")]
+    pub fn response<T: MaybeTs + utoipa::ToSchema + 'static>(mut self) -> Self {
+        self.def.response_type = Some(type_string::<T>());
+        self.parent.collector.register::<T>();
+        self.parent.collector.register_schema::<T>();
+        self
+    }
 
     /// Set the query parameters type.
+    #[cfg(not(feature = "openapi"))]
     pub fn query<T: MaybeTs + 'static>(mut self) -> Self {
         self.def.query_type = Some(type_string::<T>());
         self.parent.collector.register::<T>();
         self
     }
+#[cfg(feature = "openapi")]
+    pub fn query<T: MaybeTs + utoipa::ToSchema + 'static>(mut self) -> Self {
+        self.def.query_type = Some(type_string::<T>());
+        self.parent.collector.register::<T>();
+        self.parent.collector.register_schema::<T>();
+        self
+    }
 
     /// Set both body and response types at once.
+    #[cfg(not(feature = "openapi"))]
     pub fn json<B: MaybeTs + 'static, R: MaybeTs + 'static>(mut self) -> Self {
         self.def.body_type = Some(type_string::<B>());
         self.def.response_type = Some(type_string::<R>());
         self.parent.collector.register::<B>();
         self.parent.collector.register::<R>();
+        self
+    }
+#[cfg(feature = "openapi")]
+    pub fn json<B: MaybeTs + utoipa::ToSchema + 'static, R: MaybeTs + utoipa::ToSchema + 'static>(mut self) -> Self {
+        self.def.body_type = Some(type_string::<B>());
+        self.def.response_type = Some(type_string::<R>());
+        self.parent.collector.register::<B>();
+        self.parent.collector.register::<R>();
+        self.parent.collector.register_schema::<B>();
+        self.parent.collector.register_schema::<R>();
         self
     }
 
@@ -1116,13 +1152,23 @@ where
     C: Collector,
 {
     /// Set the query parameters type.
+    #[cfg(not(feature = "openapi"))]
     pub fn query<T: MaybeTs + 'static>(mut self) -> Self {
         self.def.query_type = Some(type_string::<T>());
         self.parent.collector.register::<T>();
         self
     }
+    /// Set the query parameters type.
+    #[cfg(feature = "openapi")]
+    pub fn query<T: MaybeTs + utoipa::ToSchema + 'static>(mut self) -> Self {
+        self.def.query_type = Some(type_string::<T>());
+        self.parent.collector.register::<T>();
+        self.parent.collector.register_schema::<T>();
+        self
+    }
 
     /// Set the event types for this WebSocket endpoint.
+    #[cfg(not(feature = "openapi"))]
     pub fn events<Send: MaybeTs + 'static, Receive: MaybeTs + 'static>(
         self,
     ) -> WsRouteBuilder<S, C, AuthScope, crate::params::EventsDeclared> {
@@ -1137,6 +1183,44 @@ where
             def,
             _events: std::marker::PhantomData,
         }
+    }
+#[cfg(feature = "openapi")]
+    pub fn events<Send: MaybeTs + utoipa::ToSchema + 'static, Receive: MaybeTs + utoipa::ToSchema + 'static>(
+        self,
+    ) -> WsRouteBuilder<S, C, AuthScope, crate::params::EventsDeclared> {
+        let mut this = self;
+        this.def.ws_send_type = Some(type_string::<Send>());
+        this.def.ws_receive_type = Some(type_string::<Receive>());
+        this.parent.collector.register::<Send>();
+        this.parent.collector.register::<Receive>();
+        this.parent.collector.register_schema::<Send>();
+        this.parent.collector.register_schema::<Receive>();
+        let WsRouteBuilder { parent, def, .. } = this;
+        WsRouteBuilder {
+            parent,
+            def,
+            _events: std::marker::PhantomData,
+        }
+    }
+
+    /// Declare that the client sends binary WebSocket frames (`sendBinary`).
+    pub fn binary_send(mut self) -> Self {
+        self.def.ws_binary = self.def.ws_binary.with_send();
+        self
+    }
+
+    /// Declare that the server sends binary WebSocket frames (`onBinary`).
+    /// Sets `ws.binaryType = "arraybuffer"` on the client socket and routes
+    /// binary frames to `onBinary(handler: (data: ArrayBuffer) => void)`.
+    pub fn binary_receive(mut self) -> Self {
+        self.def.ws_binary = self.def.ws_binary.with_receive();
+        self
+    }
+
+    /// Declare bidirectional binary WebSocket frames (`sendBinary` and `onBinary`).
+    pub fn binary(mut self) -> Self {
+        self.def.ws_binary = crate::types::WsBinaryMode::Both;
+        self
     }
 
     fn done(mut self) -> ApiRouter<S, C, AuthScope>
