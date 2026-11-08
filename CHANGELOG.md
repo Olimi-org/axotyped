@@ -1,3 +1,9 @@
+## 0.5.1 (2026-11-08)
+
+### Fixes
+
+- Publish `axotyped-macros 0.4.0` with schema-capture codegen and require it from `axotyped`. `axotyped 0.5.0` on crates.io resolved `axotyped-macros 0.3.0`, which did not emit `register_schema` calls, so OpenAPI schema capture was incomplete.
+
 ## 0.5.0 (2026-11-08)
 
 ### Features
